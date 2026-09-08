@@ -1,0 +1,63 @@
+# Cloud-free Windows laptop runtime. Everything below runs locally on the
+# laptop's own CPU (or its GPU, if one is present and CUDA is available) --
+# there is no Google Cloud VM, gcloud dependency, or per-request network call.
+# The --extra-index-url below serves PyTorch's CPU-only wheels, which are far
+# smaller than the CUDA-bundled default on PyPI; a machine with a supported
+# NVIDIA GPU can still use it automatically once CUDA drivers are present.
+--extra-index-url https://download.pytorch.org/whl/cpu
+Flask>=3.0,<4
+waitress>=3.0,<4
+numpy>=1.26,<3
+opencv-python-headless>=4.9
+Pillow>=10
+requests>=2.31
+PyYAML>=6
+
+# Local AI stack: real open-vocabulary bag/box detection+segmentation
+# (Ultralytics YOLOE), monocular metric depth for the Logitech camera
+# (Depth Anything V2 via Transformers), and zero-shot material classification
+# (CLIP via Transformers). All weights download once on first run and are
+# cached under the user's profile; no further internet access is required
+# after that.
+torch>=2.2,<3
+torchvision>=0.17,<1
+ultralytics>=8.4.0,<9
+transformers>=4.45,<6
+safetensors>=0.4
+
+# YOLOE's text-prompt mode (curated bag/box vocabulary, not the broad
+# prompt-free fallback) needs `import clip` at load time. Ultralytics only
+# ships that as `git+https://github.com/ultralytics/CLIP.git`, which needs a
+# `git` executable on PATH and a working github.com connection -- neither is
+# guaranteed on a plain Windows laptop, and when it fails Ultralytics silently
+# swaps in the prompt-free fallback (see CHANGES_local-ai-19.2.0.md, Bug 1).
+# `openai-clip` is a plain-PyPI mirror of the same `clip` package (identical
+# `clip.load()` / `clip.tokenize()` API, confirmed by inspecting both
+# side-by-side) -- installing it here means `import clip` just succeeds on
+# pip's normal first attempt and Ultralytics' git-based fallback path never
+# runs at all.
+openai-clip>=1.0,<2
+ftfy>=6.1
+regex>=2023.0
+tqdm>=4.64
+
+# openai-clip's own clip.py still does `from pkg_resources import packaging`
+# at import time. Newer setuptools (81+) removed pkg_resources entirely, so
+# without this pin `import clip` throws ModuleNotFoundError on a fresh venv
+# that happens to get a current setuptools -- confirmed directly in this
+# sandbox: setuptools 84 breaks the import, setuptools<81 fixes it.
+setuptools<81
+
+# Recipe pipeline (locallife_cloud/pointcloud_volume.py, recipe_*.py,
+# recipe_api.py) -- additive, off by default (AppConfig.recipe_enabled /
+# LOCALLIFE_RECIPE_ENABLED). open3d is the recipe's own point-cloud
+# oriented-bounding-box / heightmap volume backend; fastapi+uvicorn+
+# python-multipart serve recipe_api.py's separate FastAPI endpoint. None of
+# these are imported by the existing dashboard/tracking/ledger path unless
+# recipe_enabled is turned on or recipe_api.py is started explicitly, so a
+# failed install here does not affect the main service (see recipe_api.py's
+# and comparison.py's own lazy-import handling).
+open3d>=0.18,<1
+fastapi>=0.110,<1
+uvicorn>=0.29,<1
+python-multipart>=0.0.9,<1

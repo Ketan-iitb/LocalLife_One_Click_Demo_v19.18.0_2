@@ -1,0 +1,36 @@
+# Dual-camera recipe pipeline configuration -- v3 blueprint §10 schema.
+#
+# Loaded by locallife_cloud/recipe_config.py's RecipeConfig.from_yaml().
+# Every key here matches its dataclass default exactly; edit a value (or
+# delete a whole section) to override it -- anything left out keeps its
+# built-in default, so a thesis run only needs to state what it changes.
+camera:
+  realsense: { width: 640, height: 480, fps: 30, preset: HighAccuracy,
+               align_depth_to_color: true }
+  logitech:  { width: 640, height: 480 }
+segmentation:
+  model: yolov8n-seg.pt   # or yolov11n-seg.pt
+  target_class: null      # null = auto; or "box"/"bag"
+  conf_threshold: 0.45
+  area_range: [0.05, 0.80]
+depth:
+  valid_mm: [100, 2500]
+  mask_erode_px: 3
+  sor: { nb_neighbors: 20, std_ratio: 2.0 }
+  plane_threshold_m: 0.01
+color:
+  use_camera: logitech
+  kmeans_k: 4
+  center_crop_frac: 0.6
+material:
+  primary: clip
+  fallback_model: mobilenetv3_small
+  clip_confidence_floor: 0.6
+  fallback_confidence_floor: 0.55
+  plastic_thin_margin: 0.10
+  fallback_checkpoint_path: null
+volume:
+  box_method: plane_fit
+  bag_class_sizes_l: [5, 10]
+  bag_tolerance_frac: 0.15
+  bag_discretize_window: 0.30

@@ -1,0 +1,26 @@
+# PyTorch and torchvision are intentionally NOT listed. The GCP VM already
+# provides CUDA-enabled versions; setup_cloud.sh exposes them to the venv.
+Flask>=3.0,<4
+waitress>=3.0,<4
+numpy>=1.26,<3
+opencv-python-headless>=4.9
+Pillow>=10
+requests>=2.31
+PyYAML>=6
+ultralytics>=8.4.0,<9
+transformers>=4.45,<6
+safetensors>=0.4
+
+# Recipe pipeline (locallife_cloud/pointcloud_volume.py, recipe_*.py,
+# recipe_api.py) -- additive, off by default (AppConfig.recipe_enabled /
+# LOCALLIFE_RECIPE_ENABLED). open3d is the recipe's own point-cloud
+# oriented-bounding-box / heightmap volume backend; fastapi+uvicorn+
+# python-multipart serve recipe_api.py's separate FastAPI endpoint. None of
+# these are imported by the existing dashboard/tracking/ledger path unless
+# recipe_enabled is turned on or recipe_api.py is started explicitly, so a
+# failed install here does not affect the main service (see recipe_api.py's
+# and comparison.py's own lazy-import handling).
+open3d>=0.18,<1
+fastapi>=0.110,<1
+uvicorn>=0.29,<1
+python-multipart>=0.0.9,<1

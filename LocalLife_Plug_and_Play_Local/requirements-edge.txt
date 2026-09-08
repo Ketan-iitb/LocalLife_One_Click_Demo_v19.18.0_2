@@ -1,0 +1,5 @@
+# Install these only on the physical camera device, not on the cloud VM.
+# pyrealsense2 is often supplied by the system/Intel packages on Raspberry Pi.
+numpy>=1.24
+opencv-python>=4.8
+requests>=2.31

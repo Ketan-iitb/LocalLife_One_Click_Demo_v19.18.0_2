@@ -1,0 +1,29 @@
+# Known-box templates for template-mode volume matching -- see
+# box_templates.py and the "Revised Dual-Camera Volume Estimation" engineering
+# recipe (sections 5, 14, 16 item 10).
+#
+# Every dimension below is a PLACEHOLDER (0), not a measurement, and
+# `measured: false` disables matching against it. Replace `length`/`width`/
+# `height` with your own ruler/caliper measurement (in millimetres) of the
+# exact milk-box packages you are testing with, then set `measured: true` to
+# enable matching for that box. Do not fill in a plausible-looking number
+# without actually measuring the physical box: the PDF's own instruction is
+# explicit about this ("do not let code or an LLM invent them"), and a wrong
+# "measured" dimension would produce a confidently wrong volume instead of an
+# honestly uncertain one -- worse than no template match at all.
+boxes:
+  - id: milk_box_1l
+    nominal_volume_liters: 1.0
+    dimensions_mm: { length: 0, width: 0, height: 0 }
+    tolerance_mm: 8
+    measured: false
+  - id: milk_box_1_5l
+    nominal_volume_liters: 1.5
+    dimensions_mm: { length: 0, width: 0, height: 0 }
+    tolerance_mm: 8
+    measured: false
+  - id: milk_box_2l
+    nominal_volume_liters: 2.0
+    dimensions_mm: { length: 0, width: 0, height: 0 }
+    tolerance_mm: 10
+    measured: false
