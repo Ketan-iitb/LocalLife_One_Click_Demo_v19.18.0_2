@@ -24,7 +24,7 @@ from pathlib import Path
 import numpy as np
 
 from locallife_cloud.config import AppConfig
-from locallife_cloud.pipeline import VisionPipeline, _is_box_label
+from locallife_cloud.pipeline import VisionPipeline
 from locallife_cloud.types import Detection
 
 from locallife_cloud.box_templates import BoxTemplate, match_box_template
@@ -32,6 +32,7 @@ from locallife_cloud.types import BoxVolumeMeasurement, CameraIntrinsics
 from locallife_cloud.volume import (
     aggregate_box_measurements,
     estimate_box_volume_cuboid,
+    estimate_object_dimensions,
     fit_reference_plane,
 )
 
@@ -131,6 +132,23 @@ class BoxCuboidVolumeTests(unittest.TestCase):
         result = estimate_box_volume_cuboid(depth, intrinsics, mask, plane)
         self.assertIsNotNone(result)
         self.assertAlmostEqual(result.height_mm, self.HEIGHT_M * 1000.0, delta=0.1)
+
+    def test_general_dimensions_recover_height_and_ignore_floor_halo(self) -> None:
+        depth, mask, intrinsics, plane = self._scene_and_plane()
+        clean = estimate_object_dimensions(depth, intrinsics, mask, plane)
+        self.assertIsNotNone(clean)
+        self.assertAlmostEqual(clean.height_mm, self.HEIGHT_M * 1000.0, delta=0.1)
+        self.assertGreater(clean.length_mm, clean.width_mm)
+
+        # Loose neural masks often include visible floor. Plane-height pixels
+        # must not enlarge the physical footprint.
+        halo = mask.copy()
+        halo[120:180, 110:190] = True
+        with_halo = estimate_object_dimensions(depth, intrinsics, halo, plane)
+        self.assertIsNotNone(with_halo)
+        self.assertAlmostEqual(with_halo.length_mm, clean.length_mm, delta=0.5)
+        self.assertAlmostEqual(with_halo.width_mm, clean.width_mm, delta=0.5)
+        self.assertAlmostEqual(with_halo.height_mm, clean.height_mm, delta=0.5)
 
     def test_footprint_recovers_true_dimensions_with_no_erosion(self) -> None:
         # Numerically verified exact ground truth (corner-to-corner 3-D
@@ -481,19 +499,11 @@ class PipelineBoxAggregationTests(unittest.TestCase):
 
 
 class PeerLabelledBoxGeometryTests(unittest.TestCase):
-    """Regression guards for the round-23 real-hardware report ("volume
-    estimate hi nhi ho rahi").
+    """A peer label is presence evidence, not cross-view object identity.
 
-    On the real rig RealSense repeatedly reported a genuine cardboard carton
-    as `unclassified object` -- a depth silhouette its own neural detector
-    never labelled -- while Logitech, in the very same frame, correctly
-    called it `parcel box` / `cardboard shipping box`. Because the
-    table-relative cuboid measurement was gated on RealSense's OWN label
-    (`_is_box_label(detection.label)`), the whole L*W*H geometry path was
-    skipped for exactly the object it exists to measure: the dashboard's
-    "Box geometry" column stayed empty and the reported liters fell back to
-    the generic per-pixel integral over a mask that can bleed into
-    background (~7.8 L for a roughly 1 L carton in the reported screenshots).
+    The cameras are not pixel-registered. An unlabelled RealSense depth blob
+    can therefore be measured only after RealSense itself has an accepted
+    semantic detection; otherwise furniture and bedding can become geometry.
     """
 
     def _config(self) -> AppConfig:
@@ -545,21 +555,11 @@ class PeerLabelledBoxGeometryTests(unittest.TestCase):
         )
         return list(analysis.detections)
 
-    def test_peer_box_label_unlocks_cuboid_geometry_for_an_unlabelled_realsense_object(self) -> None:
-        # The exact reported case: RealSense recognises nothing itself, the
-        # object survives only as a scene-fusion phantom, and the peer camera
-        # is the one that confirmed it is a box.
+    def test_peer_label_cannot_promote_an_unlabelled_realsense_blob(self) -> None:
+        # The cameras are not pixel-registered. A simultaneous Logitech box
+        # label cannot prove that a RealSense depth component is that object.
         detections = self._run(own_label=None, peer_box_present=True)
-        phantom = [item for item in detections if not _is_box_label(item.label)]
-        self.assertTrue(phantom, "expected the scene-fusion phantom this test is built around")
-        measured = [item for item in detections if item.box_length_mm is not None]
-        self.assertTrue(measured, "peer box label should have opened the cuboid geometry path")
-        self.assertIn("peer_labelled_box", measured[0].box_volume_flags)
-        # Every millimetre still comes from RealSense depth, so the geometry
-        # must be real measured numbers, not a placeholder.
-        self.assertGreater(measured[0].box_height_mm, 0.0)
-        self.assertGreater(measured[0].box_length_mm, 0.0)
-        self.assertGreater(measured[0].box_width_mm, 0.0)
+        self.assertEqual(detections, [])
 
     def test_without_a_peer_box_label_an_unlabelled_object_gets_no_cuboid(self) -> None:
         # Guards the other direction: a changed-depth region must not be

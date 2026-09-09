@@ -60,6 +60,7 @@ class WastePlantLedger:
             "track_id": detection.track_id,
             "object_type": waste_object_type(detection.label),
             "label": detection.label,
+            "accepted_class": detection.accepted_class,
             "color": color,
             "material": detection.material or "unknown",
             "material_confidence": detection.material_confidence,
@@ -71,6 +72,14 @@ class WastePlantLedger:
             "measurement_quality": detection.measurement_quality,
             "calibration_mode": detection.calibration_mode,
             "confidence": detection.confidence,
+            "dimensions_mm": None if detection.footprint_length_mm is None else {
+                "footprint_length": detection.footprint_length_mm,
+                "footprint_width": detection.footprint_width_mm,
+                "height": detection.physical_height_mm,
+            },
+            "dimension_confidence": detection.dimension_confidence,
+            "dimension_flags": list(detection.dimension_flags),
+            "dimension_method": detection.dimension_method,
             "observed_at": float(time.time() if timestamp is None else timestamp),
             "deposited_at": None,
             "status": "observed",
@@ -91,6 +100,7 @@ class WastePlantLedger:
             return
         record.update(
             label=detection.label,
+            accepted_class=detection.accepted_class,
             color=detection.color,
             material=detection.material or "unknown",
             material_confidence=detection.material_confidence,
@@ -102,6 +112,14 @@ class WastePlantLedger:
             measurement_quality=detection.measurement_quality,
             calibration_mode=detection.calibration_mode,
             confidence=detection.confidence,
+            dimensions_mm=None if detection.footprint_length_mm is None else {
+                "footprint_length": detection.footprint_length_mm,
+                "footprint_width": detection.footprint_width_mm,
+                "height": detection.physical_height_mm,
+            },
+            dimension_confidence=detection.dimension_confidence,
+            dimension_flags=list(detection.dimension_flags),
+            dimension_method=detection.dimension_method,
         )
 
     def deposit(self, detection: Detection, *, timestamp: float | None = None) -> dict[str, Any]:

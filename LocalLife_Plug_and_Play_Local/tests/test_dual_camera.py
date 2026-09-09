@@ -376,12 +376,10 @@ class IndependentCameraTests(unittest.TestCase):
             self.assertEqual(fused["color"], "blue")
             self.assertIn("realsense", fused["per_camera"])
             self.assertIn("logitech", fused["per_camera"])
-            # Both cameras measured the same synthetic object, so the fused
-            # figure should sit close to each individual reading, not be
-            # wildly different from either.
-            for camera_id in ("realsense", "logitech"):
-                individual = fused["per_camera"][camera_id]["volume_l"]
-                self.assertAlmostEqual(fused["volume_l"], individual, delta=max(0.5, individual * 0.5))
+            self.assertEqual(fused["volume_source"], "realsense")
+            self.assertAlmostEqual(
+                fused["volume_l"], fused["per_camera"]["realsense"]["volume_l"], places=3,
+            )
 
     def test_fused_result_falls_back_to_whichever_single_camera_has_an_object(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

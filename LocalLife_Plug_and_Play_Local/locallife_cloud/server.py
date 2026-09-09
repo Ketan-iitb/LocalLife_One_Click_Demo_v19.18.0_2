@@ -93,8 +93,26 @@ def _annotate_frame(frame: np.ndarray, pipeline: VisionPipeline) -> np.ndarray:
         volume = f" | {active_volume:.2f} L" if active_volume is not None else ""
         visible_color = f" [{detection.color}]" if detection.color not in {"unknown", ""} else ""
         continuity = " (tracked)" if detection.source == "tracked-prediction" else ""
-        caption = f"#{detection.track_id or '?'} {detection.label}{continuity}{visible_color}{distance}{height}{volume}"
+        display_type = (
+            detection.accepted_class.replace("_", " ")
+            if detection.accepted_class is not None else detection.label
+        )
+        caption = f"#{detection.track_id or '?'} {display_type}{continuity}{visible_color}{distance}{height}{volume}"
         cv2.putText(output, caption, (x1, max(19, y1 - 7)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+        if (
+            detection.footprint_length_mm is not None
+            and detection.footprint_width_mm is not None
+            and detection.physical_height_mm is not None
+        ):
+            dimensions = (
+                f"LxWxH {detection.footprint_length_mm:.0f}x"
+                f"{detection.footprint_width_mm:.0f}x{detection.physical_height_mm:.0f} mm"
+            )
+            dimension_y = min(output.shape[0] - 8, max(20, y1 + 20))
+            cv2.putText(
+                output, dimensions, (x1, dimension_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2,
+            )
     return output
 
 

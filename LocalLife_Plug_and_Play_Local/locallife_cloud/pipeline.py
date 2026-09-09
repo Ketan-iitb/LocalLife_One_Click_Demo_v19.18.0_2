@@ -35,22 +35,12 @@ from .volume import (
     aggregate_box_measurements,
     calibrate_monocular_depth,
     estimate_box_volume_cuboid,
+    estimate_object_dimensions,
     estimate_volume,
     fit_reference_plane,
     fit_support_plane_from_background,
     synthesize_plane_depth,
 )
-
-_BOX_WORDS = {"box", "boxes", "cardboard", "carton", "parcel"}
-
-
-def _is_box_label(label: str) -> bool:
-    """Same box/carton/parcel keyword family `logitech.py`'s
-    `_object_family` uses, kept as a small local helper here since this
-    module doesn't otherwise depend on logitech.py's internals."""
-    words = set(label.lower().replace("-", " ").replace("_", " ").split())
-    return bool(words & _BOX_WORDS)
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -64,6 +54,7 @@ LOGGER = logging.getLogger(__name__)
 # a naive "contains the word bag" check and get treated as a real bag.
 NON_WASTE_BAG_QUALIFIERS = {
     "chair", "sofa", "couch", "seat", "cushion", "pillow", "bed", "ottoman", "stool",
+    "backpack", "rucksack", "laptop", "briefcase", "duffel", "sports", "handbag", "purse",
 }
 
 # A phantom/silhouette detection (see geometry.fuse_scene_detections /
@@ -90,20 +81,56 @@ def is_bag_detection(label: str) -> bool:
 
 
 def is_supported_waste_detection(label: str) -> bool:
-    return waste_object_type(label) in {"bag", "box"}
+    return accepted_object_class(label) is not None
 
 
 NEGATIVE_WASTE_LABELS = {
     "pillow", "cushion", "blanket", "bedding", "chair", "office chair", "chair wheel",
     "furniture", "furniture leg", "bottle", "plastic bottle", "lotion bottle",
+    "backpack", "rucksack", "laptop bag", "briefcase", "duffel bag", "sports bag",
+    "handbag", "purse", "shoe", "sneaker", "sandal", "slipper", "boot", "clothing",
+    "person", "hand", "foot",
 }
+
+
+def _normalized_label(label: str) -> str:
+    return " ".join(label.strip().lower().replace("_", " ").replace("-", " ").split())
+
+
+def accepted_object_class(label: str) -> str | None:
+    """Map detector vocabulary to the only three accepted object families.
+
+    Broad labels such as a bare ``bag`` are deliberately not accepted: the
+    real-hardware result set shows backpacks, laptop cases and bedding being
+    forced into a waste-bag class.  A bag must carry a plastic/waste or paper
+    qualifier, and cardboard must be a box/carton/parcel rather than an
+    arbitrary flat sheet.
+    """
+    normalized = _normalized_label(label)
+    if normalized in NEGATIVE_WASTE_LABELS:
+        return None
+    words = set(normalized.replace("(", " ").replace(")", " ").split())
+    if words & {"box", "boxes", "carton", "cartons", "parcel", "parcels"}:
+        return "cardboard_box"
+    if not words & {"bag", "bags", "sack", "sacks"}:
+        return None
+    if words & NON_WASTE_BAG_QUALIFIERS:
+        return None
+    if words & {"paper", "kraft"}:
+        return "paper_bag"
+    if words & {
+        "plastic", "polythene", "polyethylene", "garbage", "trash", "waste",
+        "refuse", "rubbish", "bin",
+    }:
+        return "plastic_bag"
+    return None
 
 
 def reject_prompt_conflicts(detections: list[Detection]) -> list[Detection]:
     """Reject a waste label when a similarly confident lookalike owns the same pixels."""
     negatives = [
         item for item in detections
-        if " ".join(item.label.strip().lower().replace("_", " ").split()) in NEGATIVE_WASTE_LABELS
+        if _normalized_label(item.label) in NEGATIVE_WASTE_LABELS
     ]
     accepted: list[Detection] = []
     for detection in detections:
@@ -140,6 +167,7 @@ def filter_waste_detections(
     )
     retained: list[Detection] = []
     for detection in reject_prompt_conflicts(detections):
+        detection.accepted_class = accepted_object_class(detection.label)
         if config.bag_only and not is_bag_detection(detection.label):
             continue
         if not config.bag_only and not is_supported_waste_detection(detection.label):
@@ -407,6 +435,7 @@ class VisionPipeline:
             ) else None,
             "runtime": getattr(self.detector, "runtime", {}),
             "prompts": list(self.config.prompts),
+            "negative_prompts": list(self.config.negative_prompts),
         }
 
     def set_baseline(
@@ -698,6 +727,14 @@ class VisionPipeline:
         detection.box_frames_considered = cuboid.frames_considered
         detection.box_frames_accepted = cuboid.frames_accepted
         detection.box_dimension_std_mm = cuboid.dimension_std_mm
+        # Keep the new general dimension contract aligned with the legacy box
+        # fields so API/dashboard consumers have one place to read L/W/H.
+        detection.footprint_length_mm = round(cuboid.length_mm, 2)
+        detection.footprint_width_mm = round(cuboid.width_mm, 2)
+        detection.physical_height_mm = round(cuboid.height_mm, 2)
+        detection.dimension_confidence = round(cuboid.volume_confidence, 4)
+        detection.dimension_flags = cuboid.flags
+        detection.dimension_method = "realsense_table_relative_cuboid"
         template_match = match_box_template(
             cuboid.length_mm, cuboid.width_mm, cuboid.height_mm, self.box_templates,
         )
@@ -844,10 +881,13 @@ class VisionPipeline:
                 frame,
                 detections,
                 scene_objects,
-                allow_unclassified=(
-                    self.config.allow_unclassified_foreground
-                    or peer_bag_present
-                ),
+                # A peer camera saying "bag" is not enough to turn an
+                # arbitrary changed-depth region into a new waste object.
+                # The supplied real-hardware results showed pillows,
+                # backpacks, bottles and empty patches entering through this
+                # exact gate.  Unclassified regions may still bridge a nearby
+                # already-counted track via counted_track_boxes below.
+                allow_unclassified=self.config.allow_unclassified_foreground,
                 bag_only=self.config.bag_only,
                 require_scene_match=(
                     scene_depth is not None
@@ -863,7 +903,6 @@ class VisionPipeline:
             detections = deduplicate_overlapping_detections(detections, frame.shape[:2])
             if scene_objects and not original_count and (
                 self.config.allow_unclassified_foreground
-                or peer_bag_present
                 or self.tracker.counted_track_boxes()
             ):
                 warnings.append(
@@ -875,6 +914,9 @@ class VisionPipeline:
                 LOGGER.debug("Ignored %s unclassified foreground components", len(scene_objects))
             elif scene_objects and any(item.source == "yoloe-scene-fusion" for item in detections):
                 LOGGER.debug("Fused %s neural detections with %s complete scene objects", original_count, len(scene_objects))
+            for detection in detections:
+                if not _is_phantom_detection(detection):
+                    detection.accepted_class = accepted_object_class(detection.label)
         if not detections and self.baseline_rgb is None:
             warnings.append("No object detected; capture an empty-scene baseline to enable fallback and volume")
         elif detections and self.baseline_rgb is None:
@@ -917,7 +959,12 @@ class VisionPipeline:
         # overwritten -- this only fills in when none exists. Results
         # measured this way are flagged `live_fitted_support_plane` so the
         # diagnostics stay honest about where the reference came from.
-        self.support_plane_source = "captured-baseline" if self.reference_plane is not None else "none"
+        captured_support_plane = self.reference_plane is not None and (
+            self.reference_realsense is not None
+            if self.camera_id != "logitech" else self.reference_monocular is not None
+        )
+        measurement_plane = self.reference_plane
+        self.support_plane_source = "captured-baseline" if captured_support_plane else "none"
         effective_reference = self.reference_realsense
         if (
             self.camera_id != "logitech"
@@ -932,12 +979,16 @@ class VisionPipeline:
                 region_mask=bin_region,
             )
             if live_plane is not None:
-                if self.reference_plane is None:
-                    self.reference_plane = live_plane
-                    self.support_plane_source = "live-frame-background"
+                # Use this one plane consistently for height, footprint and
+                # synthetic reference depth in the current measurement.  The
+                # old path kept the first live plane for height while creating
+                # later synthetic references from newly-fitted planes.
+                measurement_plane = live_plane
+                self.reference_plane = live_plane
+                self.support_plane_source = "live-frame-background"
                 if effective_reference is None:
                     synthetic = synthesize_plane_depth(
-                        depth_m.shape, intrinsics, live_plane.coefficients
+                        depth_m.shape, intrinsics, measurement_plane.coefficients
                     )
                     if synthetic is not None:
                         effective_reference = synthetic
@@ -997,7 +1048,7 @@ class VisionPipeline:
             method="realsense-aligned-depth",
             measurement_mask=bin_region,
             depth_noise_m=self.config.depth_noise_m,
-            reference_plane=self.reference_plane,
+            reference_plane=measurement_plane,
             **precision,
         ) if detections and self.camera_id != "logitech" else None
 
@@ -1022,7 +1073,7 @@ class VisionPipeline:
             method=f"{self.camera_id}-total-bin-occupancy",
             measurement_mask=bin_region,
             depth_noise_m=self.config.depth_noise_m,
-            reference_plane=self.reference_plane,
+            reference_plane=measurement_plane,
             **precision,
         ) if occupancy_reference is not None and logitech_ready else None
         if hardware_total is not None and hardware_total.coverage_ratio < self.config.minimum_depth_coverage:
@@ -1063,7 +1114,7 @@ class VisionPipeline:
                             else "monocular-depth-calibrated-against-realsense"),
                     measurement_mask=bin_region,
                     depth_noise_m=self.config.depth_noise_m,
-                    reference_plane=self.reference_plane,
+                    reference_plane=measurement_plane,
                     **precision,
                 )
             elif detections and self.baseline_monocular is not None and self.camera_id != "logitech":
@@ -1168,7 +1219,7 @@ class VisionPipeline:
                 method="realsense-instance",
                 measurement_mask=bin_region,
                 depth_noise_m=self.config.depth_noise_m,
-                reference_plane=self.reference_plane,
+                reference_plane=measurement_plane,
                 **precision,
             )
             if individual is not None:
@@ -1202,6 +1253,39 @@ class VisionPipeline:
                     # whole-mask median far below the object's true, ruler-
                     # measured height; the near-top percentile does not.
                     detection.height_above_baseline_cm = round(individual.height_p90_m * 100.0, 1)
+            # General RealSense-only physical dimensions for every accepted
+            # plastic bag, paper bag, or cardboard box.  Bags expose a visible
+            # support-plane footprint rather than pretending to be cuboids.
+            dimensions = None
+            if (
+                self.camera_id != "logitech"
+                and detection.accepted_class is not None
+                and not _is_phantom_detection(detection)
+            ):
+                dimensions = estimate_object_dimensions(
+                    depth_m,
+                    intrinsics,
+                    instance_mask,
+                    measurement_plane,
+                    measurement_mask=bin_region,
+                    min_height_m=self.config.min_object_height_m,
+                    max_height_m=self.config.max_object_height_m,
+                    min_points=min(60, self.config.min_component_pixels),
+                )
+            if dimensions is not None:
+                detection.footprint_length_mm = round(dimensions.length_mm, 2)
+                detection.footprint_width_mm = round(dimensions.width_mm, 2)
+                detection.physical_height_mm = round(dimensions.height_mm, 2)
+                detection.dimension_confidence = round(dimensions.confidence, 4)
+                extra_dimension_flags = (
+                    ("live_fitted_support_plane",)
+                    if self.support_plane_source == "live-frame-background" else ()
+                )
+                detection.dimension_flags = tuple(dimensions.flags) + extra_dimension_flags
+                detection.dimension_method = dimensions.method
+                # Use the same plane-relative, elevated-point height shown in
+                # the dimension triplet, not a camera-Z mask median.
+                detection.height_above_baseline_cm = round(dimensions.height_mm / 10.0, 1)
             # Table-relative cuboid measurement for box-family detections
             # (Revised Dual-Camera Volume Estimation recipe). RealSense only
             # -- Logitech never supplies metric geometry (PDF hard
@@ -1214,54 +1298,28 @@ class VisionPipeline:
             # succeeds, so a box with too little valid depth or no fitted
             # table plane still gets the pre-existing per-pixel behaviour
             # rather than silently losing its measurement.
-            # BUGFIX (round 23): this gate used to be `_is_box_label(detection.label)`
-            # alone, which silently skipped the whole table-relative cuboid
-            # measurement whenever RealSense's OWN neural label was missing --
-            # i.e. exactly the case seen on real hardware, where RealSense
-            # reported "unclassified object" (a depth silhouette with no neural
-            # label) for a real cardboard carton that Logitech was, in the very
-            # same frame, correctly labelling "parcel box"/"cardboard shipping
-            # box". With the gate closed, the detection fell through to the
-            # generic per-pixel height*area integral over a mask that can bleed
-            # into background -- reporting e.g. 7.8 L for a ~1 L carton -- and
-            # the dashboard's own "Box geometry" column stayed empty ("--"),
-            # which is what "volume estimate hi nhi ho rahi" actually looked
-            # like. Logitech is this rig's designated appearance/classification
-            # camera (its own C920 has no metric depth and is never used for
-            # geometry), so letting its object-type call open the geometry gate
-            # -- while every millimetre still comes exclusively from RealSense
-            # depth -- follows the dual-camera design rather than working
-            # around it. `peer_box_present` is only trusted for an already
-            # tracked/confirmed detection, never for a one-frame phantom, and
-            # the result is flagged `peer_labelled_box` so a reader can always
-            # tell the object type came from the peer camera.
-            # Deliberately NOT excluding phantom/silhouette detections here.
-            # A phantom is "a changed-depth region no neural label ever
-            # vouched for" -- but when the peer camera has independently
-            # confirmed a box in the same frame, that region is no longer
-            # unvouched-for: it simply was not RealSense's own detector that
-            # recognised it, which is the entire reason this rig has a second
-            # camera. This is the same reasoning `allow_unclassified` already
-            # applies to `peer_bag_present` in the scene-fusion step above.
-            # Note this opens the *geometry* path only -- phantom exclusion
-            # from the durable ledger and from aggregate volume totals is
-            # enforced separately (see `_is_phantom_detection`'s own uses
-            # below) and is untouched by this. Measuring the very same mask
-            # with the table-relative cuboid model instead of the leaky
-            # per-pixel integral is strictly more accurate, never less.
-            peer_opened_gate = peer_box_present and not _is_box_label(detection.label)
+            # A label from the other camera cannot safely promote an arbitrary
+            # RealSense changed-depth blob: the two views are not pixel-
+            # registered, so presence in the same frame is not object identity.
+            # Require this RealSense detection itself to be an accepted
+            # cardboard class before producing physical cuboid geometry.
             if (
                 self.camera_id != "logitech"
-                and (_is_box_label(detection.label) or peer_opened_gate)
+                and detection.accepted_class == "cardboard_box"
+                and not _is_phantom_detection(detection)
                 and depth_m is not None
             ):
                 cuboid = estimate_box_volume_cuboid(
-                    depth_m, intrinsics, instance_mask, self.reference_plane,
+                    depth_m,
+                    intrinsics,
+                    instance_mask,
+                    measurement_plane,
+                    measurement_mask=bin_region,
+                    min_height_m=self.config.min_object_height_m,
+                    max_height_m=self.config.max_object_height_m,
                 )
                 if cuboid is not None:
                     extra_flags: tuple[str, ...] = ()
-                    if peer_opened_gate:
-                        extra_flags += ("peer_labelled_box",)
                     if self.support_plane_source == "live-frame-background":
                         extra_flags += ("live_fitted_support_plane",)
                     if extra_flags:
@@ -1292,7 +1350,7 @@ class VisionPipeline:
                     method="monocular-instance",
                     measurement_mask=bin_region,
                     depth_noise_m=self.config.depth_noise_m,
-                    reference_plane=self.reference_plane,
+                    reference_plane=measurement_plane,
                     **precision,
                 )
                 if individual_mono is not None:
@@ -1466,6 +1524,7 @@ class VisionPipeline:
             track = self.tracker.tracks.get(detection.track_id) if detection.track_id is not None else None
             should_observe = bool(track is not None and track.counted)
             should_observe = should_observe and not _is_phantom_detection(detection)
+            should_observe = should_observe and detection.accepted_class is not None
             if self.config.record_only_measured_objects:
                 should_observe = should_observe and self._measurement_is_recordable(detection)
             # A track can become measurable several frames after it was born.
@@ -1480,6 +1539,8 @@ class VisionPipeline:
                 if detection.track_id is None or self.ledger.is_deposited(detection.track_id):
                     continue
                 if _is_phantom_detection(detection):
+                    continue
+                if detection.accepted_class is None:
                     continue
                 track = self.tracker.tracks.get(detection.track_id)
                 if track is None or not track.counted:
@@ -1841,6 +1902,8 @@ class VisionPipeline:
         return detection.monocular_volume_l if self.camera_id == "logitech" else detection.realsense_volume_l
 
     def _measurement_is_recordable(self, detection: Detection) -> bool:
+        if _is_phantom_detection(detection) or detection.accepted_class is None:
+            return False
         if self.baseline_restore_state == "validating":
             return False
         measured = self._detection_volume(detection)

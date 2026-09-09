@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
@@ -19,7 +20,8 @@ from locallife_cloud.geometry import (
     roi_pixels,
 )
 from locallife_cloud.pipeline import (
-    VisionPipeline, is_bag_detection, is_supported_waste_detection, summarize_depth_signal
+    VisionPipeline, accepted_object_class, is_bag_detection,
+    is_supported_waste_detection, summarize_depth_signal,
 )
 from locallife_cloud.inference import YoloSegmenter
 from locallife_cloud.tracking import ObjectTracker
@@ -231,13 +233,27 @@ class ContainerSegmentationTests(unittest.TestCase):
         self.assertEqual({item.label for item in fused}, {"plastic bag", "cardboard box"})
 
     def test_default_prompts_target_bags_and_boxes_only(self) -> None:
-        prompts = AppConfig().prompts
+        config = AppConfig()
+        prompts = config.prompts
         self.assertIn("garbage bag", prompts)
         self.assertIn("garbage sack", prompts)
         self.assertIn("black trash bag", prompts)
         self.assertTrue(all(is_supported_waste_detection(prompt) for prompt in prompts))
         self.assertIn("cardboard shipping box", prompts)
         self.assertNotIn("person", prompts)
+        self.assertIn("backpack", config.negative_prompts)
+        self.assertIn("shoe", config.negative_prompts)
+
+    def test_local_environment_defaults_skip_expensive_monocular_depth(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertFalse(AppConfig.from_env().enable_monocular_depth)
+
+    def test_only_the_three_configured_waste_families_are_accepted(self) -> None:
+        self.assertEqual(accepted_object_class("filled polythene bag"), "plastic_bag")
+        self.assertEqual(accepted_object_class("kraft paper bag"), "paper_bag")
+        self.assertEqual(accepted_object_class("cardboard shipping box"), "cardboard_box")
+        for label in ("bag", "backpack", "laptop bag", "shoe", "pillow", "bottle"):
+            self.assertIsNone(accepted_object_class(label), label)
 
     def test_unclassified_foreground_is_ignored_by_default(self) -> None:
         frame = np.zeros((60, 60, 3), dtype=np.uint8)
@@ -686,7 +702,13 @@ class PipelineTests(unittest.TestCase):
             self.assertGreater(result.detections[0].realsense_volume_l, 70.0)
             self.assertEqual(result.detections[0].depth_distance_m, 1.7)
             self.assertEqual(result.detections[0].height_above_baseline_cm, 30.0)
-            self.assertEqual(result.detections[0].to_dict()["depth_distance_m"], 1.7)
+            detection_payload = result.detections[0].to_dict()
+            self.assertEqual(detection_payload["depth_distance_m"], 1.7)
+            self.assertEqual(detection_payload["accepted_class"], "plastic_bag")
+            self.assertIsNotNone(detection_payload["dimensions_mm"])
+            self.assertGreater(detection_payload["dimensions_mm"]["footprint_length"], 0)
+            self.assertGreater(detection_payload["dimensions_mm"]["footprint_width"], 0)
+            self.assertAlmostEqual(detection_payload["dimensions_mm"]["height"], 300.0, delta=1.0)
             self.assertEqual(pipeline.state()["volume_status"]["code"], "measuring")
 
     def test_dome_shaped_object_reports_near_its_peak_height_not_a_footprint_median(self) -> None:
@@ -835,7 +857,7 @@ class PipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             mask = np.zeros((30, 30), dtype=bool)
             mask[5:20, 5:20] = True
-            detector = FakeDetector([Detection("bag", 0.8, (5, 5, 20, 20), mask=mask)])
+            detector = FakeDetector([Detection("garbage bag", 0.8, (5, 5, 20, 20), mask=mask)])
             config = AppConfig(results_dir=Path(temporary), roi=(0, 0, 1, 1), min_component_pixels=10)
             pipeline = VisionPipeline(config, detector=detector, depth_estimator=FakeDepthEstimator())
             baseline = np.zeros((30, 30, 3), dtype=np.uint8)
@@ -850,7 +872,7 @@ class PipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             mask = np.zeros((40, 40), dtype=bool)
             mask[8:28, 8:28] = True
-            detector = FakeDetector([Detection("bag", 0.9, (8, 8, 28, 28), mask=mask)])
+            detector = FakeDetector([Detection("garbage bag", 0.9, (8, 8, 28, 28), mask=mask)])
             config = AppConfig(results_dir=Path(temporary), roi=(0, 0, 1, 1), min_component_pixels=20)
             pipeline = VisionPipeline(config, detector=detector, depth_estimator=FakeDepthEstimator())
             baseline = np.zeros((40, 40, 3), dtype=np.uint8)

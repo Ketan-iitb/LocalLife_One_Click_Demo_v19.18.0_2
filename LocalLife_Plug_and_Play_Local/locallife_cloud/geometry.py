@@ -601,6 +601,7 @@ def fuse_scene_detections(
                 box=box,
                 mask=mask,
                 source=detection_source,
+                accepted_class=best.accepted_class if best is not None else None,
                 color=dominant_color(frame, mask),
             )
         )

@@ -10,6 +10,8 @@ import numpy as np
 
 
 DEFAULT_PROMPTS = (
+    # Accepted families.  Keep wording specific: a bare "bag" prompt makes
+    # backpacks, laptop cases and handbags compete as waste bags.
     "garbage bag",
     "large garbage bag",
     "colored garbage bag",
@@ -27,10 +29,51 @@ DEFAULT_PROMPTS = (
     "refuse sack",
     "rubbish sack",
     "filled plastic waste bag",
+    "plastic polythene bag",
+    "filled polythene bag",
+    "paper waste bag",
+    "paper sack",
+    "kraft paper bag",
     "cardboard box",
     "cardboard shipping box",
     "parcel box",
     "carton box",
+)
+
+# Competing classes are shown to the open-vocabulary detector so it can call
+# a backpack a backpack instead of being forced to choose the nearest waste
+# label.  They remain separate from ``prompts`` so installations that already
+# override LOCALLIFE_PROMPTS do not accidentally treat negatives as accepted
+# application classes.
+DEFAULT_NEGATIVE_PROMPTS = (
+    # Explicit negative/lookalike prompts.  YOLOE can only reject a shoe or
+    # backpack as a competing class if it was allowed to name it; with only
+    # positive waste prompts it was forced to choose the nearest bag label.
+    "backpack",
+    "rucksack",
+    "laptop bag",
+    "briefcase",
+    "duffel bag",
+    "sports bag",
+    "handbag",
+    "purse",
+    "shoe",
+    "sneaker",
+    "sandal",
+    "slipper",
+    "boot",
+    "pillow",
+    "cushion",
+    "blanket",
+    "bedding",
+    "clothing",
+    "bottle",
+    "lotion bottle",
+    "chair",
+    "furniture",
+    "person",
+    "hand",
+    "foot",
 )
 
 
@@ -61,8 +104,13 @@ class AppConfig:
     detector_iou: float = 0.50
     image_size: int = 960
     prompts: tuple[str, ...] = DEFAULT_PROMPTS
+    negative_prompts: tuple[str, ...] = DEFAULT_NEGATIVE_PROMPTS
     depth_model: str = "depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf"
-    enable_monocular_depth: bool = True
+    # RealSense is the only metric geometry authority.  Keeping the large
+    # Logitech Depth-Anything model on by default made local CPU inference
+    # take minutes while also producing a second, non-authoritative volume.
+    # It remains opt-in through LOCALLIFE_ENABLE_DEPTH for comparison trials.
+    enable_monocular_depth: bool = False
     enable_material_classification: bool = True
     material_model: str = "openai/clip-vit-base-patch32"
     material_labels: tuple[str, ...] = ()
@@ -272,8 +320,13 @@ class AppConfig:
             detector_iou=float(os.environ.get("LOCALLIFE_IOU", defaults.detector_iou)),
             image_size=int(os.environ.get("LOCALLIFE_IMAGE_SIZE", defaults.image_size)),
             prompts=_tuple_env("LOCALLIFE_PROMPTS", DEFAULT_PROMPTS),
+            negative_prompts=_tuple_env(
+                "LOCALLIFE_NEGATIVE_PROMPTS", DEFAULT_NEGATIVE_PROMPTS,
+            ),
             depth_model=os.environ.get("LOCALLIFE_DEPTH_MODEL", defaults.depth_model),
-            enable_monocular_depth=_bool_env("LOCALLIFE_ENABLE_DEPTH", True),
+            enable_monocular_depth=_bool_env(
+                "LOCALLIFE_ENABLE_DEPTH", defaults.enable_monocular_depth,
+            ),
             enable_material_classification=_bool_env(
                 "LOCALLIFE_ENABLE_MATERIAL", defaults.enable_material_classification,
             ),

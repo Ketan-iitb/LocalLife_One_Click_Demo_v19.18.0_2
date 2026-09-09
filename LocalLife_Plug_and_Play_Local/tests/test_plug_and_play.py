@@ -238,7 +238,7 @@ class PlugAndPlayProfileTests(unittest.TestCase):
             self.assertEqual(detection.measurement_method, "table_relative_cuboid")
 
     def test_pillow_prompt_vetoes_overlapping_bag_label(self) -> None:
-        bag = Detection("fabric bag", 0.55, (5, 5, 35, 35))
+        bag = Detection("garbage bag", 0.55, (5, 5, 35, 35))
         pillow = Detection("pillow", 0.70, (4, 4, 36, 36))
         self.assertEqual(reject_prompt_conflicts([bag, pillow]), [])
         self.assertEqual(reject_prompt_conflicts([bag]), [bag])

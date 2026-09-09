@@ -382,17 +382,12 @@ class DualCameraCoordinator:
         The fixed installation holds exactly one physical bag or box in the
         measurement bin at a time, so RealSense's and Logitech's own current
         confirmed detections (when both have one) are observations of the
-        *same* object -- they do not need pixel-level cross-camera
-        registration to be combined, only to be identified as "the current
-        object" on each side and blended into one number instead of shown as
-        two disagreeing ones. RealSense's factory-calibrated stereo depth is
-        this project's higher-trust sensor (see DUAL_CAMERA_THESIS.md); it is
-        therefore weighted more heavily than Logitech's monocular estimate,
-        and used alone whenever Logitech has no usable reading, and vice
-        versa. Phantom (unconfirmed depth-silhouette) detections are excluded
-        entirely: fusing in a reading with zero semantic confirmation would
-        just spread the same false-positive risk into the one number this
-        exists to make trustworthy.
+        *same* object. Appearance observations may be combined at scene level,
+        but geometry is never blended: RealSense's factory-calibrated stereo
+        depth is the sole physical-dimension and final-volume authority.
+        Logitech's monocular estimate is retained only as a diagnostic
+        comparison. Phantom (unconfirmed depth-silhouette) detections are
+        excluded entirely.
         """
         candidates: dict[str, dict[str, Any]] = {}
         for camera_id in CAMERA_IDS:
@@ -403,6 +398,7 @@ class DualCameraCoordinator:
                 item for item in analysis.detections
                 if item.tracking_status in {"confirmed", "predicted"}
                 and not is_phantom_source(item.source)
+                and item.accepted_class is not None
             ]
             if not confirmed:
                 continue
@@ -422,6 +418,7 @@ class DualCameraCoordinator:
                 "available": False,
                 "sources": [],
                 "volume_l": None,
+                "volume_source": None,
                 "color": "unknown",
                 "material": "unknown",
                 "per_camera": {},
@@ -438,14 +435,11 @@ class DualCameraCoordinator:
         agreement_l: float | None = None
         agreement_percent: float | None = None
         if volumes:
-            weights: dict[str, float] = {}
-            for camera_id, liters in volumes.items():
-                uncertainty = candidates[camera_id]["uncertainty_l"] or max(0.10, abs(liters) * 0.15)
-                weights[camera_id] = 1.0 / max(uncertainty, 1e-6) ** 2
-            if "realsense" in weights and "logitech" in weights:
-                weights["realsense"] *= 2.0
-            total_weight = sum(weights.values()) or 1.0
-            fused_volume = sum(volumes[camera_id] * weights[camera_id] for camera_id in volumes) / total_weight
+            # Build-playbook invariant: RealSense is the sole authority for
+            # geometry and liters.  Logitech may contribute colour/material
+            # and an optional comparison reading, but must never move the
+            # number presented as the fused/final volume.
+            fused_volume = volumes.get("realsense")
             if len(volumes) == 2:
                 difference = abs(volumes["realsense"] - volumes["logitech"])
                 reference = max(volumes.values()) or 1.0
@@ -462,18 +456,23 @@ class DualCameraCoordinator:
         sources = sorted(candidates.keys())
         if len(sources) == 2:
             message = (
-                "Fused from both cameras"
+                "RealSense supplies final volume; both cameras contribute visual classification"
                 if agreement_percent is None or agreement_percent >= 70.0
                 else f"Both cameras see an object, but their volumes disagree by {agreement_l:.1f} L "
-                f"({100 - agreement_percent:.0f}%); RealSense is weighted higher in the fused figure"
+                f"({100 - agreement_percent:.0f}%); final volume remains RealSense-only"
             )
         else:
-            message = f"Only {sources[0]} currently has a confirmed object; showing its measurement alone"
+            message = (
+                "Only Logitech currently has a confirmed object; waiting for RealSense geometry"
+                if sources[0] == "logitech"
+                else "Only realsense currently has a confirmed object; showing its measured volume"
+            )
 
         return {
             "available": True,
             "sources": sources,
             "volume_l": None if fused_volume is None else round(fused_volume, 3),
+            "volume_source": "realsense" if fused_volume is not None else None,
             "color": fused_color,
             "material": fused_material,
             "per_camera": {

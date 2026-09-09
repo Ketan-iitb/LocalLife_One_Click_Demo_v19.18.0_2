@@ -221,9 +221,17 @@ class YoloSegmenter:
                     "Upgrade ultralytics or set LOCALLIFE_DETECTOR_MODEL to a trained best.pt."
                 )
             try:
-                self.model.set_classes(list(self.config.prompts))
+                prompt_bank = tuple(dict.fromkeys(
+                    (*self.config.prompts, *self.config.negative_prompts)
+                ))
+                self.model.set_classes(list(prompt_bank))
                 self.runtime["prompt_mode"] = "waste-text-prompts"
-                LOGGER.info("Configured waste prompts: %s", ", ".join(self.config.prompts))
+                self.runtime["accepted_prompt_count"] = len(self.config.prompts)
+                self.runtime["negative_prompt_count"] = len(self.config.negative_prompts)
+                LOGGER.info(
+                    "Configured %s accepted and %s negative/lookalike prompts",
+                    len(self.config.prompts), len(self.config.negative_prompts),
+                )
             except Exception as exc:
                 fallback_name = model_name.removesuffix(".pt") + "-pf.pt"
                 LOGGER.warning(

@@ -52,6 +52,10 @@ class Detection:
     box: tuple[int, int, int, int]
     mask: np.ndarray | None = field(default=None, repr=False)
     source: str = "yoloe"
+    # Stable application-level class.  The detector's raw free-form label is
+    # intentionally retained in ``label`` for diagnostics, while this field
+    # is restricted to the three object families the installation accepts.
+    accepted_class: str | None = None
     color: str = "unknown"
     material: str = "unknown"
     material_confidence: float = 0.0
@@ -87,6 +91,16 @@ class Detection:
     box_frames_considered: int = 1
     box_frames_accepted: int = 1
     box_dimension_std_mm: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    # General RealSense-only 3-D dimensions.  Unlike the legacy box fields,
+    # these are also populated for filled plastic/paper bags.  For deformable
+    # bags length/width describe the visible support-plane footprint, not the
+    # flat manufactured bag size.
+    footprint_length_mm: float | None = None
+    footprint_width_mm: float | None = None
+    physical_height_mm: float | None = None
+    dimension_confidence: float | None = None
+    dimension_flags: tuple[str, ...] = ()
+    dimension_method: str | None = None
 
     @property
     def area_pixels(self) -> int:
@@ -102,6 +116,7 @@ class Detection:
             "box_xyxy": list(self.box),
             "area_pixels": self.area_pixels,
             "source": self.source,
+            "accepted_class": self.accepted_class,
             "color": self.color,
             "material": self.material,
             "material_confidence": round(float(self.material_confidence), 4),
@@ -133,6 +148,14 @@ class Detection:
                 "width": round(float(self.box_dimension_std_mm[1]), 3),
                 "height": round(float(self.box_dimension_std_mm[2]), 3),
             } if self.box_length_mm is not None else None,
+            "dimensions_mm": None if self.footprint_length_mm is None else {
+                "footprint_length": round(float(self.footprint_length_mm), 2),
+                "footprint_width": round(float(self.footprint_width_mm), 2),
+                "height": round(float(self.physical_height_mm), 2),
+            },
+            "dimension_confidence": self.dimension_confidence,
+            "dimension_flags": list(self.dimension_flags),
+            "dimension_method": self.dimension_method,
         }
 
 
@@ -179,6 +202,41 @@ class VolumeMeasurement:
             "rejected_pixels": int(self.rejected_pixels),
             "quality": self.quality,
             "height_p90_m": round(float(self.height_p90_m), 6),
+        }
+
+
+@dataclass(slots=True)
+class ObjectDimensions:
+    """RealSense-only visible 3-D footprint and robust height.
+
+    The footprint is measured in the fitted support-plane coordinate system.
+    It is suitable for rigid cardboard containers and as an explicitly
+    approximate *filled footprint* for deformable plastic/paper bags.
+    """
+
+    length_mm: float
+    width_mm: float
+    height_mm: float
+    confidence: float
+    depth_valid_ratio: float
+    object_points: int
+    mask_clipped: bool
+    flags: tuple[str, ...] = ()
+    method: str = "realsense_support_plane_footprint"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "dimensions_mm": {
+                "footprint_length": round(float(self.length_mm), 2),
+                "footprint_width": round(float(self.width_mm), 2),
+                "height": round(float(self.height_mm), 2),
+            },
+            "confidence": round(float(self.confidence), 4),
+            "depth_valid_ratio": round(float(self.depth_valid_ratio), 4),
+            "object_points": int(self.object_points),
+            "mask_clipped": bool(self.mask_clipped),
+            "flags": list(self.flags),
+            "method": self.method,
         }
 
 

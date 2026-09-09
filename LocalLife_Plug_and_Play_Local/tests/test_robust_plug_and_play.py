@@ -125,7 +125,7 @@ class RobustPlugAndPlayTests(unittest.TestCase):
             self.assertTrue(station.state()["automatic_setup"]["ready"])
             self.assertTrue((Path(directory) / "baselines" / "metadata.json").is_file())
 
-    def test_peer_camera_can_confirm_depth_silhouette_during_detector_miss(self) -> None:
+    def test_peer_camera_cannot_promote_depth_silhouette_during_detector_miss(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = AppConfig(
                 results_dir=Path(directory), enable_monocular_depth=False,
@@ -146,8 +146,7 @@ class RobustPlugAndPlayTests(unittest.TestCase):
                 frame, detections=[], depth_m=depth, intrinsics=intrinsics,
                 peer_bag_present=True, persist=False,
             )
-            self.assertEqual(len(result.detections), 1)
-            self.assertIn("bag", result.detections[0].label)
+            self.assertEqual(result.detections, [])
 
     def test_dashboard_exposes_a_manual_baseline_escape_hatch_and_known_reference_calibration(self) -> None:
         # REGRESSION GUARD: earlier local builds required the measurement area

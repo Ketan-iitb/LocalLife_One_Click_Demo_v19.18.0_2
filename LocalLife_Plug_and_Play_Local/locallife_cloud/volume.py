@@ -8,7 +8,13 @@ from dataclasses import dataclass
 import numpy as np
 
 from .geometry import roi_mask
-from .types import BoxVolumeMeasurement, CameraIntrinsics, DepthCalibration, VolumeMeasurement
+from .types import (
+    BoxVolumeMeasurement,
+    CameraIntrinsics,
+    DepthCalibration,
+    ObjectDimensions,
+    VolumeMeasurement,
+)
 
 
 @dataclass(slots=True)
@@ -607,17 +613,174 @@ def _erode_object_mask(mask: np.ndarray, iterations: int) -> np.ndarray:
         return eroded
 
 
+def _mask_touches_measurement_boundary(
+    object_mask: np.ndarray,
+    measurement_mask: np.ndarray | None = None,
+) -> bool:
+    """Detect clipping on the original mask, before edge erosion hides it."""
+    mask = object_mask.astype(bool)
+    if not np.any(mask):
+        return False
+    if np.any(mask[0, :]) or np.any(mask[-1, :]) or np.any(mask[:, 0]) or np.any(mask[:, -1]):
+        return True
+    if measurement_mask is None or measurement_mask.shape != mask.shape:
+        return False
+    allowed = measurement_mask.astype(bool)
+    interior = allowed.copy()
+    interior[1:, :] &= allowed[:-1, :]
+    interior[:-1, :] &= allowed[1:, :]
+    interior[:, 1:] &= allowed[:, :-1]
+    interior[:, :-1] &= allowed[:, 1:]
+    return bool(np.any(mask & allowed & ~interior))
+
+
+def _largest_connected_region(mask: np.ndarray) -> np.ndarray:
+    """Keep one coherent elevated surface instead of disconnected noise."""
+    if not np.any(mask):
+        return mask.astype(bool)
+    try:
+        import cv2
+
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+        if count <= 1:
+            return mask.astype(bool)
+        largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        return labels == largest
+    except ImportError:
+        return mask.astype(bool)
+
+
+def estimate_object_dimensions(
+    depth_m: np.ndarray | None,
+    intrinsics: CameraIntrinsics | None,
+    object_mask: np.ndarray | None,
+    reference_plane: ReferencePlane | None,
+    *,
+    measurement_mask: np.ndarray | None = None,
+    min_height_m: float = 0.025,
+    max_height_m: float = 0.80,
+    min_points: int = 60,
+    footprint_trim_percentile: float = 2.0,
+    height_percentile: float = 95.0,
+) -> ObjectDimensions | None:
+    """Measure visible support-plane footprint and robust RealSense height.
+
+    Only points measurably above the plane enter the footprint.  This prevents
+    an RGB/YOLO mask's floor halo from inflating length, width, and volume.
+    """
+    if depth_m is None or intrinsics is None or object_mask is None:
+        return None
+    if reference_plane is None or reference_plane.coefficients is None:
+        return None
+    if depth_m.ndim != 2 or object_mask.shape != depth_m.shape:
+        return None
+    if measurement_mask is not None and measurement_mask.shape != depth_m.shape:
+        return None
+    if not (0.0 <= footprint_trim_percentile < 50.0):
+        raise ValueError("Footprint trim percentile must be between 0 and 50")
+    if not (50.0 <= height_percentile <= 100.0):
+        raise ValueError("Height percentile must be between 50 and 100")
+
+    candidate = object_mask.astype(bool).copy()
+    if measurement_mask is not None:
+        candidate &= measurement_mask.astype(bool)
+    candidate_pixels = int(np.count_nonzero(candidate))
+    if candidate_pixels < min_points:
+        return None
+
+    depth = depth_m.astype(np.float64, copy=False)
+    depth_ok = np.isfinite(depth) & (depth > 0.10) & (depth < 20.0)
+    sensed_pixels = int(np.count_nonzero(candidate & depth_ok))
+    depth_valid_ratio = sensed_pixels / max(1, candidate_pixels)
+    height_map = _plane_perpendicular_height(depth, intrinsics, reference_plane.coefficients)
+    if height_map is None:
+        return None
+    elevated = (
+        candidate
+        & depth_ok
+        & np.isfinite(height_map)
+        & (height_map >= min_height_m)
+        & (height_map <= max_height_m)
+    )
+    elevated = _largest_connected_region(elevated)
+    valid_count = int(np.count_nonzero(elevated))
+    if valid_count < min_points:
+        return None
+
+    rows, columns = np.nonzero(elevated)
+    z = depth[rows, columns]
+    x = (columns.astype(np.float64) - intrinsics.ppx) * z / intrinsics.fx
+    y = (rows.astype(np.float64) - intrinsics.ppy) * z / intrinsics.fy
+    points = np.column_stack((x, y, z))
+
+    a, b, _ = reference_plane.coefficients
+    normal = np.array((a, b, -1.0), dtype=np.float64)
+    normal_norm = float(np.linalg.norm(normal))
+    if not np.isfinite(normal_norm) or normal_norm < 1e-9:
+        return None
+    normal /= normal_norm
+    seed = np.array((1.0, 0.0, 0.0)) if abs(normal[0]) < 0.9 else np.array((0.0, 1.0, 0.0))
+    u_hat = seed - float(np.dot(seed, normal)) * normal
+    u_hat /= np.linalg.norm(u_hat)
+    v_hat = np.cross(normal, u_hat)
+
+    footprint = np.column_stack((points @ u_hat, points @ v_hat))
+    footprint -= np.median(footprint, axis=0)
+    covariance = np.cov(footprint, rowvar=False)
+    if covariance.shape != (2, 2) or not np.all(np.isfinite(covariance)):
+        return None
+    _, eigenvectors = np.linalg.eigh(covariance)
+    principal = footprint @ eigenvectors
+    low = np.percentile(principal, footprint_trim_percentile, axis=0)
+    high = np.percentile(principal, 100.0 - footprint_trim_percentile, axis=0)
+    dimensions_m = np.sort(np.maximum(0.0, high - low))[::-1]
+    if dimensions_m.size != 2 or dimensions_m[1] <= 0:
+        return None
+
+    heights = height_map[elevated]
+    height_m = float(np.percentile(heights, height_percentile))
+    mask_clipped = _mask_touches_measurement_boundary(object_mask, measurement_mask)
+    flags: list[str] = ["single_view_visible_footprint"]
+    if depth_valid_ratio < 0.70:
+        flags.append("low_valid_depth")
+    if valid_count / max(1, sensed_pixels) < 0.35:
+        flags.append("low_elevated_fraction")
+    if reference_plane.residual_rmse_m * 1000.0 > 8.0:
+        flags.append("high_plane_rmse")
+    if mask_clipped:
+        flags.append("mask_clipped")
+
+    confidence = 0.85
+    confidence -= 0.30 * max(0.0, 0.90 - depth_valid_ratio)
+    confidence -= 0.15 if "low_elevated_fraction" in flags else 0.0
+    confidence -= 0.15 if "high_plane_rmse" in flags else 0.0
+    confidence -= 0.20 if mask_clipped else 0.0
+    return ObjectDimensions(
+        length_mm=float(dimensions_m[0] * 1000.0),
+        width_mm=float(dimensions_m[1] * 1000.0),
+        height_mm=height_m * 1000.0,
+        confidence=float(np.clip(confidence, 0.05, 0.95)),
+        depth_valid_ratio=depth_valid_ratio,
+        object_points=valid_count,
+        mask_clipped=mask_clipped,
+        flags=tuple(flags),
+    )
+
+
 def estimate_box_volume_cuboid(
     depth_m: np.ndarray | None,
     intrinsics: CameraIntrinsics | None,
     object_mask: np.ndarray | None,
     reference_plane: ReferencePlane | None,
     *,
+    measurement_mask: np.ndarray | None = None,
     mask_erosion_px: int = 2,
     min_points: int = 60,
     height_percentile: float = 90.0,
     fallback_height_percentile: float = 98.0,
     footprint_trim_percentile: float = 2.0,
+    min_height_m: float = 0.025,
+    max_height_m: float = 0.80,
 ) -> BoxVolumeMeasurement | None:
     """Table-relative rigid-box volume: robust height above the fitted table
     plane, times a robust footprint length/width, per the "Revised
@@ -644,17 +807,35 @@ def estimate_box_volume_cuboid(
         return None
     if object_mask.shape != depth_m.shape:
         return None
+    if measurement_mask is not None and measurement_mask.shape != depth_m.shape:
+        return None
 
     a, b, c = reference_plane.coefficients
     denom = float(np.sqrt(a * a + b * b + 1.0))
     if not np.isfinite(denom) or denom < 1e-9:
         return None
 
-    eroded_mask = _erode_object_mask(object_mask.astype(bool), mask_erosion_px)
-    raw_object_pixels = int(np.count_nonzero(object_mask))
+    # Clipping must be checked on the original mask.  Erosion deliberately
+    # removes its outer pixels and previously hid real image-edge clipping.
+    mask_clipped = _mask_touches_measurement_boundary(object_mask, measurement_mask)
+    geometric_mask = object_mask.astype(bool)
+    if measurement_mask is not None:
+        geometric_mask &= measurement_mask.astype(bool)
+    eroded_mask = _erode_object_mask(geometric_mask, mask_erosion_px)
+    raw_object_pixels = int(np.count_nonzero(geometric_mask))
     depth = depth_m.astype(np.float64)
     depth_ok = np.isfinite(depth) & (depth > 0.10) & (depth < 20.0)
-    valid = eroded_mask & depth_ok
+    height_map = _plane_perpendicular_height(depth, intrinsics, reference_plane.coefficients)
+    if height_map is None:
+        return None
+    valid = (
+        eroded_mask
+        & depth_ok
+        & np.isfinite(height_map)
+        & (height_map >= min_height_m)
+        & (height_map <= max_height_m)
+    )
+    valid = _largest_connected_region(valid)
     valid_count = int(np.count_nonzero(valid))
     depth_valid_ratio = valid_count / max(1, raw_object_pixels)
     if valid_count < min_points:
@@ -665,10 +846,10 @@ def estimate_box_volume_cuboid(
     x = (columns.astype(np.float64) - intrinsics.ppx) * z / intrinsics.fx
     y = (rows.astype(np.float64) - intrinsics.ppy) * z / intrinsics.fy
 
-    # Per-point perpendicular height above the fitted table plane (same
-    # formula as `_plane_perpendicular_height`, applied directly to the
-    # backprojected object points rather than the whole depth image).
-    height = (a * x + b * y + c - z) / denom
+    # Per-point perpendicular height above the fitted table plane.  It was
+    # calculated before footprint PCA so floor/background pixels inside a
+    # loose semantic mask cannot expand the physical box dimensions.
+    height = height_map[valid]
 
     # Robust top height: median of the upper `height_percentile`, falling
     # back to a higher, narrower percentile if too few points land in that
@@ -716,10 +897,6 @@ def estimate_box_volume_cuboid(
 
     volume_l = length_m * width_m * height_m * 1000.0
 
-    mask_clipped = bool(
-        np.any(eroded_mask[0, :]) or np.any(eroded_mask[-1, :])
-        or np.any(eroded_mask[:, 0]) or np.any(eroded_mask[:, -1])
-    )
     plane_rmse_mm = reference_plane.residual_rmse_m * 1000.0
     flags: list[str] = ["single_view_estimate"]
     if depth_valid_ratio < 0.70:
