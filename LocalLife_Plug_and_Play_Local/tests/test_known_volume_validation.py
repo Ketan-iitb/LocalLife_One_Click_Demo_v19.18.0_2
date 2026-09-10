@@ -26,6 +26,8 @@ factor" warning already baked into `calibrate_known_volume()`'s own output).
 
 from __future__ import annotations
 
+import csv
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -36,6 +38,7 @@ from locallife_cloud.config import AppConfig
 from locallife_cloud.pipeline import VisionPipeline
 from locallife_cloud.types import CameraIntrinsics, Detection
 from locallife_cloud.volume import estimate_volume
+from scripts.validate_known_volume import _current_observation, _export_csv, _load_trials
 
 # Shared, arbitrary-but-realistic camera model for every synthetic object
 # below: a 640x480-class sensor's focal length in pixels is commonly in the
@@ -55,6 +58,105 @@ BALLPARK_TOLERANCE_FRACTION = 0.15
 # prove the factor is actually wired through the full liters computation,
 # not to claim independent-object accuracy.
 CALIBRATED_TOLERANCE_FRACTION = 0.01
+
+
+class Phase1BTrialCaptureTests(unittest.TestCase):
+    """Guards for safe extraction of validation evidence from `/api/state`."""
+
+    @staticmethod
+    def _state(detections: list[dict]) -> dict:
+        return {
+            "cameras": {
+                "realsense": {
+                    "volume_calibration_factor": 1.0,
+                    "latest": {
+                        # Deliberately wrong aggregate: Phase 1B must select
+                        # the one accepted object's own displayed reading.
+                        "realsense_volume_l": 88.0,
+                        "inference_ms": 42.0,
+                        "detections": detections,
+                    },
+                },
+            },
+        }
+
+    def test_uses_single_accepted_objects_own_volume_and_dimensions(self) -> None:
+        observation = _current_observation(self._state([
+            {
+                "label": "changed depth region",
+                "source": "fixed-bin-depth-silhouette",
+                "tracking_status": "confirmed",
+                "accepted_class": None,
+                "realsense_volume_l": 80.0,
+            },
+            {
+                "label": "black trash bag",
+                "source": "yoloe",
+                "tracking_status": "confirmed",
+                "accepted_class": "plastic_bag",
+                "color": "black",
+                "confidence": 0.91,
+                "realsense_volume_l": 2.4,
+                "dimensions_mm": {
+                    "footprint_length": 310.0,
+                    "footprint_width": 190.0,
+                    "height": 140.0,
+                },
+                "dimension_confidence": 0.84,
+                "dimension_flags": ["single_view_geometry"],
+                "dimension_method": "realsense_support_plane_pca",
+                "depth_coverage_percent": 96.0,
+            },
+        ]), "realsense")
+
+        self.assertIsNotNone(observation)
+        self.assertEqual(observation["observed_liters"], 2.4)
+        self.assertEqual(observation["object_type"], "plastic_bag")
+        self.assertEqual(observation["predicted_color"], "black")
+        self.assertEqual(observation["estimated_length_mm"], 310.0)
+        self.assertEqual(observation["estimated_width_mm"], 190.0)
+        self.assertEqual(observation["estimated_height_mm"], 140.0)
+        self.assertEqual(observation["dimension_confidence"], 0.84)
+
+    def test_rejects_ambiguous_scene_with_two_accepted_objects(self) -> None:
+        detections = []
+        for label in ("plastic trash bag", "paper bag"):
+            detections.append({
+                "label": label,
+                "source": "yoloe",
+                "tracking_status": "confirmed",
+                "accepted_class": "plastic_bag" if "plastic" in label else "paper_bag",
+                "realsense_volume_l": 1.0,
+            })
+        self.assertIsNone(_current_observation(self._state(detections), "realsense"))
+
+    def test_reports_keep_calibration_trials_out_of_validation_accuracy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            log_path = Path(temporary) / "trials.jsonl"
+            records = [
+                {
+                    "trial_id": "fit-1", "camera": "realsense", "role": "calibration",
+                    "known_liters": 1.0, "observed_liters": 0.8, "percent_error": -20.0,
+                },
+                {
+                    "trial_id": "check-1", "camera": "realsense", "role": "validation",
+                    "known_liters": 2.0, "observed_liters": 1.9, "percent_error": -5.0,
+                    "dimension_flags": ["single_view_geometry"],
+                },
+            ]
+            log_path.write_text(
+                "".join(json.dumps(item) + "\n" for item in records), encoding="utf-8",
+            )
+
+            validation = _load_trials(log_path, "realsense", "validation")
+            self.assertEqual([item["trial_id"] for item in validation], ["check-1"])
+
+            csv_path = Path(temporary) / "trials.csv"
+            _export_csv(_load_trials(log_path, "realsense"), csv_path)
+            with csv_path.open("r", encoding="utf-8", newline="") as handle:
+                exported = list(csv.DictReader(handle))
+            self.assertEqual(len(exported), 2)
+            self.assertEqual(exported[1]["dimension_flags"], "single_view_geometry")
 
 
 def _synthetic_cuboid_measurement(

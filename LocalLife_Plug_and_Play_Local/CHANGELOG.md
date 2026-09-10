@@ -9,6 +9,77 @@ configuration changes, validation performed, hardware status, and any known
 limitations. This should make it possible to identify the version that
 introduced a regression without guessing from file modification dates.
 
+## v3 — 2026-09-09 — Phase 1B validation framework
+
+### Status
+
+- Implemented in the local workspace; not deployed to the friend's laptop.
+- No camera, RealSense firmware, USB, baseline, geometry, detector, or volume
+  calibration value was changed.
+- The logging/reporting framework is ready, but its records remain empty until
+  trials are performed with ruler-measured dimensions and independently known
+  volumes.
+
+### Reason for this version
+
+Phase 1A made RealSense footprint L×W×H visible and restricted accepted waste
+to plastic bags, paper bags, and cardboard boxes. Phase 1B supplies the
+controlled evidence needed to determine whether those physical measurements
+are accurate before changing the geometry or fitting a volume correction.
+
+### Validation and calibration changes
+
+- Extended `scripts/validate_known_volume.py` to record a unique trial ID and
+  explicitly separate `validation` trials from factor-fitting `calibration`
+  trials.
+- A RealSense trial is accepted only when exactly one confirmed/predicted,
+  non-phantom object belonging to an accepted waste class is present.
+- The object detection's own liters value is recorded instead of trusting a
+  scene-wide aggregate that could hide ambiguity.
+- Added ground-truth inputs for waste type, colour, filled-object footprint
+  length/width, physical height, placement, and setup notes.
+- Added captured outputs for predicted class/colour, RealSense L×W×H,
+  dimension confidence/flags/method, depth coverage, detection confidence,
+  measurement quality, inference time, volume uncertainty, and active volume
+  calibration factor.
+- Added volume absolute/percentage error, dimension signed errors, sample
+  range, population standard deviation, and the raw repeated sample values.
+- Added an automatically regenerated CSV beside the detailed JSONL log. Older
+  JSONL trials remain readable and are included where fields are available.
+- Restricted `--calibrate` to `--camera realsense --role calibration`.
+  Logitech and fused results can still be observed for comparison but cannot
+  set the final metric-volume correction through this tool.
+- No correction coefficient is supplied or guessed in this version. A factor
+  may be fitted only when a tester deliberately provides `--calibrate` with a
+  physically known reference; independent objects must then be used for the
+  validation set.
+
+### Example physical validation command
+
+```text
+python scripts/validate_known_volume.py --camera realsense --role validation \
+  --known-liters 5 --label "filled-polythene-5L-01" \
+  --object-type plastic_bag --actual-color black \
+  --actual-length-mm 320 --actual-width-mm 210 --actual-height-mm 180 \
+  --placement centre --samples 10
+```
+
+The example numbers above demonstrate command syntax only; they are not bag
+calibration values and must be replaced with the tester's actual measurements.
+
+### Files changed
+
+| Area | Files | Purpose |
+|---|---|---|
+| Trial capture/reporting | `scripts/validate_known_volume.py` | Safe RealSense object selection, physical truth fields, repeatability metrics, JSONL and CSV output |
+| Regression tests | `tests/test_known_volume_validation.py` | Reject ambiguous two-object scenes and preserve the accepted object's volume/dimensions |
+
+### Validation completed
+
+- Python compilation of the Phase 1B script — passed.
+- Known-volume test module: 10 tests — all passed.
+- Hardware accuracy remains pending on the friend's RealSense installation.
+
 ## v2 — 2026-09-09
 
 ### Status
