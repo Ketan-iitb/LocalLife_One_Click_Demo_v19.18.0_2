@@ -34,6 +34,7 @@ from locallife_cloud.volume import (
     estimate_box_volume_cuboid,
     estimate_object_dimensions,
     fit_reference_plane,
+    reference_plane_is_usable,
 )
 
 
@@ -242,6 +243,20 @@ class BoxCuboidVolumeTests(unittest.TestCase):
         self.assertIn("high_plane_rmse", noisy_result.flags)
         self.assertNotIn("high_plane_rmse", clean_result.flags)
         self.assertLess(noisy_result.volume_confidence, clean_result.volume_confidence)
+        self.assertTrue(reference_plane_is_usable(plane))
+        self.assertFalse(reference_plane_is_usable(noisy_plane))
+
+    def test_plane_fit_selects_dominant_floor_instead_of_averaging_floor_and_wall(self) -> None:
+        height, width = 100, 120
+        intrinsics = CameraIntrinsics(fx=140, fy=140, ppx=60, ppy=50)
+        depth = np.full((height, width), 2.0, dtype=np.float32)
+        depth[:35, :] = 3.2  # a second, farther wall plane
+
+        plane = fit_reference_plane(depth, intrinsics)
+
+        self.assertIsNotNone(plane)
+        self.assertLess(plane.residual_rmse_m, 0.008)
+        self.assertAlmostEqual(plane.coefficients[2], 2.0, delta=0.02)
 
     def test_diagnostics_to_dict_matches_the_recipe_pdf_shape(self) -> None:
         depth, mask, intrinsics, plane = self._scene_and_plane()

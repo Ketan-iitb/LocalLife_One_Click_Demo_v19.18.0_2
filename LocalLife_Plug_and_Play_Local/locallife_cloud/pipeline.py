@@ -39,6 +39,7 @@ from .volume import (
     estimate_volume,
     fit_reference_plane,
     fit_support_plane_from_background,
+    reference_plane_is_usable,
     synthesize_plane_depth,
 )
 
@@ -55,6 +56,7 @@ LOGGER = logging.getLogger(__name__)
 NON_WASTE_BAG_QUALIFIERS = {
     "chair", "sofa", "couch", "seat", "cushion", "pillow", "bed", "ottoman", "stool",
     "backpack", "rucksack", "laptop", "briefcase", "duffel", "sports", "handbag", "purse",
+    "laundry", "hamper", "basket", "storage",
 }
 
 # A phantom/silhouette detection (see geometry.fuse_scene_detections /
@@ -90,6 +92,9 @@ NEGATIVE_WASTE_LABELS = {
     "backpack", "rucksack", "laptop bag", "briefcase", "duffel bag", "sports bag",
     "handbag", "purse", "shoe", "sneaker", "sandal", "slipper", "boot", "clothing",
     "person", "hand", "foot",
+    "laundry basket", "laundry hamper", "fabric storage basket", "curtain", "drape",
+    "chair cover", "floor mat", "rug", "power cable", "power adapter", "power strip",
+    "charger", "door",
 }
 
 
@@ -136,11 +141,35 @@ def reject_prompt_conflicts(detections: list[Detection]) -> list[Detection]:
     for detection in detections:
         if not is_supported_waste_detection(detection.label):
             continue
-        conflict = any(
-            intersection_over_union(detection.box, negative.box) >= 0.35
-            and negative.confidence >= detection.confidence * 0.8
-            for negative in negatives
-        )
+        conflict = False
+        for negative in negatives:
+            ax1, ay1, ax2, ay2 = detection.box
+            bx1, by1, bx2, by2 = negative.box
+            intersection = max(0, min(ax2, bx2) - max(ax1, bx1)) * max(
+                0, min(ay2, by2) - max(ay1, by1)
+            )
+            smaller_box = max(1, min(
+                max(0, ax2 - ax1) * max(0, ay2 - ay1),
+                max(0, bx2 - bx1) * max(0, by2 - by1),
+            ))
+            containment = intersection / smaller_box
+            mask_overlap = 0.0
+            if (
+                detection.mask is not None and negative.mask is not None
+                and detection.mask.shape == negative.mask.shape
+            ):
+                smaller_mask = max(1, min(
+                    int(np.count_nonzero(detection.mask)), int(np.count_nonzero(negative.mask)),
+                ))
+                mask_overlap = int(np.count_nonzero(detection.mask & negative.mask)) / smaller_mask
+            overlaps = (
+                intersection_over_union(detection.box, negative.box) >= 0.25
+                or containment >= 0.55
+                or mask_overlap >= 0.45
+            )
+            if overlaps and negative.confidence >= detection.confidence * 0.60:
+                conflict = True
+                break
         if not conflict:
             accepted.append(detection)
     return accepted
@@ -210,7 +239,7 @@ def deduplicate_overlapping_detections(
     """
     frame_height, frame_width = frame_shape[:2]
     unique: list[Detection] = []
-    for candidate in sorted(detections, key=lambda item: (-item.confidence, item.area_pixels)):
+    for candidate in sorted(detections, key=lambda item: (-item.confidence, -item.area_pixels)):
         duplicate = False
         candidate_mask = combined_mask([candidate], (frame_height, frame_width))
         candidate_area = max(1, int(np.count_nonzero(candidate_mask)))
@@ -220,9 +249,20 @@ def deduplicate_overlapping_detections(
             existing_mask = combined_mask([existing], (frame_height, frame_width))
             smaller = min(candidate_area, max(1, int(np.count_nonzero(existing_mask))))
             nested = int(np.count_nonzero(candidate_mask & existing_mask)) / smaller
+            ax1, ay1, ax2, ay2 = candidate.box
+            bx1, by1, bx2, by2 = existing.box
+            box_intersection = max(0, min(ax2, bx2) - max(ax1, bx1)) * max(
+                0, min(ay2, by2) - max(ay1, by1)
+            )
+            smaller_box = max(1, min(
+                max(0, ax2 - ax1) * max(0, ay2 - ay1),
+                max(0, bx2 - bx1) * max(0, by2 - by1),
+            ))
+            box_nested = box_intersection / smaller_box
             if (
                 intersection_over_union(candidate.box, existing.box) >= iou_threshold
                 or nested >= nested_threshold
+                or box_nested >= nested_threshold
             ):
                 duplicate = True
                 break
@@ -530,7 +570,11 @@ class VisionPipeline:
             )
             floor = self.baseline_monocular if self.camera_id == "logitech" else self.baseline_realsense
             region = fixed_bin_mask(image.shape, self.config.roi, self.config.bin_polygon)
-            self.reference_plane = fit_reference_plane(floor, self.latest_intrinsics, mask=region)
+            fitted_plane = fit_reference_plane(floor, self.latest_intrinsics, mask=region)
+            # Never publish dimensions from a baseline that does not contain
+            # one coherent support surface. The depth/reference arrays remain
+            # saved, but unsafe plane-relative L/W/H stays unavailable.
+            self.reference_plane = fitted_plane if reference_plane_is_usable(fitted_plane) else None
             self._occupied_logitech_mask = (
                 np.zeros(image.shape[:2], dtype=bool) if self.camera_id == "logitech" else None
             )
@@ -928,7 +972,14 @@ class VisionPipeline:
         if self.reference_plane is None and intrinsics is not None:
             floor = self.reference_monocular if self.camera_id == "logitech" else self.reference_realsense
             if floor is not None:
-                self.reference_plane = fit_reference_plane(floor, intrinsics, mask=bin_region)
+                fitted_plane = fit_reference_plane(floor, intrinsics, mask=bin_region)
+                if reference_plane_is_usable(fitted_plane):
+                    self.reference_plane = fitted_plane
+                else:
+                    warnings.append(
+                        "The captured reference does not contain one reliable support plane; "
+                        "metric dimensions were withheld"
+                    )
         object_mask = combined_mask(detections, frame.shape[:2]) if detections else None
 
         # BUGFIX (round 24) -- the root blocker behind every "pending -
@@ -978,7 +1029,7 @@ class VisionPipeline:
                 object_mask=object_mask,
                 region_mask=bin_region,
             )
-            if live_plane is not None:
+            if reference_plane_is_usable(live_plane):
                 # Use this one plane consistently for height, footprint and
                 # synthetic reference depth in the current measurement.  The
                 # old path kept the first live plane for height while creating
@@ -997,6 +1048,12 @@ class VisionPipeline:
                             "Measured against a support plane fitted from this frame's own background; "
                             "capture an empty-scene baseline for the most accurate results"
                         )
+            elif live_plane is not None:
+                warnings.append(
+                    f"Rejected an unreliable live support plane "
+                    f"({live_plane.residual_rmse_m * 1000.0:.1f} mm RMSE); "
+                    "capture a genuinely empty-scene baseline before trusting dimensions"
+                )
         # `hardware_total`/`monocular_total` (the per-camera aggregate liters
         # figure rendered as the dashboard's "CURRENT VOLUME" metric, and --
         # before the fix above -- also `calibrate_known_volume()`'s implicit
@@ -1457,11 +1514,29 @@ class VisionPipeline:
         for detection in detections:
             if detection.track_id is not None:
                 colors = self._color_history[detection.track_id]
-                if detection.color not in {"unknown", ""}:
+                # A tracked prediction repeats the previous frame's colour;
+                # counting it as a new vote made one early brown/black error
+                # impossible to correct after the detector recovered.
+                if (
+                    detection.color not in {"unknown", ""}
+                    and detection.source != "tracked-prediction"
+                    and not _is_phantom_detection(detection)
+                ):
                     colors.append(detection.color)
                 if colors:
                     detection.color = Counter(colors).most_common(1)[0][0]
-                if self.material_classifier is not None and self.material_classifier.enabled:
+                canonical_material = {
+                    "plastic_bag": "polythene bag",
+                    "paper_bag": "paper bag",
+                    "cardboard_box": "cardboard",
+                }.get(detection.accepted_class)
+                if canonical_material is not None:
+                    # The accepted class is stronger material evidence than
+                    # a generic crop classifier. This prevents a confirmed
+                    # cardboard box being reported as plastic (image2_1).
+                    detection.material = canonical_material
+                    detection.material_confidence = 1.0
+                elif self.material_classifier is not None and self.material_classifier.enabled:
                     materials = self._material_history[detection.track_id]
                     frame_count = self._material_frame_counts[detection.track_id]
                     due = frame_count % max(1, self.config.material_reclassify_frames) == 0

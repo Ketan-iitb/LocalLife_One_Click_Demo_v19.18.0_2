@@ -235,9 +235,11 @@ class ContainerSegmentationTests(unittest.TestCase):
     def test_default_prompts_target_bags_and_boxes_only(self) -> None:
         config = AppConfig()
         prompts = config.prompts
-        self.assertIn("garbage bag", prompts)
-        self.assertIn("garbage sack", prompts)
-        self.assertIn("black trash bag", prompts)
+        self.assertIn("plastic garbage bag", prompts)
+        self.assertIn("transparent plastic waste bag", prompts)
+        self.assertNotIn("garbage bag", prompts)
+        self.assertNotIn("black garbage bag", prompts)
+        self.assertNotIn("white garbage bag", prompts)
         self.assertTrue(all(is_supported_waste_detection(prompt) for prompt in prompts))
         self.assertIn("cardboard shipping box", prompts)
         self.assertNotIn("person", prompts)

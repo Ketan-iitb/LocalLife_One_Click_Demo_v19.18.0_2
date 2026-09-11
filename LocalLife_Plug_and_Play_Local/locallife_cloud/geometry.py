@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import colorsys
-from collections import deque
+from collections import Counter, deque
 from math import hypot
 from typing import Iterable, Sequence
 
@@ -622,13 +622,29 @@ def _lab_b_channel(blue: float, green: float, red: float) -> float:
     correction means "yellow-leaning", negative means "blue-leaning", and
     values near zero are genuinely chromatically neutral. `blue`/`green`/
     `red` are 0.0-1.0 floats (this function's callers already have those).
-    Returns 0.0 (chromatically neutral) if OpenCV is unavailable, which
-    degrades to the pre-existing HSV-only behaviour rather than crashing.
+    Uses an equivalent sRGB-to-CIELAB calculation if OpenCV is unavailable.
     """
     try:
         import cv2
     except ImportError:
-        return 0.0
+        rgb = np.asarray((red, green, blue), dtype=np.float64)
+        linear = np.where(
+            rgb <= 0.04045,
+            rgb / 12.92,
+            ((rgb + 0.055) / 1.055) ** 2.4,
+        )
+        # sRGB D65 -> XYZ, followed by the CIELAB b* axis.
+        x, y, z = np.array((
+            (0.4124564, 0.3575761, 0.1804375),
+            (0.2126729, 0.7151522, 0.0721750),
+            (0.0193339, 0.1191920, 0.9503041),
+        )) @ linear
+        delta = 6.0 / 29.0
+
+        def lab_curve(value: float) -> float:
+            return value ** (1.0 / 3.0) if value > delta**3 else value / (3 * delta**2) + 4.0 / 29.0
+
+        return float(200.0 * (lab_curve(y) - lab_curve(z / 1.08883)))
     pixel = np.array([[[blue * 255.0, green * 255.0, red * 255.0]]], dtype=np.float32)
     lab = cv2.cvtColor(np.clip(pixel, 0.0, 255.0).astype(np.uint8), cv2.COLOR_BGR2LAB)
     return float(lab[0, 0, 2]) - 128.0
@@ -649,28 +665,83 @@ def dominant_color(frame_bgr: np.ndarray, mask: np.ndarray | None) -> str:
         try:
             import cv2
 
-            radius = max(1, min(7, int(np.sqrt(area) * 0.035)))
+            radius = max(3, min(14, int(np.sqrt(area) * 0.05)))
+            kernel = np.ones((3, 3), dtype=np.uint8)
+            # Drop the outermost pixel: segmentation antialiasing and loose
+            # masks put background carpet/chair pixels exactly there.  The
+            # band just inside that edge is the bag skin we want.
+            inner = cv2.erode(material.astype(np.uint8), kernel, iterations=1).astype(bool)
             eroded = cv2.erode(
-                material.astype(np.uint8), np.ones((3, 3), dtype=np.uint8), iterations=radius
+                material.astype(np.uint8), kernel, iterations=radius
             ).astype(bool)
-            boundary = material & ~eroded
+            boundary = inner & ~eroded
             if int(np.count_nonzero(boundary)) >= max(20, int(area * 0.06)):
                 material = boundary
         except ImportError:
             from numpy.lib.stride_tricks import sliding_window_view
 
-            radius = max(1, min(7, int(np.sqrt(area) * 0.035)))
+            radius = max(3, min(14, int(np.sqrt(area) * 0.05)))
+            inner = material.copy()
+            windows = sliding_window_view(
+                np.pad(inner.astype(np.uint8), 1, mode="constant"), (3, 3)
+            )
+            inner = np.all(windows, axis=(-2, -1))
             eroded = material.copy()
             for _ in range(radius):
                 windows = sliding_window_view(
                     np.pad(eroded.astype(np.uint8), 1, mode="constant"), (3, 3)
                 )
                 eroded = np.all(windows, axis=(-2, -1))
-            boundary = material & ~eroded
+            boundary = inner & ~eroded
             if int(np.count_nonzero(boundary)) >= max(20, int(area * 0.06)):
                 material = boundary
 
     selected = frame_bgr[material].astype(np.float32)
+    if selected.shape[0] > 20_000:
+        selected = selected[np.linspace(0, selected.shape[0] - 1, 20_000, dtype=np.int64)]
+
+    # Do not average unlike colours into a third, fictional colour.  That was
+    # happening on the green translucent bag in the hardware screenshots:
+    # green plastic plus a few brown carpet/chair pixels produced a brown RGB
+    # median.  Vote by hue among sufficiently bright/chromatic skin pixels;
+    # keep the median path below for black/white/grey and pale translucent
+    # material where hue evidence is genuinely weak.
+    normalized = selected / 255.0
+    bgr_max = np.max(normalized, axis=1)
+    bgr_min = np.min(normalized, axis=1)
+    pixel_saturation = (bgr_max - bgr_min) / np.maximum(bgr_max, 1e-8)
+    chromatic = (pixel_saturation >= 0.18) & (bgr_max >= 0.18)
+    chromatic_count = int(np.count_nonzero(chromatic))
+    if chromatic_count >= max(20, int(selected.shape[0] * 0.22)):
+        votes: Counter[str] = Counter()
+        for pixel, saturation_value, brightness in zip(
+            normalized[chromatic], pixel_saturation[chromatic], bgr_max[chromatic], strict=True,
+        ):
+            blue_pixel, green_pixel, red_pixel = (float(value) for value in pixel)
+            degrees_pixel = colorsys.rgb_to_hsv(red_pixel, green_pixel, blue_pixel)[0] * 360.0
+            if degrees_pixel < 12 or degrees_pixel >= 345:
+                category = "red"
+            elif degrees_pixel < 38:
+                category = "orange" if brightness >= 0.50 else "brown"
+            elif degrees_pixel < 70:
+                category = "yellow" if brightness >= 0.52 else "brown"
+            elif degrees_pixel < 165:
+                category = "green"
+            elif degrees_pixel < 195:
+                category = "cyan"
+            elif degrees_pixel < 260:
+                category = "blue"
+            elif degrees_pixel < 320:
+                category = "purple"
+            else:
+                category = "pink"
+            votes[category] += float(saturation_value * brightness)
+        if votes:
+            category, evidence = votes.most_common(1)[0]
+            total_evidence = sum(votes.values())
+            if evidence >= total_evidence * 0.40:
+                return category
+
     blue, green, red = (float(value) / 255.0 for value in np.median(selected, axis=0))
     hue, saturation, value = colorsys.rgb_to_hsv(red, green, blue)
     degrees = hue * 360.0

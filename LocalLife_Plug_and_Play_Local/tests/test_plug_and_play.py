@@ -243,6 +243,17 @@ class PlugAndPlayProfileTests(unittest.TestCase):
         self.assertEqual(reject_prompt_conflicts([bag, pillow]), [])
         self.assertEqual(reject_prompt_conflicts([bag]), [bag])
 
+    def test_lower_confidence_curtain_prompt_vetoes_contained_bag_label(self) -> None:
+        bag = Detection("plastic garbage bag", 0.80, (10, 10, 90, 95))
+        curtain = Detection("curtain", 0.50, (15, 8, 85, 98))
+        self.assertEqual(reject_prompt_conflicts([bag, curtain]), [])
+
+    def test_laundry_bag_or_basket_is_not_accepted_as_waste(self) -> None:
+        from locallife_cloud.pipeline import accepted_object_class
+
+        self.assertIsNone(accepted_object_class("laundry bag"))
+        self.assertIsNone(accepted_object_class("laundry basket"))
+
 
 if __name__ == "__main__":
     unittest.main()

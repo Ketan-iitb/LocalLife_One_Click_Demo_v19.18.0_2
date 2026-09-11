@@ -66,6 +66,19 @@ class RobustPlugAndPlayTests(unittest.TestCase):
         frame[20:80, 72:80] = (0, 180, 0)
         self.assertEqual(dominant_color(frame, mask), "green")
 
+    def test_green_bag_skin_wins_over_brown_mask_edge_and_orange_contents(self) -> None:
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        mask = np.zeros((100, 100), dtype=bool)
+        mask[15:85, 15:85] = True
+        frame[mask] = (0, 175, 0)  # green bag skin
+        frame[27:73, 27:73] = (0, 120, 245)  # orange contents
+        frame[15, 15:85] = (45, 70, 105)  # brown one-pixel mask leakage
+        frame[84, 15:85] = (45, 70, 105)
+        frame[15:85, 15] = (45, 70, 105)
+        frame[15:85, 84] = (45, 70, 105)
+
+        self.assertEqual(dominant_color(frame, mask), "green")
+
     def test_tiny_and_low_confidence_scene_objects_are_rejected(self) -> None:
         config = AppConfig(
             min_component_pixels=100, bag_only=True, detector_confidence=.25,

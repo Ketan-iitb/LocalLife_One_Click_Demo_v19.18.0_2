@@ -47,6 +47,21 @@ class ReferencePlane:
         }
 
 
+MAX_REFERENCE_PLANE_RMSE_M = 0.008
+
+
+def reference_plane_is_usable(
+    plane: ReferencePlane | None, *, maximum_rmse_m: float = MAX_REFERENCE_PLANE_RMSE_M,
+) -> bool:
+    """Whether a support plane is accurate enough to publish metric L/W/H."""
+    return bool(
+        plane is not None
+        and plane.coefficients is not None
+        and np.isfinite(plane.residual_rmse_m)
+        and plane.residual_rmse_m <= maximum_rmse_m
+    )
+
+
 def fit_reference_plane(
     depth_m: np.ndarray | None,
     intrinsics: CameraIntrinsics | None,
@@ -73,14 +88,57 @@ def fit_reference_plane(
     x = (columns.astype(np.float64) - intrinsics.ppx) * z / intrinsics.fx
     y = (rows.astype(np.float64) - intrinsics.ppy) * z / intrinsics.fy
     design = np.column_stack((x, y, np.ones_like(z)))
-    coefficients = np.linalg.lstsq(design, z, rcond=None)[0]
-    residual = z - design @ coefficients
-    deviation = np.abs(residual - np.median(residual))
-    robust_sigma = max(0.0005, 1.4826 * float(np.median(deviation)))
-    inliers = deviation <= max(0.003, 3.5 * robust_sigma)
-    if int(np.count_nonzero(inliers)) >= minimum_samples:
-        design, z = design[inliers], z[inliers]
+
+    # A single least-squares fit across a room averages the floor, wall,
+    # chair and cables into a plane that does not physically exist.  That is
+    # exactly what the hardware screenshots exposed: 78-94 cm "height" for
+    # a measured 21.5 cm box, accompanied by high_plane_rmse.  Use a small,
+    # deterministic RANSAC search to find the dominant coherent surface,
+    # then refine only its inliers.
+    rng = np.random.default_rng(0)
+    best_inliers: np.ndarray | None = None
+    best_score: tuple[int, float] = (-1, float("-inf"))
+    ransac_gate_m = 0.012
+    if z.size >= 3:
+        for _ in range(72):
+            indices = rng.choice(z.size, size=3, replace=False)
+            seed_design = design[indices]
+            if np.linalg.cond(seed_design) > 1e7:
+                continue
+            candidate = np.linalg.solve(seed_design, z[indices])
+            if not np.all(np.isfinite(candidate)):
+                continue
+            absolute = np.abs(z - design @ candidate)
+            inliers = absolute <= ransac_gate_m
+            count = int(np.count_nonzero(inliers))
+            median_error = float(np.median(absolute[inliers])) if count else float("inf")
+            score = (count, -median_error)
+            if score > best_score:
+                best_score = score
+                best_inliers = inliers
+
+    minimum_inliers = max(minimum_samples, int(np.ceil(z.size * 0.18)))
+    if best_inliers is None or int(np.count_nonzero(best_inliers)) < minimum_inliers:
+        # Preserve a conservative fallback for small, already-clean masks.
         coefficients = np.linalg.lstsq(design, z, rcond=None)[0]
+        residual = z - design @ coefficients
+        deviation = np.abs(residual - np.median(residual))
+        robust_sigma = max(0.0005, 1.4826 * float(np.median(deviation)))
+        inliers = deviation <= max(0.003, 3.5 * robust_sigma)
+    else:
+        coefficients = np.linalg.lstsq(design[best_inliers], z[best_inliers], rcond=None)[0]
+        residual = z - design @ coefficients
+        seed_residual = residual[best_inliers]
+        robust_sigma = max(
+            0.0005,
+            1.4826 * float(np.median(np.abs(seed_residual - np.median(seed_residual)))),
+        )
+        inliers = np.abs(residual) <= max(0.004, min(ransac_gate_m, 3.5 * robust_sigma))
+
+    if int(np.count_nonzero(inliers)) < minimum_samples:
+        return None
+    design, z = design[inliers], z[inliers]
+    coefficients = np.linalg.lstsq(design, z, rcond=None)[0]
     normal = np.array((-coefficients[0], -coefficients[1], 1.0), dtype=np.float64)
     normal /= np.linalg.norm(normal)
     residual = z - design @ coefficients
@@ -137,6 +195,15 @@ def fit_support_plane_from_background(
     if object_mask is not None and object_mask.shape == background.shape:
         excluded = object_mask.astype(bool)
         if np.any(excluded):
+            # The support surface for this installation is below/alongside
+            # the object in image space. Prefer the lower band surrounding
+            # the object so a large wall or doorway cannot outvote the floor.
+            object_rows = np.nonzero(excluded)[0]
+            lower_start = int(np.percentile(object_rows, 35.0))
+            lower_band = background.copy()
+            lower_band[:lower_start, :] = False
+            if int(np.count_nonzero(lower_band & ~excluded)) >= minimum_samples:
+                background = lower_band
             try:
                 import cv2
 

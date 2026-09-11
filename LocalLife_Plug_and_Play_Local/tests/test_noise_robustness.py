@@ -262,6 +262,20 @@ class DeduplicateOverlappingDetectionsTests(unittest.TestCase):
         result = deduplicate_overlapping_detections([first, second], shape)
         self.assertEqual(len(result), 2)
 
+    def test_nested_prompt_duplicates_collapse_even_when_masks_do_not_overlap(self) -> None:
+        shape = (120, 120)
+        outer_mask = np.zeros(shape, dtype=bool)
+        outer_mask[10:25, 10:100] = True
+        inner_mask = np.zeros(shape, dtype=bool)
+        inner_mask[40:80, 40:80] = True
+        outer = Detection("plastic garbage bag", 0.91, (10, 10, 100, 100), outer_mask)
+        inner = Detection("filled plastic waste bag", 0.88, (35, 35, 85, 85), inner_mask)
+
+        result = deduplicate_overlapping_detections([outer, inner], shape)
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].confidence, 0.91)
+
 
 class DetectorSequence:
     """Returns a fixed list of detections per call, mimicking an intermittent

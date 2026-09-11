@@ -10,33 +10,20 @@ import numpy as np
 
 
 DEFAULT_PROMPTS = (
-    # Accepted families.  Keep wording specific: a bare "bag" prompt makes
-    # backpacks, laptop cases and handbags compete as waste bags.
-    "garbage bag",
-    "large garbage bag",
-    "colored garbage bag",
-    "full garbage bag",
-    "tied garbage bag",
-    "black garbage bag",
-    "white garbage bag",
-    "trash bag",
-    "full trash bag",
-    "black trash bag",
-    "bin bag",
-    "garbage sack",
-    "filled waste sack",
-    "plastic waste sack",
-    "refuse sack",
-    "rubbish sack",
+    # Keep this bank compact and material-specific.  The live image set from
+    # 2026-09-10 showed that many near-synonymous shape/colour prompts
+    # independently proposed the same object, while prompts such as "black
+    # garbage bag" biased a visibly green bag toward black.  Colour is
+    # measured from pixels, never encoded in the detector prompt.
+    "plastic garbage bag",
+    "plastic trash bag",
     "filled plastic waste bag",
-    "plastic polythene bag",
-    "filled polythene bag",
+    "polythene waste bag",
+    "transparent plastic waste bag",
     "paper waste bag",
-    "paper sack",
     "kraft paper bag",
     "cardboard box",
     "cardboard shipping box",
-    "parcel box",
     "carton box",
 )
 
@@ -74,6 +61,20 @@ DEFAULT_NEGATIVE_PROMPTS = (
     "person",
     "hand",
     "foot",
+    # Lookalikes observed in the 2026-09-10 hardware screenshots.
+    "laundry basket",
+    "laundry hamper",
+    "fabric storage basket",
+    "curtain",
+    "drape",
+    "chair cover",
+    "floor mat",
+    "rug",
+    "power cable",
+    "power adapter",
+    "power strip",
+    "charger",
+    "door",
 )
 
 
