@@ -275,6 +275,108 @@ def synthesize_plane_depth(
     return depth.astype(np.float32)
 
 
+def recover_elevated_object_mask(
+    depth_m: np.ndarray | None,
+    intrinsics: CameraIntrinsics | None,
+    seed_mask: np.ndarray | None,
+    reference_plane: ReferencePlane | None,
+    *,
+    measurement_mask: np.ndarray | None = None,
+    min_height_m: float = 0.025,
+    max_height_m: float = 0.80,
+    min_points: int = 60,
+    max_expansion: float = 6.0,
+) -> np.ndarray | None:
+    """Recover the complete depth surface anchored by a semantic detection.
+
+    Open-vocabulary segmentation can cover only a printed logo or the centre
+    panel of a pale paper/plastic bag. Measuring that partial mask produces a
+    plausible distance but a severely undersized footprint and height. Once a
+    trustworthy support plane exists, RealSense itself can identify all pixels
+    physically elevated above that plane. This function returns only the
+    connected elevated component that overlaps the semantic seed, so an
+    unrelated raised object elsewhere in the frame is never promoted to waste.
+
+    The result is a *measurement mask*, not a new classifier: without an
+    accepted plastic-bag, paper-bag, or cardboard seed, nothing is recovered.
+    """
+    if (
+        depth_m is None or intrinsics is None or seed_mask is None
+        or depth_m.ndim != 2 or seed_mask.shape != depth_m.shape
+        or not reference_plane_is_usable(reference_plane)
+    ):
+        return None
+    if measurement_mask is not None and measurement_mask.shape != depth_m.shape:
+        return None
+    if min_points < 1 or max_expansion < 1.0:
+        return None
+
+    seed = seed_mask.astype(bool)
+    region = np.ones(depth_m.shape, dtype=bool)
+    if measurement_mask is not None:
+        region &= measurement_mask.astype(bool)
+    seed &= region
+    seed_pixels = int(np.count_nonzero(seed))
+    if seed_pixels < min_points:
+        return None
+
+    depth = depth_m.astype(np.float64, copy=False)
+    height_map = _plane_perpendicular_height(
+        depth, intrinsics, reference_plane.coefficients,
+    )
+    if height_map is None:
+        return None
+    elevated = (
+        region
+        & np.isfinite(depth)
+        & (depth > 0.10)
+        & (depth < 20.0)
+        & np.isfinite(height_map)
+        & (height_map >= min_height_m)
+        & (height_map <= max_height_m)
+    )
+
+    # Bridge only small RealSense holes on the same physical surface. A tight
+    # close is sufficient for stereo speckle and cannot span the large gap to
+    # a second object elsewhere in the scene.
+    try:
+        import cv2
+
+        elevated = cv2.morphologyEx(
+            elevated.astype(np.uint8), cv2.MORPH_CLOSE,
+            np.ones((5, 5), dtype=np.uint8), iterations=1,
+        ).astype(bool)
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            elevated.astype(np.uint8), connectivity=8,
+        )
+        components = [
+            labels == index for index in range(1, count)
+            if int(stats[index, cv2.CC_STAT_AREA]) >= min_points
+        ]
+    except ImportError:
+        from .geometry import connected_components
+
+        components = connected_components(elevated, min_area=min_points)
+
+    best: np.ndarray | None = None
+    best_overlap = 0
+    for component in components:
+        overlap = int(np.count_nonzero(component & seed))
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best = component.astype(bool)
+    minimum_overlap = max(12, min_points // 4, int(np.ceil(seed_pixels * 0.015)))
+    if best is None or best_overlap < minimum_overlap:
+        return None
+
+    recovered_pixels = int(np.count_nonzero(best))
+    if recovered_pixels > int(seed_pixels * max_expansion):
+        # A huge jump is more likely a contaminated/incorrect plane than a
+        # legitimately partial object mask. Keep the semantic seed instead.
+        return None
+    return best
+
+
 def _plane_perpendicular_height(
     depth_m: np.ndarray,
     intrinsics: CameraIntrinsics,

@@ -16,6 +16,7 @@ from .config import AppConfig
 from .geometry import (
     combined_mask,
     detect_scene_objects,
+    dominant_color,
     fixed_bin_mask,
     fuse_scene_detections,
     intersection_over_union,
@@ -40,6 +41,7 @@ from .volume import (
     fit_reference_plane,
     fit_support_plane_from_background,
     reference_plane_is_usable,
+    recover_elevated_object_mask,
     synthesize_plane_depth,
 )
 
@@ -89,6 +91,7 @@ def is_supported_waste_detection(label: str) -> bool:
 NEGATIVE_WASTE_LABELS = {
     "pillow", "cushion", "blanket", "bedding", "chair", "office chair", "chair wheel",
     "furniture", "furniture leg", "bottle", "plastic bottle", "lotion bottle",
+    "soda can", "aluminium drink can", "aluminum drink can", "tin can", "drink can",
     "backpack", "rucksack", "laptop bag", "briefcase", "duffel bag", "sports bag",
     "handbag", "purse", "shoe", "sneaker", "sandal", "slipper", "boot", "clothing",
     "person", "hand", "foot",
@@ -1071,9 +1074,43 @@ class VisionPipeline:
         # contaminate in that case). `combined_mask()` safely returns an
         # all-False mask for an empty list, and `estimate_volume()` rejects
         # an all-False mask via its own pixel-count floor.
+        measurement_masks: dict[int, np.ndarray] = {}
+        recovered_measurement_ids: set[int] = set()
+        if (
+            self.camera_id != "logitech"
+            and depth_m is not None
+            and intrinsics is not None
+            and reference_plane_is_usable(measurement_plane)
+        ):
+            for detection in detections:
+                if detection.accepted_class is None or _is_phantom_detection(detection):
+                    continue
+                seed = combined_mask([detection], frame.shape[:2])
+                recovered = recover_elevated_object_mask(
+                    depth_m,
+                    intrinsics,
+                    seed,
+                    measurement_plane,
+                    measurement_mask=bin_region,
+                    min_height_m=self.config.min_object_height_m,
+                    max_height_m=self.config.max_object_height_m,
+                    min_points=min(60, self.config.min_component_pixels),
+                )
+                if recovered is not None and int(np.count_nonzero(recovered)) > int(np.count_nonzero(seed) * 1.08):
+                    measurement_masks[id(detection)] = recovered
+                    recovered_measurement_ids.add(id(detection))
+                    # Re-evaluate colour on the full physical surface. This
+                    # avoids a red logo, carpet halo, or small shaded centre
+                    # patch deciding the colour of an otherwise white bag.
+                    detection.color = dominant_color(frame, recovered)
+
         confirmed_detections = [item for item in detections if not _is_phantom_detection(item)]
         aggregate_detections = confirmed_detections if confirmed_detections else detections
-        confirmed_object_mask = combined_mask(aggregate_detections, frame.shape[:2])
+        confirmed_object_mask = np.zeros(frame.shape[:2], dtype=bool)
+        for item in aggregate_detections:
+            confirmed_object_mask |= measurement_masks.get(
+                id(item), combined_mask([item], frame.shape[:2]),
+            )
         logitech_ready = self.camera_id != "logitech" or self._logitech_measurement_ready()
         provisional_logitech = (
             self.camera_id == "logitech" and self.calibration_mode == "model-metric-unverified"
@@ -1213,7 +1250,9 @@ class VisionPipeline:
                 warnings.append("Capture an empty Logitech baseline before comparing volumes")
 
         for detection in detections:
-            instance_mask = combined_mask([detection], frame.shape[:2])
+            instance_mask = measurement_masks.get(
+                id(detection), combined_mask([detection], frame.shape[:2]),
+            )
             logitech_height_coherent = True
             if depth_m is not None:
                 valid_distance = instance_mask & np.isfinite(depth_m) & (depth_m > 0.10) & (depth_m < 20.0)
@@ -1338,6 +1377,8 @@ class VisionPipeline:
                     ("live_fitted_support_plane",)
                     if self.support_plane_source == "live-frame-background" else ()
                 )
+                if id(detection) in recovered_measurement_ids:
+                    extra_dimension_flags += ("support_plane_mask_recovered",)
                 detection.dimension_flags = tuple(dimensions.flags) + extra_dimension_flags
                 detection.dimension_method = dimensions.method
                 # Use the same plane-relative, elevated-point height shown in
@@ -1379,6 +1420,8 @@ class VisionPipeline:
                     extra_flags: tuple[str, ...] = ()
                     if self.support_plane_source == "live-frame-background":
                         extra_flags += ("live_fitted_support_plane",)
+                    if id(detection) in recovered_measurement_ids:
+                        extra_flags += ("support_plane_mask_recovered",)
                     if extra_flags:
                         cuboid = replace(cuboid, flags=tuple(cuboid.flags) + extra_flags)
                 # `detection.track_id` is not assigned yet at this point in

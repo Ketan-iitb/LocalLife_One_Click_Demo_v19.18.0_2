@@ -10,13 +10,11 @@ dimensions are known exactly rather than estimated from noisy single-view
 depth.
 
 Per the PDF's explicit instruction ("Record the real box dimensions with a
-ruler/caliper; do not let code or an LLM invent them"), the shipped
-`box_templates.yaml` ships with every dimension a `0` placeholder and
-`measured: false`. `match_box_template()` only ever matches a template with
-`measured: true` -- this module never fabricates a "close enough" match
-against a template it knows is unmeasured. Replace the placeholders in
-`box_templates.yaml` with your own caliper measurements of the exact milk
-boxes you are testing with, and flip `measured: true`, to enable matching.
+ruler/caliper; do not let code or an LLM invent them"), a template only
+matches when `measured: true`. The active entries in `box_templates.yaml`
+come from the tester's ruler-annotated reference filenames; deformable bags
+remain excluded because outer dimensions alone do not establish their filled
+volume.
 """
 
 from __future__ import annotations

@@ -34,6 +34,7 @@ from locallife_cloud.volume import (
     estimate_box_volume_cuboid,
     estimate_object_dimensions,
     fit_reference_plane,
+    recover_elevated_object_mask,
     reference_plane_is_usable,
 )
 
@@ -150,6 +151,38 @@ class BoxCuboidVolumeTests(unittest.TestCase):
         self.assertAlmostEqual(with_halo.length_mm, clean.length_mm, delta=0.5)
         self.assertAlmostEqual(with_halo.width_mm, clean.width_mm, delta=0.5)
         self.assertAlmostEqual(with_halo.height_mm, clean.height_mm, delta=0.5)
+
+    def test_support_plane_recovers_full_object_from_partial_semantic_seed(self) -> None:
+        depth, full_mask, intrinsics, plane = self._scene_and_plane()
+        rows, columns = np.where(full_mask)
+        seed = np.zeros_like(full_mask)
+        # Model a detector that sees only the printed centre panel/logo.
+        seed[rows.min() + 4:rows.max() - 3, columns.min() + 10:columns.max() - 9] = True
+
+        recovered = recover_elevated_object_mask(
+            depth, intrinsics, seed, plane, min_points=20,
+        )
+
+        self.assertIsNotNone(recovered)
+        self.assertGreater(np.count_nonzero(recovered), np.count_nonzero(seed) * 2)
+        self.assertGreater(
+            np.count_nonzero(recovered & full_mask) / np.count_nonzero(full_mask), 0.95,
+        )
+
+    def test_support_plane_recovery_does_not_jump_to_second_object(self) -> None:
+        depth, first_mask, intrinsics, plane = self._scene_and_plane(center=105)
+        second_mask = np.zeros_like(first_mask)
+        second_mask[175:215, 180:230] = True
+        depth[second_mask] = np.nanmedian(depth[first_mask])
+        seed = np.zeros_like(first_mask)
+        seed[98:112, 96:114] = True
+
+        recovered = recover_elevated_object_mask(
+            depth, intrinsics, seed, plane, min_points=20,
+        )
+
+        self.assertIsNotNone(recovered)
+        self.assertEqual(np.count_nonzero(recovered & second_mask), 0)
 
     def test_footprint_recovers_true_dimensions_with_no_erosion(self) -> None:
         # Numerically verified exact ground truth (corner-to-corner 3-D
@@ -407,18 +440,25 @@ class BoxTemplateMatchTests(unittest.TestCase):
         match = match_box_template(95.0, 65.0, 200.0, [near, far])
         self.assertEqual(match.template.id, "near")
 
-    def test_shipped_yaml_loads_and_starts_unmeasured(self) -> None:
+    def test_shipped_yaml_loads_measured_parameterised_objects(self) -> None:
         from locallife_cloud.box_templates import load_box_templates
 
         templates = load_box_templates()
-        self.assertEqual(len(templates), 3)
+        self.assertEqual(len(templates), 4)
         ids = {template.id for template in templates}
-        self.assertEqual(ids, {"milk_box_1l", "milk_box_1_5l", "milk_box_2l"})
+        self.assertEqual(ids, {
+            "cardboard_box_215x115x215",
+            "cardboard_box_410x330x140",
+            "chocolate_milk_carton_70x70x230",
+            "milk_carton_95x70x230",
+        })
         for template in templates:
-            self.assertFalse(template.measured)
-            # Every match attempt against the shipped, unmeasured file must
-            # fail -- it must never accidentally "validate" a real box.
-        self.assertIsNone(match_box_template(95.0, 65.0, 200.0, templates))
+            self.assertTrue(template.measured)
+            expected = template.length_mm * template.width_mm * template.height_mm / 1_000_000.0
+            self.assertAlmostEqual(template.nominal_volume_liters, expected, places=6)
+        matched = match_box_template(213.0, 118.0, 211.0, templates)
+        self.assertIsNotNone(matched)
+        self.assertEqual(matched.template.id, "cardboard_box_215x115x215")
 
 
 class _StubBoxDetector:
@@ -686,6 +726,28 @@ class NoCapturedBaselineVolumeTests(unittest.TestCase):
         ]
         self.assertTrue(measured, "a bag must get liters without any captured baseline")
         self.assertGreater(measured[0].realsense_volume_l, 0.0)
+
+    def test_pipeline_recovers_full_white_bag_from_logo_sized_seed(self) -> None:
+        pipeline, camera = self._pipeline_without_any_baseline()
+        frame, depth, full_mask = self._scene()
+        frame[full_mask] = 240
+        seed = np.zeros_like(full_mask)
+        seed[25:40, 30:40] = True
+
+        analysis = pipeline.process_precomputed(
+            frame,
+            detections=[Detection("paper shopping bag", 0.9, (30, 25, 40, 40), seed)],
+            depth_m=depth,
+            intrinsics=camera,
+            timestamp=100.0,
+            persist=False,
+        )
+
+        item = analysis.detections[0]
+        self.assertEqual(item.accepted_class, "paper_bag")
+        self.assertEqual(item.color, "white")
+        self.assertIsNotNone(item.footprint_length_mm)
+        self.assertIn("support_plane_mask_recovered", item.dimension_flags)
 
     def test_pending_reason_is_no_longer_empty_baseline_once_a_plane_is_fitted(self) -> None:
         pipeline, camera = self._pipeline_without_any_baseline()

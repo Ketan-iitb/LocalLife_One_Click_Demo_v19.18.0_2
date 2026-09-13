@@ -2,28 +2,37 @@
 # box_templates.py and the "Revised Dual-Camera Volume Estimation" engineering
 # recipe (sections 5, 14, 16 item 10).
 #
-# Every dimension below is a PLACEHOLDER (0), not a measurement, and
-# `measured: false` disables matching against it. Replace `length`/`width`/
-# `height` with your own ruler/caliper measurement (in millimetres) of the
-# exact milk-box packages you are testing with, then set `measured: true` to
-# enable matching for that box. Do not fill in a plausible-looking number
-# without actually measuring the physical box: the PDF's own instruction is
-# explicit about this ("do not let code or an LLM invent them"), and a wrong
-# "measured" dimension would produce a confidently wrong volume instead of an
-# honestly uncertain one -- worse than no template match at all.
+# These four rigid-object references come directly from the ruler dimensions
+# encoded by the tester in parameterised_objects/ filenames. `length` and
+# `width` are the two support-plane dimensions and `height` is perpendicular
+# to that plane. `nominal_volume_liters` is the external L*W*H cuboid volume,
+# not an assumption about the package's printed liquid capacity.
+#
+# Deformable plastic bags are deliberately absent. Their external bounding
+# dimensions do not reveal the actual filled volume and must not be converted
+# into a calibration factor without an independently known volume.
 boxes:
-  - id: milk_box_1l
-    nominal_volume_liters: 1.0
-    dimensions_mm: { length: 0, width: 0, height: 0 }
-    tolerance_mm: 8
-    measured: false
-  - id: milk_box_1_5l
-    nominal_volume_liters: 1.5
-    dimensions_mm: { length: 0, width: 0, height: 0 }
-    tolerance_mm: 8
-    measured: false
-  - id: milk_box_2l
-    nominal_volume_liters: 2.0
-    dimensions_mm: { length: 0, width: 0, height: 0 }
+  - id: cardboard_box_215x115x215
+    nominal_volume_liters: 5.315875
+    dimensions_mm: { length: 215, width: 115, height: 215 }
     tolerance_mm: 10
-    measured: false
+    measured: true
+    source_image: box_11.5_21.5_21.5_cm.jpg
+  - id: cardboard_box_410x330x140
+    nominal_volume_liters: 18.942
+    dimensions_mm: { length: 410, width: 330, height: 140 }
+    tolerance_mm: 12
+    measured: true
+    source_image: box_41_33_14_cm.jpg
+  - id: chocolate_milk_carton_70x70x230
+    nominal_volume_liters: 1.127
+    dimensions_mm: { length: 70, width: 70, height: 230 }
+    tolerance_mm: 8
+    measured: true
+    source_image: choclate_,milk_box_7_7_23_cm.jpg
+  - id: milk_carton_95x70x230
+    nominal_volume_liters: 1.5295
+    dimensions_mm: { length: 95, width: 70, height: 230 }
+    tolerance_mm: 8
+    measured: true
+    source_image: milk_box_7_9.5_23_cm.jpg

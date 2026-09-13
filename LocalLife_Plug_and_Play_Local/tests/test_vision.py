@@ -242,9 +242,12 @@ class ContainerSegmentationTests(unittest.TestCase):
         self.assertNotIn("white garbage bag", prompts)
         self.assertTrue(all(is_supported_waste_detection(prompt) for prompt in prompts))
         self.assertIn("cardboard shipping box", prompts)
+        self.assertIn("paper shopping bag", prompts)
+        self.assertIn("milk carton", prompts)
         self.assertNotIn("person", prompts)
         self.assertIn("backpack", config.negative_prompts)
         self.assertIn("shoe", config.negative_prompts)
+        self.assertIn("soda can", config.negative_prompts)
 
     def test_local_environment_defaults_skip_expensive_monocular_depth(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
@@ -254,7 +257,7 @@ class ContainerSegmentationTests(unittest.TestCase):
         self.assertEqual(accepted_object_class("filled polythene bag"), "plastic_bag")
         self.assertEqual(accepted_object_class("kraft paper bag"), "paper_bag")
         self.assertEqual(accepted_object_class("cardboard shipping box"), "cardboard_box")
-        for label in ("bag", "backpack", "laptop bag", "shoe", "pillow", "bottle"):
+        for label in ("bag", "backpack", "laptop bag", "shoe", "pillow", "bottle", "soda can"):
             self.assertIsNone(accepted_object_class(label), label)
 
     def test_unclassified_foreground_is_ignored_by_default(self) -> None:

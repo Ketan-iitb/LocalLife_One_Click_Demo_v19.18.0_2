@@ -22,9 +22,12 @@ DEFAULT_PROMPTS = (
     "transparent plastic waste bag",
     "paper waste bag",
     "kraft paper bag",
+    "paper shopping bag",
     "cardboard box",
     "cardboard shipping box",
     "carton box",
+    "milk carton",
+    "drink carton",
 )
 
 # Competing classes are shown to the open-vocabulary detector so it can call
@@ -56,6 +59,9 @@ DEFAULT_NEGATIVE_PROMPTS = (
     "clothing",
     "bottle",
     "lotion bottle",
+    "soda can",
+    "aluminium drink can",
+    "tin can",
     "chair",
     "furniture",
     "person",

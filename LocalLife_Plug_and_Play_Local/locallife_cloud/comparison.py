@@ -13,6 +13,8 @@ from uuid import uuid4
 
 import numpy as np
 
+from . import __version__
+
 from .config import AppConfig
 from .geometry import fixed_bin_mask, is_phantom_source
 from .inference import MetricDepthEstimator, create_segmenter
@@ -589,5 +591,6 @@ class DualCameraCoordinator:
         states = {camera_id: station.state() for camera_id, station in self.pipelines.items()}
         # Preserve the previous single-camera API for existing RealSense bridges.
         return {**states["realsense"], "mode": "independent-dual-camera-comparison",
+                "build_version": __version__,
                 "frames_processed": self.frames_processed, "cameras": states, "comparison": self.comparison(),
                 "fused": self.fused_result(), "recipe_result": self.recipe_result()}

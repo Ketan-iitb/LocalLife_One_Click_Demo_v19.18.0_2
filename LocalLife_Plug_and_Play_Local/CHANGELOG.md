@@ -9,6 +9,68 @@ configuration changes, validation performed, hardware status, and any known
 limitations. This should make it possible to identify the version that
 introduced a regression without guessing from file modification dates.
 
+## v4 — 2026-09-13 — Parameterised-object correction pass
+
+### Status
+
+- Implemented in the local workspace as build `19.19.0-local-ai`; not deployed
+  to the friend's laptop and not yet verified with a physical RealSense frame.
+- No camera firmware, exposure, laser, USB, or other hardware setting changed.
+
+### Evidence reviewed
+
+- Reviewed all nine ruler-annotated photos in `parameterised_objects/` and all
+  seven September 12 result screenshots in `images/`.
+- The screenshots show an older runtime: they render raw labels such as
+  `white garbage bag` and `unclassified object`, whereas the current source
+  displays only canonical `plastic bag`, `paper bag`, or `cardboard box`
+  labels and suppresses unclassified foreground.
+- The live status in the screenshots reports zero baseline frames. In the
+  white-bag case, the semantic mask covers only a central patch/logo, which
+  explains why distance can remain plausible while height and footprint are
+  severely undersized.
+
+### Changes
+
+- Added support-plane-anchored measurement-mask recovery. RealSense may expand
+  an accepted semantic seed to the connected physical surface elevated above
+  the fitted floor, but it cannot create a waste object without an accepted
+  plastic/paper/cardboard detection. Expansion is bounded and cannot jump to
+  an unrelated raised component elsewhere in the scene.
+- Recomputes colour from the recovered physical surface, reducing decisions
+  based on a logo, shaded centre patch, or carpet halo.
+- Added `paper shopping bag`, `milk carton`, and `drink carton` positive
+  prompts; added soda/aluminium/tin can negatives for the Pepsi-can failure.
+- Converted the four measured rigid boxes/cartons into enabled geometry
+  templates. Their reference liters are external L×W×H cuboid volumes, not an
+  assumption about printed liquid capacity.
+- Added `parameterised_objects/reference_objects.csv`; backpacks, laptop bags,
+  and the fabric laundry hamper are explicit negative controls. Deformable bag
+  liters remain blank until an independently known filled volume is supplied.
+- Added a visible `Build 19.19.0-local-ai` badge and `build_version` API field so
+  a stale deployed copy can be identified directly from the screen/state.
+
+### Known limitations
+
+- Static RGB screenshots do not contain raw aligned RealSense depth, camera
+  intrinsics, or per-frame masks, so they cannot prove physical dimension
+  accuracy. A hardware retest with one still object at a time is required.
+- The dimensions encoded in the filenames are now treated as ruler ground
+  truth. No correction factor was fitted to those same objects.
+- Polythene volume calibration remains intentionally pending until known
+  filled volumes are supplied; bounding dimensions alone are insufficient.
+
+### Validation completed
+
+- Reference manifest audit: 9 objects, 6 accepted references, 3 negative
+  controls, and all 4 rigid L×W×H volume calculations verified.
+- Focused detection, colour, geometry, dual-camera, tracking, and Phase 1B
+  validation suite: 201 tests passed.
+- A broader 219-test run passed 217 tests. The two failures are existing
+  patchy-depth morphology tests in the environment without OpenCV; the live
+  camera installation uses the OpenCV path. They were not introduced by v4.
+- Real-camera numerical accuracy remains pending on the friend's laptop.
+
 ## v3 — 2026-09-09 — Phase 1B validation framework
 
 ### Status
