@@ -426,7 +426,11 @@ class DualCameraCoordinator:
                 "per_camera": {},
                 "agreement_l": None,
                 "agreement_percent": None,
-                "message": "Waiting for a confirmed bag or box on either camera",
+                "message": (
+                    "Waiting for a confirmed test object on either camera"
+                    if self.config.operating_mode == "geometry_validation"
+                    else "Waiting for a confirmed bag or box on either camera"
+                ),
             }
 
         volumes = {
@@ -591,6 +595,7 @@ class DualCameraCoordinator:
         states = {camera_id: station.state() for camera_id, station in self.pipelines.items()}
         # Preserve the previous single-camera API for existing RealSense bridges.
         return {**states["realsense"], "mode": "independent-dual-camera-comparison",
+                "operating_mode": self.config.operating_mode,
                 "build_version": __version__,
                 "frames_processed": self.frames_processed, "cameras": states, "comparison": self.comparison(),
                 "fused": self.fused_result(), "recipe_result": self.recipe_result()}

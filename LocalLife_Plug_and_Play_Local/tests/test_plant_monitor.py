@@ -123,6 +123,45 @@ class LedgerTests(unittest.TestCase):
 
 
 class AutomaticDepositTests(unittest.TestCase):
+    def test_geometry_validation_tracks_and_measures_without_writing_waste_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            detector = AdjustableDetector()
+            config = AppConfig(
+                results_dir=Path(temporary), operating_mode="geometry_validation",
+                enable_monocular_depth=False, roi=(0, 0, 1, 1),
+                min_component_pixels=20, tracker_confirm_frames=1,
+                settle_frames=2, volume_window_frames=2, auto_deposit=True,
+            )
+            pipeline = VisionPipeline(config, detector=detector)
+            empty = np.zeros((70, 70, 3), dtype=np.uint8)
+            baseline = np.full((70, 70), 2.0, dtype=np.float32)
+            camera = CameraIntrinsics(fx=100, fy=100, ppx=35, ppy=35)
+            pipeline.set_baseline(empty, baseline, camera)
+            mask = np.zeros((70, 70), dtype=bool)
+            mask[15:55, 18:52] = True
+            detector.detections = [Detection("laptop bag", 0.9, (18, 15, 52, 55), mask)]
+            frame = empty.copy()
+            frame[mask] = (20, 120, 40)
+            depth = baseline.copy()
+            # The annotated laptop sleeve is 20 mm thick: below waste mode's
+            # 25 mm noise gate, but above validation mode's separate 10 mm gate.
+            depth[mask] = 1.98
+
+            for timestamp in (100.0, 101.0, 102.0):
+                analysis = pipeline.process_frame(
+                    frame, depth_m=depth, intrinsics=camera, timestamp=timestamp,
+                )
+
+            state = pipeline.state()
+            self.assertEqual(state["operating_mode"], "geometry_validation")
+            self.assertFalse(state["waste_ledger_enabled"])
+            self.assertFalse(state["auto_deposit"])
+            self.assertEqual(state["session_seen"]["total"], 1)
+            self.assertEqual(analysis.detections[0].accepted_class, "measurement_object")
+            self.assertIsNotNone(analysis.detections[0].footprint_length_mm)
+            self.assertEqual(state["plant"]["observed_count"], 0)
+            self.assertEqual(state["plant"]["deposited_count"], 0)
+
     def test_stable_bag_and_box_are_counted_once_and_color_is_recorded(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             detector = AdjustableDetector()

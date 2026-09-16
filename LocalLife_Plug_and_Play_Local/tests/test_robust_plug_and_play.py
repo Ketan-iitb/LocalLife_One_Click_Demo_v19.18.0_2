@@ -91,6 +91,22 @@ class RobustPlugAndPlayTests(unittest.TestCase):
         real = Detection("full garbage bag", .8, (150, 35, 260, 185))
         self.assertEqual(filter_waste_detections([tiny, uncertain, real], shape, region, config), [real])
 
+    def test_geometry_validation_accepts_household_objects_but_not_operator_or_background(self) -> None:
+        config = AppConfig(
+            operating_mode="geometry_validation", min_component_pixels=20,
+            detector_confidence=.25, roi=(0, 0, 1, 1), enable_monocular_depth=False,
+        )
+        shape = (200, 300, 3)
+        region = fixed_bin_mask(shape, config.roi, ())
+        backpack = Detection("backpack", .8, (30, 30, 130, 160))
+        bottle = Detection("plastic bottle", .8, (170, 40, 220, 170))
+        person = Detection("person", .95, (5, 5, 290, 195))
+
+        retained = filter_waste_detections([backpack, bottle, person], shape, region, config)
+
+        self.assertEqual(retained, [backpack, bottle])
+        self.assertTrue(all(item.accepted_class == "measurement_object" for item in retained))
+
     def test_track_enters_history_when_volume_becomes_stable_later(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             frame = np.zeros((40, 40, 3), dtype=np.uint8)

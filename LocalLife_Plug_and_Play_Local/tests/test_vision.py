@@ -253,6 +253,24 @@ class ContainerSegmentationTests(unittest.TestCase):
         with patch.dict("os.environ", {}, clear=True):
             self.assertFalse(AppConfig.from_env().enable_monocular_depth)
 
+    def test_geometry_validation_mode_is_explicit_and_reversible(self) -> None:
+        with patch.dict("os.environ", {"LOCALLIFE_OPERATING_MODE": "geometry-validation"}, clear=True):
+            config = AppConfig.from_env()
+        self.assertEqual(config.operating_mode, "geometry_validation")
+        self.assertEqual(config.min_object_height_m, 0.025)
+        self.assertEqual(config.geometry_validation_min_object_height_m, 0.010)
+        self.assertIn("backpack", config.geometry_validation_prompts)
+        self.assertEqual(accepted_object_class("backpack", config.operating_mode), "measurement_object")
+        self.assertEqual(accepted_object_class("milk carton", config.operating_mode), "measurement_object")
+        self.assertIsNone(accepted_object_class("person", config.operating_mode))
+        self.assertIsNone(accepted_object_class("floor", config.operating_mode))
+        self.assertIsNone(accepted_object_class("office chair", config.operating_mode))
+
+    def test_invalid_operating_mode_is_rejected(self) -> None:
+        config = AppConfig(operating_mode="anything")
+        with self.assertRaisesRegex(ValueError, "LOCALLIFE_OPERATING_MODE"):
+            config.validate()
+
     def test_only_the_three_configured_waste_families_are_accepted(self) -> None:
         self.assertEqual(accepted_object_class("filled polythene bag"), "plastic_bag")
         self.assertEqual(accepted_object_class("kraft paper bag"), "paper_bag")

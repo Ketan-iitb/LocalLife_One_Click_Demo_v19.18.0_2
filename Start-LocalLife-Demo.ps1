@@ -9,6 +9,11 @@ param(
     [ValidateSet('Local', 'Cloud')]
     [string]$Mode = 'Local',
 
+    # Temporary Phase 1B default. Use -OperatingMode waste to restore the
+    # strict plastic-bag/paper-bag/cardboard-box production classifier.
+    [ValidateSet('waste', 'geometry_validation')]
+    [string]$OperatingMode = 'geometry_validation',
+
     [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]*$')]
     [string]$ProjectDirectory = 'LocalLife_Plug_and_Play_Local',
 
@@ -528,6 +533,7 @@ function Start-RoleWindow {
     $command = '& ' + (Quote-PowerShellLiteral -Value $PSCommandPath) +
         ' -Role ' + (Quote-PowerShellLiteral -Value $ChildRole) +
         ' -Mode ' + (Quote-PowerShellLiteral -Value $Mode) +
+        ' -OperatingMode ' + (Quote-PowerShellLiteral -Value $OperatingMode) +
         ' -ProjectDirectory ' + (Quote-PowerShellLiteral -Value $ProjectDirectory) +
         ' -PiHost ' + (Quote-PowerShellLiteral -Value $PiHost) +
         ' -Port ' + $Port +
@@ -699,6 +705,8 @@ function Start-AppRole {
             if (-not [string]::IsNullOrEmpty($ApiToken)) {
                 $env:LOCALLIFE_API_TOKEN = $ApiToken
             }
+            $env:LOCALLIFE_OPERATING_MODE = $OperatingMode
+            Write-Step ('Operating mode: ' + $OperatingMode)
             # --disable-sync: the background bucket-sync thread (BucketSync
             # in storage.py) is a Cloud-mode concern -- syncing results to a
             # Google Cloud Storage bucket so they survive an ephemeral VM
@@ -817,6 +825,7 @@ function Start-AppRole {
         'if [ ! -d ~/' + $ProjectDirectory + ' ]; then ' +
         'echo "ERROR: The project is not installed on the cloud VM. See DEMONSTRATION_INSTRUCTIONS.md."; exit 1; fi; ' +
         'cd ~/' + $ProjectDirectory + ' || exit 1; ' +
+        'export LOCALLIFE_OPERATING_MODE=' + $OperatingMode + '; ' +
         "pkill -f '[l]ocallife_cloud.server' || true; " +
         'if [ -f .venv/bin/activate ]; then source .venv/bin/activate; fi; ' +
         'python3 -m pip show locallife-cloud >/dev/null 2>&1 || python3 -m pip install -e . -q; ' +
@@ -1255,11 +1264,11 @@ function Start-PiRole {
 function Start-Demo {
     $Host.UI.RawUI.WindowTitle = 'LOCAL LIFE DEMONSTRATION LAUNCHER'
     if ($Mode -eq 'Local') {
-        Write-Banner 'LOCAL LIFE DUAL-CAMERA DEMONSTRATION (v19.18.0 - LOCAL LAPTOP)'
+        Write-Banner 'LOCAL LIFE DUAL-CAMERA DEMONSTRATION (v19.20.0 - LOCAL LAPTOP)'
         Write-Host 'NO CLOUD NEEDED - everything runs on your Windows laptop, for free.' -ForegroundColor Green
     }
     else {
-        Write-Banner 'LOCAL LIFE DUAL-CAMERA DEMONSTRATION (v19.18.0 - CLOUD GPU via gpu.py)'
+        Write-Banner 'LOCAL LIFE DUAL-CAMERA DEMONSTRATION (v19.20.0 - CLOUD GPU via gpu.py)'
         Write-Host 'Using a cloud GPU VM. gpu.py hunts across zones for capacity automatically.' -ForegroundColor Green
         Write-Host 'Cloud charges apply while the VM is running -- see STOP_LOCAL_LIFE_DEMO.cmd.' -ForegroundColor Yellow
     }
@@ -1318,6 +1327,7 @@ function Start-Demo {
     $session = @{
         started_at = (Get-Date).ToString('o')
         mode = $Mode
+        operating_mode = $OperatingMode
         laptop_address = $address
         dashboard_url = ('http://' + $appAddress + ':' + $Port)
         pi_bridge_port = $PiBridgePort

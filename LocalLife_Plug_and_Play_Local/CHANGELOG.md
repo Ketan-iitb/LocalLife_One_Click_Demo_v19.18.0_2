@@ -9,6 +9,83 @@ configuration changes, validation performed, hardware status, and any known
 limitations. This should make it possible to identify the version that
 introduced a regression without guessing from file modification dates.
 
+## v5 — 2026-09-16 — Reversible household-object geometry validation
+
+### Status
+
+- Implemented locally as build `19.20.0-local-ai`; not deployed to the
+  friend's laptop and not yet tested with live RealSense hardware.
+- No camera firmware, exposure, laser, USB, depth preset, ROI, baseline, or
+  calibration factor was changed.
+
+### Reason for this version
+
+The measured bags and cartons are not always available at the friend's home.
+Phase 1B therefore needs ordinary household objects to exercise RealSense
+footprint length, footprint width, and height without permanently weakening
+the final waste-only classifier.
+
+### Changes
+
+- Added the explicit `LOCALLIFE_OPERATING_MODE` switch. `waste` preserves the
+  existing strict plastic-bag, paper-bag, and cardboard-box rules;
+  `geometry_validation` accepts a separate bank of common household reference
+  objects as `measurement_object` tracks.
+- Former waste negatives including backpacks, laptop bags, shoes, bottles,
+  cans, cushions, and laundry hampers may be measured only in validation mode.
+  People, hands, feet, unclassified silhouettes, and fixed scene/background
+  classes remain rejected.
+- Hard-disabled waste-ledger writes, ledger refreshes, and auto-deposit while
+  validation mode is active. This guard is in the pipeline, so an environment
+  setting of `LOCALLIFE_AUTO_DEPOSIT=true` cannot bypass it.
+- Kept both cameras active. RealSense remains the only authority for physical
+  dimensions and final metric volume; Logitech remains a secondary RGB,
+  colour, material, and optional comparison source.
+- Extended the rigid cuboid path to box/carton/parcel/package labels in
+  validation mode. Other household objects continue to use the general
+  support-plane footprint/height estimator.
+- Added a validation-only 10 mm minimum-height gate so the annotated 20 mm
+  laptop sleeve can be measured. Production waste mode keeps its existing
+  25 mm depth-noise gate.
+- Added a prominent dashboard mode banner, `TEST OBJECTS SEEN`, explicit
+  `WASTE LEDGER DISABLED` status, and raw detector labels beside the generic
+  `measurement_object` class.
+- Added `scripts/validate_reference_dimensions.py`. It reads all nine rows in
+  `parameterised_objects/reference_objects.csv`, including the three objects
+  that are production waste negatives, and records median RealSense L×W×H plus
+  signed/percentage dimension errors. Missing deformable-object liters remain
+  missing; the tool makes no volume claim for them.
+- The shipped `cloud.env.example` selects validation mode for this temporary
+  phase. Returning one line to `LOCALLIFE_OPERATING_MODE=waste` restores the
+  production classifier without reverting code.
+- The Windows one-click launcher now carries a validated `-OperatingMode`
+  parameter through its child windows and remote start command. Its temporary
+  default is `geometry_validation`, so the normal double-click workflow
+  actually runs this phase even though that launcher does not source
+  `cloud.env`; pass `-OperatingMode waste` to restore production behavior.
+
+### Validation completed
+
+- Focused configuration, classification, filtering, RealSense geometry,
+  dual-camera, tracking, ledger, reference-manifest, and color suite: 219
+  tests passed.
+- The additional OpenCV-only local-offline test module could not import in
+  this WSL interpreter because `cv2` is not installed. No assertion in that
+  module ran; the friend's installed local environment must run it.
+- Live hardware accuracy is still pending. A valid trial requires a current
+  build badge, an empty/stable RealSense baseline, and exactly one still
+  reference object in view.
+
+### Known limitations
+
+- The prompt bank covers common household test items rather than every object
+  category that could exist in a home. Extra categories can be supplied with
+  `LOCALLIFE_VALIDATION_PROMPTS` without changing production waste prompts.
+- Single-view RealSense dimensions still depend on a clean support plane,
+  aligned depth, and a complete instance mask. This version creates a safer,
+  broader test protocol; it does not claim hardware accuracy before the logged
+  physical trials are run.
+
 ## v4 — 2026-09-13 — Parameterised-object correction pass
 
 ### Status

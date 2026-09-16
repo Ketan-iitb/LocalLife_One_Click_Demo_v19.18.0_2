@@ -94,7 +94,9 @@ def _annotate_frame(frame: np.ndarray, pipeline: VisionPipeline) -> np.ndarray:
         visible_color = f" [{detection.color}]" if detection.color not in {"unknown", ""} else ""
         continuity = " (tracked)" if detection.source == "tracked-prediction" else ""
         display_type = (
-            detection.accepted_class.replace("_", " ")
+            f"test object ({detection.label})"
+            if detection.accepted_class == "measurement_object"
+            else detection.accepted_class.replace("_", " ")
             if detection.accepted_class is not None else detection.label
         )
         caption = f"#{detection.track_id or '?'} {display_type}{continuity}{visible_color}{distance}{height}{volume}"

@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from .config import AppConfig
+from .config import AppConfig, GEOMETRY_VALIDATION_REJECT_LABELS
 from .geometry import dominant_color, fixed_bin_mask, roi_pixels
 from .types import Detection
 
@@ -221,16 +221,22 @@ class YoloSegmenter:
                     "Upgrade ultralytics or set LOCALLIFE_DETECTOR_MODEL to a trained best.pt."
                 )
             try:
-                prompt_bank = tuple(dict.fromkeys(
-                    (*self.config.prompts, *self.config.negative_prompts)
-                ))
+                if self.config.operating_mode == "geometry_validation":
+                    accepted_prompts = self.config.geometry_validation_prompts
+                    competing_prompts = tuple(sorted(GEOMETRY_VALIDATION_REJECT_LABELS))
+                    prompt_mode = "geometry-validation-text-prompts"
+                else:
+                    accepted_prompts = self.config.prompts
+                    competing_prompts = self.config.negative_prompts
+                    prompt_mode = "waste-text-prompts"
+                prompt_bank = tuple(dict.fromkeys((*accepted_prompts, *competing_prompts)))
                 self.model.set_classes(list(prompt_bank))
-                self.runtime["prompt_mode"] = "waste-text-prompts"
-                self.runtime["accepted_prompt_count"] = len(self.config.prompts)
-                self.runtime["negative_prompt_count"] = len(self.config.negative_prompts)
+                self.runtime["prompt_mode"] = prompt_mode
+                self.runtime["accepted_prompt_count"] = len(accepted_prompts)
+                self.runtime["negative_prompt_count"] = len(competing_prompts)
                 LOGGER.info(
-                    "Configured %s accepted and %s negative/lookalike prompts",
-                    len(self.config.prompts), len(self.config.negative_prompts),
+                    "Configured %s accepted and %s competing prompts for %s mode",
+                    len(accepted_prompts), len(competing_prompts), self.config.operating_mode,
                 )
             except Exception as exc:
                 fallback_name = model_name.removesuffix(".pt") + "-pf.pt"

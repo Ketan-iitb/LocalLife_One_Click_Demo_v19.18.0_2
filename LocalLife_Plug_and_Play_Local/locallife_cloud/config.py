@@ -83,6 +83,53 @@ DEFAULT_NEGATIVE_PROMPTS = (
     "door",
 )
 
+# Temporary, opt-in prompt bank for measuring known household objects while
+# the RealSense geometry is being validated.  This is intentionally separate
+# from the production waste prompt bank: switching back to ``waste`` restores
+# the strict plastic-bag/paper-bag/cardboard-box contract without editing code.
+DEFAULT_GEOMETRY_VALIDATION_PROMPTS = tuple(dict.fromkeys((
+    *DEFAULT_PROMPTS,
+    "backpack",
+    "rucksack",
+    "laptop bag",
+    "briefcase",
+    "duffel bag",
+    "handbag",
+    "shoe",
+    "sneaker",
+    "slipper",
+    "pillow",
+    "cushion",
+    "folded clothing",
+    "plastic bottle",
+    "drink can",
+    "laundry basket",
+    "laundry hamper",
+    "fabric storage basket",
+    "storage container",
+    "parcel",
+    "package",
+    "book",
+    "toy",
+)))
+
+# Scene/background classes must not become measurement objects in validation
+# mode.  Hands and people are also excluded so placing/removing a reference
+# object does not create a physical-measurement track for the operator.
+GEOMETRY_VALIDATION_REJECT_LABELS = frozenset({
+    "person", "hand", "foot", "floor", "wall", "ceiling", "door", "window",
+    "curtain", "drape", "rug", "floor mat", "carpet", "table", "desk",
+    "chair", "sofa", "couch", "bed", "furniture", "power cable", "power adapter",
+    "power strip", "charger",
+    "unknown", "unclassified object", "foreground object",
+})
+GEOMETRY_VALIDATION_REJECT_WORDS = frozenset({
+    "person", "people", "human", "hand", "hands", "foot", "feet",
+    "floor", "wall", "ceiling", "door", "window", "curtain", "drape",
+    "rug", "carpet", "table", "desk", "chair", "sofa", "couch", "bed",
+    "furniture", "cable", "adapter", "charger",
+})
+
 
 def _bool_env(name: str, default: bool) -> bool:
     value = os.environ.get(name)
@@ -106,12 +153,14 @@ class AppConfig:
     host: str = "127.0.0.1"
     port: int = 8000
     api_token: str = ""
+    operating_mode: str = "waste"
     detector_model: str = "yoloe-11l-seg.pt"
     detector_confidence: float = 0.24
     detector_iou: float = 0.50
     image_size: int = 960
     prompts: tuple[str, ...] = DEFAULT_PROMPTS
     negative_prompts: tuple[str, ...] = DEFAULT_NEGATIVE_PROMPTS
+    geometry_validation_prompts: tuple[str, ...] = DEFAULT_GEOMETRY_VALIDATION_PROMPTS
     depth_model: str = "depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf"
     # RealSense is the only metric geometry authority.  Keeping the large
     # Logitech Depth-Anything model on by default made local CPU inference
@@ -251,6 +300,10 @@ class AppConfig:
     box_aggregation_window_frames: int = 20
     history_limit: int = 100
     min_object_height_m: float = 0.025
+    # The annotated laptop sleeve is 20 mm thick, below the production
+    # waste-noise gate. Validation mode lowers this only for reference-object
+    # geometry; waste mode keeps the safer 25 mm threshold unchanged.
+    geometry_validation_min_object_height_m: float = 0.010
     max_object_height_m: float = 0.80
     roi: tuple[float, float, float, float] = (0.05, 0.05, 0.90, 0.90)
     auto_count: bool = True
@@ -322,6 +375,9 @@ class AppConfig:
             host=os.environ.get("LOCALLIFE_HOST", defaults.host),
             port=int(os.environ.get("LOCALLIFE_PORT", defaults.port)),
             api_token=os.environ.get("LOCALLIFE_API_TOKEN", ""),
+            operating_mode=os.environ.get(
+                "LOCALLIFE_OPERATING_MODE", defaults.operating_mode,
+            ).strip().lower().replace("-", "_"),
             detector_model=os.environ.get("LOCALLIFE_DETECTOR_MODEL", defaults.detector_model),
             detector_confidence=float(os.environ.get("LOCALLIFE_CONF", defaults.detector_confidence)),
             detector_iou=float(os.environ.get("LOCALLIFE_IOU", defaults.detector_iou)),
@@ -329,6 +385,9 @@ class AppConfig:
             prompts=_tuple_env("LOCALLIFE_PROMPTS", DEFAULT_PROMPTS),
             negative_prompts=_tuple_env(
                 "LOCALLIFE_NEGATIVE_PROMPTS", DEFAULT_NEGATIVE_PROMPTS,
+            ),
+            geometry_validation_prompts=_tuple_env(
+                "LOCALLIFE_VALIDATION_PROMPTS", DEFAULT_GEOMETRY_VALIDATION_PROMPTS,
             ),
             depth_model=os.environ.get("LOCALLIFE_DEPTH_MODEL", defaults.depth_model),
             enable_monocular_depth=_bool_env(
@@ -428,6 +487,10 @@ class AppConfig:
             )),
             history_limit=int(os.environ.get("LOCALLIFE_HISTORY_LIMIT", defaults.history_limit)),
             min_object_height_m=float(os.environ.get("LOCALLIFE_MIN_HEIGHT_M", defaults.min_object_height_m)),
+            geometry_validation_min_object_height_m=float(os.environ.get(
+                "LOCALLIFE_VALIDATION_MIN_HEIGHT_M",
+                defaults.geometry_validation_min_object_height_m,
+            )),
             max_object_height_m=float(os.environ.get("LOCALLIFE_MAX_HEIGHT_M", defaults.max_object_height_m)),
             roi=roi,
             auto_count=_bool_env("LOCALLIFE_AUTO_COUNT", True),
@@ -472,6 +535,10 @@ class AppConfig:
         )
 
     def validate(self) -> None:
+        if self.operating_mode not in {"waste", "geometry_validation"}:
+            raise ValueError(
+                "LOCALLIFE_OPERATING_MODE must be 'waste' or 'geometry_validation'"
+            )
         x, y, width, height = self.roi
         if min(x, y) < 0 or width <= 0 or height <= 0 or x + width > 1 or y + height > 1:
             raise ValueError("ROI must fit within normalized image coordinates [0, 1]")
@@ -481,6 +548,8 @@ class AppConfig:
             raise ValueError("Batch size must be at least one")
         if self.max_object_height_m <= self.min_object_height_m:
             raise ValueError("Maximum object height must exceed minimum object height")
+        if not 0 < self.geometry_validation_min_object_height_m < self.max_object_height_m:
+            raise ValueError("Validation minimum object height must be positive and below the maximum")
         if self.logitech_scene_min_height_m <= 0 or self.max_object_height_m <= self.logitech_scene_min_height_m:
             raise ValueError("Logitech scene-detection minimum height must be positive and below the maximum object height")
         if self.recipe_refresh_seconds <= 0:

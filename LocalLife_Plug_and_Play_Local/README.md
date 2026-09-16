@@ -21,6 +21,30 @@ object-interior color recognition, independent background-depth stabilization,
 a separate configurable measurement region, implausible-volume rejection, and
 a backup-protected Logitech-only history reset.
 
+## Current Phase 1B geometry-validation mode
+
+The shipped `cloud.env.example` currently selects
+`LOCALLIFE_OPERATING_MODE=geometry_validation`. This temporary, reversible
+mode accepts common household test objects so RealSense footprint length,
+footprint width, and height can be checked before waste-only classification is
+restored. Logitech stays active for RGB/color comparison, but RealSense remains
+the only metric geometry authority. Validation tracks never enter the waste
+ledger and can never auto-deposit.
+
+The ruler measurements in `parameterised_objects/reference_objects.csv` can be
+used directly:
+
+```bash
+python scripts/validate_reference_dimensions.py --list
+python scripts/validate_reference_dimensions.py --reference bagpack
+```
+
+Keep exactly one still object in view for each trial. The command records the
+median live RealSense LxWxH and signed/percentage error. Objects with blank
+reference liters are dimension-only trials; the tool does not invent their
+volume. Set `LOCALLIFE_OPERATING_MODE=waste` and restart to return to strict
+plastic-bag, paper-bag, and cardboard-box behavior.
+
 ## Existing waste-plant capabilities
 
 This edition can monitor **garbage bags and cardboard boxes**, maintains persistent

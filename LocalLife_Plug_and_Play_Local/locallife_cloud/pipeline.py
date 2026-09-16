@@ -12,7 +12,11 @@ from typing import Any
 
 import numpy as np
 
-from .config import AppConfig
+from .config import (
+    AppConfig,
+    GEOMETRY_VALIDATION_REJECT_LABELS,
+    GEOMETRY_VALIDATION_REJECT_WORDS,
+)
 from .geometry import (
     combined_mask,
     detect_scene_objects,
@@ -105,16 +109,27 @@ def _normalized_label(label: str) -> str:
     return " ".join(label.strip().lower().replace("_", " ").replace("-", " ").split())
 
 
-def accepted_object_class(label: str) -> str | None:
-    """Map detector vocabulary to the only three accepted object families.
+def accepted_object_class(label: str, operating_mode: str = "waste") -> str | None:
+    """Map detector vocabulary to the active mode's accepted object family.
 
-    Broad labels such as a bare ``bag`` are deliberately not accepted: the
+    Waste mode has only three families. Broad labels such as a bare ``bag``
+    are deliberately not accepted there: the
     real-hardware result set shows backpacks, laptop cases and bedding being
     forced into a waste-bag class.  A bag must carry a plastic/waste or paper
     qualifier, and cardboard must be a box/carton/parcel rather than an
-    arbitrary flat sheet.
+    arbitrary flat sheet. Geometry-validation mode instead maps recognized
+    non-background household items to ``measurement_object``.
     """
     normalized = _normalized_label(label)
+    if operating_mode == "geometry_validation":
+        words = set(normalized.replace("(", " ").replace(")", " ").split())
+        if (
+            not normalized
+            or normalized in GEOMETRY_VALIDATION_REJECT_LABELS
+            or words & GEOMETRY_VALIDATION_REJECT_WORDS
+        ):
+            return None
+        return "measurement_object"
     if normalized in NEGATIVE_WASTE_LABELS:
         return None
     words = set(normalized.replace("(", " ").replace(")", " ").split())
@@ -198,11 +213,20 @@ def filter_waste_detections(
         min(config.min_component_pixels, max(1, int(region_area * 0.10))),
     )
     retained: list[Detection] = []
-    for detection in reject_prompt_conflicts(detections):
-        detection.accepted_class = accepted_object_class(detection.label)
-        if config.bag_only and not is_bag_detection(detection.label):
+    candidates = (
+        detections
+        if config.operating_mode == "geometry_validation"
+        else reject_prompt_conflicts(detections)
+    )
+    for detection in candidates:
+        detection.accepted_class = accepted_object_class(
+            detection.label, config.operating_mode,
+        )
+        if detection.accepted_class is None:
             continue
-        if not config.bag_only and not is_supported_waste_detection(detection.label):
+        if config.operating_mode == "waste" and config.bag_only and not is_bag_detection(detection.label):
+            continue
+        if config.operating_mode == "waste" and not config.bag_only and not is_supported_waste_detection(detection.label):
             continue
         if detection.source.startswith("yolo") and detection.confidence < config.detector_confidence:
             continue
@@ -247,7 +271,11 @@ def deduplicate_overlapping_detections(
         candidate_mask = combined_mask([candidate], (frame_height, frame_width))
         candidate_area = max(1, int(np.count_nonzero(candidate_mask)))
         for existing in unique:
-            if waste_object_type(existing.label) != waste_object_type(candidate.label):
+            if (
+                existing.accepted_class != "measurement_object"
+                and candidate.accepted_class != "measurement_object"
+                and waste_object_type(existing.label) != waste_object_type(candidate.label)
+            ):
                 continue
             existing_mask = combined_mask([existing], (frame_height, frame_width))
             smaller = min(candidate_area, max(1, int(np.count_nonzero(existing_mask))))
@@ -836,6 +864,10 @@ class VisionPipeline:
         peer_box_present: bool = False,
     ) -> FrameAnalysis:
         warnings: list[str] = []
+        if self.config.operating_mode == "geometry_validation":
+            warnings.append(
+                "Geometry validation mode is active; waste history and auto-deposit are disabled"
+            )
         # Box-cuboid multi-frame aggregation bookkeeping (see the box-family
         # measurement block below and the post-tracking loop that consumes
         # these): keyed by `id(detection)` because `detection.track_id` is
@@ -854,6 +886,11 @@ class VisionPipeline:
             else predicted_depth
         )
         bin_region = fixed_bin_mask(frame.shape, self.config.roi, self.config.bin_polygon)
+        minimum_height_m = (
+            self.config.geometry_validation_min_object_height_m
+            if self.config.operating_mode == "geometry_validation" and self.camera_id != "logitech"
+            else self.config.min_object_height_m
+        )
         detections = filter_waste_detections(detections, frame.shape, bin_region, self.config)
 
         if self.camera_id == "logitech":
@@ -895,7 +932,7 @@ class VisionPipeline:
             scene_min_height_m = (
                 self.config.logitech_scene_min_height_m
                 if self.camera_id == "logitech"
-                else self.config.min_object_height_m
+                else minimum_height_m
             )
             scene_objects = detect_scene_objects(
                 frame,
@@ -963,7 +1000,9 @@ class VisionPipeline:
                 LOGGER.debug("Fused %s neural detections with %s complete scene objects", original_count, len(scene_objects))
             for detection in detections:
                 if not _is_phantom_detection(detection):
-                    detection.accepted_class = accepted_object_class(detection.label)
+                    detection.accepted_class = accepted_object_class(
+                        detection.label, self.config.operating_mode,
+                    )
         if not detections and self.baseline_rgb is None:
             warnings.append("No object detected; capture an empty-scene baseline to enable fallback and volume")
         elif detections and self.baseline_rgb is None:
@@ -1092,7 +1131,7 @@ class VisionPipeline:
                     seed,
                     measurement_plane,
                     measurement_mask=bin_region,
-                    min_height_m=self.config.min_object_height_m,
+                    min_height_m=minimum_height_m,
                     max_height_m=self.config.max_object_height_m,
                     min_points=min(60, self.config.min_component_pixels),
                 )
@@ -1136,7 +1175,7 @@ class VisionPipeline:
             intrinsics,
             object_mask=confirmed_object_mask,
             roi=self.config.roi,
-            min_height_m=self.config.min_object_height_m,
+            min_height_m=minimum_height_m,
             max_height_m=self.config.max_object_height_m,
             min_pixels=min(50, self.config.min_component_pixels),
             method="realsense-aligned-depth",
@@ -1161,7 +1200,7 @@ class VisionPipeline:
             intrinsics,
             object_mask=occupancy_mask,
             roi=self.config.roi,
-            min_height_m=self.config.min_object_height_m,
+            min_height_m=minimum_height_m,
             max_height_m=self.config.max_object_height_m,
             min_pixels=min(50, self.config.min_component_pixels),
             method=f"{self.camera_id}-total-bin-occupancy",
@@ -1201,7 +1240,7 @@ class VisionPipeline:
                     intrinsics,
                     object_mask=confirmed_object_mask,
                     roi=self.config.roi,
-                    min_height_m=self.config.min_object_height_m,
+                    min_height_m=minimum_height_m,
                     max_height_m=self.config.max_object_height_m,
                     min_pixels=min(50, self.config.min_component_pixels),
                     method=("logitech-depth-anything-v2" if self.camera_id == "logitech"
@@ -1263,7 +1302,7 @@ class VisionPipeline:
                     valid_height = (
                         valid_distance
                         & np.isfinite(effective_reference)
-                        & (height_m >= self.config.min_object_height_m)
+                        & (height_m >= minimum_height_m)
                         & (height_m <= self.config.max_object_height_m)
                     )
                     if np.any(valid_height):
@@ -1280,7 +1319,7 @@ class VisionPipeline:
                     if self.camera_id == "logitech" and self.reference_monocular is not None:
                         relative_height = self.reference_monocular - calibrated_prediction
                         positive_height = valid_prediction & (
-                            relative_height >= self.config.min_object_height_m
+                            relative_height >= minimum_height_m
                         )
                         valid_height = positive_height & (
                             relative_height <= self.config.max_object_height_m
@@ -1309,7 +1348,7 @@ class VisionPipeline:
                 # previously integrated the entire camera ROI as one object.
                 object_mask=instance_mask,
                 roi=self.config.roi,
-                min_height_m=self.config.min_object_height_m,
+                min_height_m=minimum_height_m,
                 max_height_m=self.config.max_object_height_m,
                 min_pixels=min(25, self.config.min_component_pixels),
                 method="realsense-instance",
@@ -1364,7 +1403,7 @@ class VisionPipeline:
                     instance_mask,
                     measurement_plane,
                     measurement_mask=bin_region,
-                    min_height_m=self.config.min_object_height_m,
+                    min_height_m=minimum_height_m,
                     max_height_m=self.config.max_object_height_m,
                     min_points=min(60, self.config.min_component_pixels),
                 )
@@ -1403,7 +1442,16 @@ class VisionPipeline:
             # cardboard class before producing physical cuboid geometry.
             if (
                 self.camera_id != "logitech"
-                and detection.accepted_class == "cardboard_box"
+                and (
+                    detection.accepted_class == "cardboard_box"
+                    or (
+                        self.config.operating_mode == "geometry_validation"
+                        and bool(
+                            set(_normalized_label(detection.label).split())
+                            & {"box", "boxes", "carton", "cartons", "parcel", "parcels", "package"}
+                        )
+                    )
+                )
                 and not _is_phantom_detection(detection)
                 and depth_m is not None
             ):
@@ -1413,7 +1461,7 @@ class VisionPipeline:
                     instance_mask,
                     measurement_plane,
                     measurement_mask=bin_region,
-                    min_height_m=self.config.min_object_height_m,
+                    min_height_m=minimum_height_m,
                     max_height_m=self.config.max_object_height_m,
                 )
                 if cuboid is not None:
@@ -1444,7 +1492,7 @@ class VisionPipeline:
                     intrinsics,
                     object_mask=instance_mask,
                     roi=self.config.roi,
-                    min_height_m=self.config.min_object_height_m,
+                    min_height_m=minimum_height_m,
                     max_height_m=self.config.max_object_height_m,
                     min_pixels=min(25, self.config.min_component_pixels),
                     method="monocular-instance",
@@ -1647,12 +1695,16 @@ class VisionPipeline:
                 should_observe = should_observe and self._measurement_is_recordable(detection)
             # A track can become measurable several frames after it was born.
             # Check on every confirmed frame, not only when its ID is new.
-            if should_observe:
-                self.ledger.observe(detection, timestamp=timestamp)
-            self.ledger.refresh(detection)
+            if self.config.operating_mode == "waste":
+                if should_observe:
+                    self.ledger.observe(detection, timestamp=timestamp)
+                # Preserve production behavior: an already-observed record
+                # may still receive improved color/material/volume on a frame
+                # that is not itself eligible to create a new record.
+                self.ledger.refresh(detection)
 
         newly_deposited: list[Detection] = []
-        if self.config.auto_deposit:
+        if self.config.auto_deposit and self.config.operating_mode == "waste":
             for detection in detections:
                 if detection.track_id is None or self.ledger.is_deposited(detection.track_id):
                     continue
@@ -2351,6 +2403,8 @@ class VisionPipeline:
                 "camera_intrinsics": None if self.latest_intrinsics is None else self.latest_intrinsics.to_dict(),
                 "camera_intrinsics_origin": self.latest_intrinsics_origin,
                 "volume_status": volume_status,
+                "operating_mode": self.config.operating_mode,
+                "waste_ledger_enabled": self.config.operating_mode == "waste",
                 "allow_unclassified_foreground": self.config.allow_unclassified_foreground,
                 "bag_only": self.config.bag_only,
                 "baseline_frame_count": self.baseline_frame_count,
@@ -2383,7 +2437,9 @@ class VisionPipeline:
                 ),
                 "committed_bags": self.committed_bags,
                 "plant": self.ledger.summary(),
-                "auto_deposit": self.config.auto_deposit,
+                "auto_deposit": (
+                    self.config.auto_deposit and self.config.operating_mode == "waste"
+                ),
                 "color_waste_streams": dict(self.config.color_waste_streams),
                 "bin_capacity_l": self.config.bin_capacity_l or None,
                 "bin_fill_percent": (
