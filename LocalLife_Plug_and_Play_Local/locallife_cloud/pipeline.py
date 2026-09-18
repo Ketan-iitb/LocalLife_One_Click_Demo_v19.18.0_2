@@ -321,6 +321,26 @@ def deduplicate_overlapping_detections(
     return sorted(unique, key=lambda item: item.area_pixels, reverse=True)
 
 
+# Flags the dimension estimator raises when it does not trust its own
+# result. `mask_clipped` means the measured surface runs off the edge of the
+# measurement region, so at least one of L/W/H is a crop of the region rather
+# than the object. `low_elevated_fraction` means most of the mask is not
+# actually standing above the support plane -- the signature of a mask that
+# has spread onto the wall or bedding. `high_plane_rmse` means the support
+# plane the measurement is expressed relative to is itself a poor fit.
+UNTRUSTWORTHY_DIMENSION_FLAGS = (
+    "mask_clipped",
+    "low_elevated_fraction",
+    "high_plane_rmse",
+    "no_newly_introduced_surface",
+)
+
+
+def untrustworthy_dimension_flags(flags: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    """Which of a measurement's own flags should stop it being published."""
+    return tuple(flag for flag in UNTRUSTWORTHY_DIMENSION_FLAGS if flag in tuple(flags))
+
+
 def reject_unchanged_background_detections(
     detections: list[Detection],
     change_mask: np.ndarray | None,
@@ -1006,12 +1026,16 @@ class VisionPipeline:
             detections,
             introduced_mask,
             frame.shape[:2],
-            # Half the measurement threshold. A raw YOLOE mask routinely
-            # spills a little onto the surface around the object, so the
-            # admission gate only has to establish that something was placed
-            # here at all; the stricter fraction is applied later to the
-            # recovered mask that dimensions are actually computed from.
-            min_change_fraction=self.config.measurement_change_min_fraction * 0.5,
+            # v7.1: deliberately low, and much lower than the measurement
+            # threshold. This gate answers one question -- "is any part of
+            # this a newly placed object?" -- so that unchanged furniture is
+            # rejected whatever the detector calls it. It is not an accuracy
+            # gate. The v7 run produced masks covering a bag plus a large
+            # blotch of wall, only ~26% of which was new; at half the
+            # measurement fraction those were discarded outright and a real
+            # object vanished from the dashboard. Admitting them and then
+            # measuring only their new part is both safer and more useful.
+            min_change_fraction=self.config.detection_change_min_fraction,
         )
         if unchanged_rejected:
             warnings.append(
@@ -1424,6 +1448,41 @@ class VisionPipeline:
             instance_mask = measurement_masks.get(
                 id(detection), combined_mask([detection], frame.shape[:2]),
             )
+            # v7.1: constrain the mask that dimensions are computed from, not
+            # only the recovered one. The v7 hardware run showed why this
+            # matters: YOLOE returned a mask covering the bag AND a large
+            # blotch of the wall behind it. Depth-supported recovery correctly
+            # refused that surface (no `support_plane_mask_recovered` flag
+            # appears in those results), but refusing simply fell back to the
+            # raw semantic mask -- the contaminated one -- so the wall was
+            # measured anyway and the reported height came out at 61 cm for a
+            # bag a fraction of that.
+            #
+            # `instance_mask` itself is deliberately left alone. Depth
+            # coverage is computed from it, and coverage means "how much of
+            # this object has valid depth": pixels the camera failed to
+            # measure are not newly-introduced, so intersecting them away
+            # would erase exactly the holes coverage exists to detect and
+            # would let a sparse-depth object look fully measured. The
+            # separate `dimension_mask` below carries the constraint.
+            dimension_mask = instance_mask
+            dimension_mask_rejected = False
+            mask_change_constrained = False
+            if introduced_mask is not None and self.camera_id != "logitech":
+                original_pixels = int(np.count_nonzero(instance_mask))
+                constrained_mask = instance_mask & introduced_mask
+                constrained_pixels = int(np.count_nonzero(constrained_mask))
+                if constrained_pixels >= max(
+                    min(60, self.config.min_component_pixels),
+                    int(original_pixels * 0.10),
+                ):
+                    dimension_mask = constrained_mask
+                    mask_change_constrained = constrained_pixels < original_pixels
+                else:
+                    # Almost nothing under this mask is new. Either the
+                    # baseline already contains the object or the detection is
+                    # scenery; in both cases dimensions would be meaningless.
+                    dimension_mask_rejected = True
             logitech_height_coherent = True
             if depth_m is not None:
                 valid_distance = instance_mask & np.isfinite(depth_m) & (depth_m > 0.10) & (depth_m < 20.0)
@@ -1524,7 +1583,10 @@ class VisionPipeline:
             # plastic bag, paper bag, or cardboard box.  Bags expose a visible
             # support-plane footprint rather than pretending to be cuboids.
             dimensions = None
-            if (
+            if dimension_mask_rejected:
+                detection.measurement_quality = "rejected-no-newly-introduced-surface"
+                detection.dimension_flags = ("no_newly_introduced_surface",)
+            elif (
                 self.camera_id != "logitech"
                 and detection.accepted_class is not None
                 and not _is_phantom_detection(detection)
@@ -1532,7 +1594,7 @@ class VisionPipeline:
                 dimensions = estimate_object_dimensions(
                     depth_m,
                     intrinsics,
-                    instance_mask,
+                    dimension_mask,
                     measurement_plane,
                     measurement_mask=bin_region,
                     min_height_m=minimum_height_m,
@@ -1546,12 +1608,33 @@ class VisionPipeline:
                 )
                 if id(detection) in recovered_measurement_ids:
                     extra_dimension_flags += ("support_plane_mask_recovered",)
+                if mask_change_constrained:
+                    extra_dimension_flags += ("mask_constrained_to_new_surface",)
                 if extra_dimension_flags:
                     dimensions = replace(
                         dimensions, flags=tuple(dimensions.flags) + extra_dimension_flags,
                     )
-                pending_dimension_measurements[id(detection)] = dimensions
-                self._apply_object_dimensions(detection, dimensions)
+                blocking = untrustworthy_dimension_flags(dimensions.flags)
+                if blocking and self.config.reject_flagged_dimensions:
+                    # v7.1: the estimator already knew these numbers were bad.
+                    # Until now those flags only subtracted from a confidence
+                    # score while the millimetres were published anyway, so
+                    # every wrong reading in the v3/v6/v7 trials arrived
+                    # pre-labelled `mask_clipped` and `low_elevated_fraction`
+                    # and was reported regardless. Withhold the numbers and
+                    # keep the reason visible instead.
+                    detection.dimension_flags = tuple(dimensions.flags)
+                    detection.dimension_method = dimensions.method
+                    detection.measurement_quality = (
+                        "rejected-untrustworthy-dimensions: " + ", ".join(blocking)
+                    )
+                    warnings.append(
+                        "Withheld dimensions flagged " + ", ".join(blocking)
+                        + "; the object mask or support plane is not trustworthy in this frame"
+                    )
+                else:
+                    pending_dimension_measurements[id(detection)] = dimensions
+                    self._apply_object_dimensions(detection, dimensions)
             if self.camera_id != "logitech" and detection.accepted_class is not None:
                 pending_dimension_attempted.add(id(detection))
             # Table-relative cuboid measurement for box-family detections
@@ -1582,11 +1665,12 @@ class VisionPipeline:
                 )
                 and not _is_phantom_detection(detection)
                 and depth_m is not None
+                and not dimension_mask_rejected
             ):
                 cuboid = estimate_box_volume_cuboid(
                     depth_m,
                     intrinsics,
-                    instance_mask,
+                    dimension_mask,
                     measurement_plane,
                     measurement_mask=bin_region,
                     min_height_m=minimum_height_m,
@@ -1712,7 +1796,10 @@ class VisionPipeline:
                     list(history),
                     frames_considered=self._dimension_frames_considered[detection.track_id],
                 )
-                if aggregated_dimensions is not None:
+                if aggregated_dimensions is not None and not (
+                    self.config.reject_flagged_dimensions
+                    and untrustworthy_dimension_flags(aggregated_dimensions.flags)
+                ):
                     self._apply_object_dimensions(detection, aggregated_dimensions)
 
         # Box-cuboid multi-frame track aggregation (Revised Dual-Camera

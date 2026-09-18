@@ -39,9 +39,11 @@ from locallife_cloud.config import AppConfig
 from locallife_cloud.pipeline import (
     VisionPipeline,
     reject_unchanged_background_detections,
+    untrustworthy_dimension_flags,
 )
 from locallife_cloud.types import CameraIntrinsics, Detection
 from locallife_cloud.volume import (
+    estimate_object_dimensions,
     fit_reference_plane,
     newly_introduced_mask,
     recover_elevated_object_mask,
@@ -298,6 +300,142 @@ class ValidationBaselineCaptureTests(unittest.TestCase):
 
         self.assertIsNone(pipeline.baseline_rgb)
         self.assertEqual(pipeline._automatic_baseline_status, "waiting-for-empty-scene")
+
+
+class UntrustworthyDimensionFlagTests(unittest.TestCase):
+    """v7.1: the estimator's own doubts must stop a number being published.
+
+    Every wrong reading in the v3, v6 and v7 trials arrived already labelled
+    `mask_clipped` and `low_elevated_fraction`. Those flags only ever lowered
+    a confidence score, so the millimetres were shown anyway and the operator
+    had no way to tell a measurement from a guess.
+    """
+
+    def test_blocking_flags_are_reported(self) -> None:
+        self.assertEqual(
+            untrustworthy_dimension_flags(
+                ("single_view_visible_footprint", "mask_clipped", "low_elevated_fraction"),
+            ),
+            ("mask_clipped", "low_elevated_fraction"),
+        )
+
+    def test_an_ordinary_measurement_is_not_blocked(self) -> None:
+        self.assertEqual(
+            untrustworthy_dimension_flags(("single_view_visible_footprint",)), (),
+        )
+
+
+class ContaminatedSemanticMaskTests(unittest.TestCase):
+    """v7.1: the v7 hardware failure, end to end.
+
+    The detector returned one mask covering the bag *and* a blotch of the
+    wall behind it. Depth-supported recovery correctly refused that surface
+    (no `support_plane_mask_recovered` flag appears in those results), but
+    refusing simply fell back to the raw semantic mask -- the contaminated
+    one -- so the unchanged scenery was measured anyway and a bag reported a
+    611 mm height. Dimensions must be computed from the newly-introduced part
+    of a mask, never the whole of it.
+    """
+
+    class _StubDetector:
+        device = "cpu"
+        runtime = {"device": "cpu"}
+
+        def __init__(self) -> None:
+            self.detections: list[Detection] = []
+
+        def detect_batch(self, frames: list[np.ndarray]) -> list[list[Detection]]:
+            return [
+                [Detection(item.label, item.confidence, item.box,
+                           None if item.mask is None else item.mask.copy())
+                 for item in self.detections]
+                for _ in frames
+            ]
+
+    def _pipeline(self) -> VisionPipeline:
+        config = AppConfig(
+            results_dir=Path(tempfile.mkdtemp()),
+            operating_mode="geometry_validation",
+            enable_monocular_depth=False,
+            roi=(0, 0, 1, 1),
+            min_component_pixels=20,
+            tracker_confirm_frames=1,
+            automatic_baseline=False,
+            restore_saved_baseline=False,
+            auto_deposit=False,
+        )
+        return VisionPipeline(config, detector=self._StubDetector())
+
+    def _scene(self):
+        """A floor, one piece of unchanged elevated furniture, one placed object."""
+        camera = CameraIntrinsics(fx=200.0, fy=200.0, ppx=60.0, ppy=60.0)
+        empty_frame = np.full((120, 120, 3), 110, dtype=np.uint8)
+        empty_depth = np.full((120, 120), 2.00, dtype=np.float32)
+        # Furniture that was always there and stands 25 cm proud of the floor,
+        # so elevation alone cannot distinguish it from a placed object.
+        furniture = np.zeros((120, 120), dtype=bool)
+        furniture[40:60, 20:45] = True
+        empty_depth[furniture] = 1.75
+        empty_frame[furniture] = (200, 200, 200)
+
+        placed = np.zeros((120, 120), dtype=bool)
+        placed[60:85, 45:80] = True
+        depth = empty_depth.copy()
+        depth[placed] = 1.88  # the object under test is 12 cm tall
+        frame = empty_frame.copy()
+        frame[placed] = (30, 140, 60)
+        return camera, empty_frame, empty_depth, frame, depth, furniture, placed
+
+    def test_dimensions_come_from_the_new_surface_only(self) -> None:
+        camera, empty_frame, empty_depth, frame, depth, furniture, placed = self._scene()
+        pipeline = self._pipeline()
+        pipeline.latest_frame = empty_frame.copy()
+        pipeline.latest_depth = empty_depth.copy()
+        pipeline.set_baseline()
+
+        # The detector's mask covers the placed object AND the furniture, as
+        # in images/v7 where it covered the bag and a patch of wall.
+        contaminated = placed | furniture
+        rows, columns = np.where(contaminated)
+        pipeline.detector.detections = [Detection(
+            "handbag", 0.55,
+            (int(columns.min()), int(rows.min()), int(columns.max()), int(rows.max())),
+            contaminated,
+        )]
+
+        analysis = pipeline.process_frame(
+            frame, depth_m=depth, intrinsics=camera, timestamp=1.0, persist=False,
+        )
+
+        measured = [
+            item for item in analysis.detections if item.physical_height_mm is not None
+        ]
+        self.assertTrue(measured, "the placed object must still be measured")
+        item = measured[0]
+        self.assertIn("mask_constrained_to_new_surface", item.dimension_flags)
+        # The object is 12 cm tall. The furniture in the same mask is 25 cm.
+        self.assertAlmostEqual(item.physical_height_mm, 120.0, delta=15.0)
+
+    def test_the_same_mask_is_genuinely_contaminating(self) -> None:
+        # Guards the test above from passing vacuously: confirm that this
+        # scene really would mismeasure if the whole semantic mask were used.
+        camera, _empty_frame, empty_depth, _frame, depth, furniture, placed = self._scene()
+        plane = fit_reference_plane(
+            empty_depth, camera, mask=np.ones(empty_depth.shape, dtype=bool),
+        )
+        self.assertIsNotNone(plane)
+
+        whole_mask = estimate_object_dimensions(
+            depth, camera, placed | furniture, plane, min_height_m=0.010, min_points=20,
+        )
+        new_only = estimate_object_dimensions(
+            depth, camera, placed, plane, min_height_m=0.010, min_points=20,
+        )
+
+        self.assertIsNotNone(whole_mask)
+        self.assertIsNotNone(new_only)
+        self.assertGreater(whole_mask.height_mm, new_only.height_mm + 80.0)
+        self.assertAlmostEqual(new_only.height_mm, 120.0, delta=15.0)
 
 
 if __name__ == "__main__":

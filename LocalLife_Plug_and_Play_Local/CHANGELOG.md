@@ -9,6 +9,78 @@ configuration changes, validation performed, hardware status, and any known
 limitations. This should make it possible to identify the version that
 introduced a regression without guessing from file modification dates.
 
+## v7.1 — 2026-09-18 — Measure only the new surface; stop publishing flagged dimensions
+
+### Status
+
+- Implemented locally, following the first `images/v7` hardware run of v7.
+  Not yet retested on the RealSense computer. No camera setting, firmware,
+  intrinsics, or calibration factor was changed, and no dimension
+  mathematics was changed.
+
+### Evidence from the v7 run
+
+v7's baseline fix worked: no result in `images/v7` carries
+`live_fitted_support_plane`, so an empty-scene baseline was captured for the
+first time, and RealSense live tracks fell from the v6 range of 4-9 to 1-2.
+
+The reported dimensions were still wrong. A black bag on a bed reported
+`711 x 325 x 606 mm`, then `635 x 159 x 611 mm`, then `521 x 158 x 611 mm`
+across three scenes -- a 611 mm height that barely moved while the object
+changed. The overlays show why: YOLOE returned one mask covering the bag and
+a large blotch of the wall behind it. Depth-supported recovery correctly
+refused that surface -- `support_plane_mask_recovered` appears on none of
+those results -- but refusing fell back to the raw semantic mask, the
+contaminated one, so the wall was measured anyway. Every such result already
+carried `mask_clipped` and `low_elevated_fraction` and was published all the
+same.
+
+### Changes
+
+- Dimensions and rigid cuboids are now computed from a separate
+  `dimension_mask`: the detection's mask intersected with the
+  newly-introduced region. No path reaches the estimator without passing the
+  novelty test, so refusing a recovered surface can no longer fall back to a
+  contaminated one. Results carry `mask_constrained_to_new_surface` when this
+  narrowed the mask.
+- `instance_mask` itself is deliberately left unconstrained for volume and
+  depth coverage. Coverage means "how much of this object has valid depth";
+  pixels the camera failed to measure are not newly-introduced, so
+  intersecting them away would erase exactly the holes coverage exists to
+  detect. A regression test caught this: constraining it let a sparse-depth
+  object be auto-deposited as a good measurement.
+- Dimensions flagged `mask_clipped`, `low_elevated_fraction`,
+  `high_plane_rmse` or `no_newly_introduced_surface` are now withheld rather
+  than published with a lowered confidence score. The flags remain visible as
+  the stated reason. Reversible with
+  `LOCALLIFE_REJECT_FLAGGED_DIMENSIONS=false`.
+- The detection admission gate was lowered from half the measurement fraction
+  to `LOCALLIFE_DETECTION_CHANGE_MIN_FRACTION` (0.10). At the higher value a
+  real object whose detector mask was only ~26% new was discarded outright
+  and vanished from the dashboard. Admission answers "is any of this newly
+  placed?"; accuracy is handled by measuring only the new part.
+
+### Validation completed
+
+- Focused suite: 297 tests passed, including 15 in
+  `tests/test_baseline_change_gating.py`. The contamination test is paired
+  with a second test proving the same scene really would mismeasure if the
+  whole semantic mask were used, so it cannot pass vacuously.
+- The same 9 pre-existing OpenCV/Torch-dependent failures remain, confirmed
+  failing on the unmodified tree.
+- No hardware accuracy claim. The 120 mm recovered in the synthetic scene is
+  synthetic; ruler validation on the RealSense rig is still outstanding.
+
+### Known limitations
+
+- Steps 5 and 6 of the agreed correction remain open: deformable label drift
+  can still fork a track, and there is no single-dominant-object gate. The
+  v7 run still shows occasional `unclassified object` phantom tracks.
+- `fuse_scene_detections` discards a neural detection overlapping the changed
+  region by less than 30%. That rule predates this work but only became
+  active now that baselines exist, and it can drop a real object with a very
+  sloppy mask. It was left alone rather than retuned blind.
+
 ## v7 — 2026-09-18 — Baseline deadlock and measured-object novelty
 
 ### Status

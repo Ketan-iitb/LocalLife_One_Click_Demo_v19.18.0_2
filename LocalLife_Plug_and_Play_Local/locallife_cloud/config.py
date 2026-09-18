@@ -341,6 +341,20 @@ class AppConfig:
     # unchanged bedding is the newly-introduced-pixel constraint, which is
     # targeted at the actual failure instead of penalising small seeds.
     measurement_max_mask_expansion: float = 6.0
+    # v7.1: the dimension estimator raises `mask_clipped`,
+    # `low_elevated_fraction` and `high_plane_rmse` when it does not trust its
+    # own result, but those flags only ever lowered a confidence score while
+    # the millimetres were published anyway. Every wrong reading in the v3, v6
+    # and v7 trials arrived pre-labelled that way and was displayed regardless.
+    # Withhold the numbers instead; the flags stay visible as the reason.
+    reject_flagged_dimensions: bool = True
+    # v7.1: fraction of a *detection's* mask that must be newly introduced for
+    # it to be admitted at all. Deliberately far below
+    # `measurement_change_min_fraction`: this only separates a placed object
+    # from unchanged furniture, while the measured mask is separately
+    # restricted to the new pixels. Raising this to accuracy-like values
+    # discards real objects whose detector mask happens to be sloppy.
+    detection_change_min_fraction: float = 0.10
     sync_interval_seconds: int = 180
     enable_bucket_sync: bool = True
     max_upload_mb: int = 24
@@ -550,6 +564,14 @@ class AppConfig:
                 "LOCALLIFE_MEASUREMENT_MAX_MASK_EXPANSION",
                 defaults.measurement_max_mask_expansion,
             )),
+            reject_flagged_dimensions=_bool_env(
+                "LOCALLIFE_REJECT_FLAGGED_DIMENSIONS",
+                defaults.reject_flagged_dimensions,
+            ),
+            detection_change_min_fraction=float(os.environ.get(
+                "LOCALLIFE_DETECTION_CHANGE_MIN_FRACTION",
+                defaults.detection_change_min_fraction,
+            )),
             automatic_baseline_frames=int(os.environ.get(
                 "LOCALLIFE_AUTOMATIC_BASELINE_FRAMES", defaults.automatic_baseline_frames,
             )),
@@ -672,6 +694,8 @@ class AppConfig:
             raise ValueError("Baseline change threshold must be positive")
         if not 0 < self.measurement_change_min_fraction <= 1:
             raise ValueError("Measurement change fraction must be between 0 and 1")
+        if not 0 < self.detection_change_min_fraction <= 1:
+            raise ValueError("Detection change fraction must be between 0 and 1")
         if self.measurement_max_mask_expansion < 1.0:
             raise ValueError("Measurement mask expansion limit must be at least 1.0")
         if self.automatic_baseline_frames < 2 or self.automatic_baseline_motion_threshold < 0:
