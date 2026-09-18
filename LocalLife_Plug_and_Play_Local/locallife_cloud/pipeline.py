@@ -34,10 +34,18 @@ from .logitech import bound_logitech_detections, stabilize_background_depth
 from .storage import ResultStore
 from .tracking import ObjectTracker
 from .box_templates import load_box_templates, match_box_template
-from .types import BoxVolumeMeasurement, CameraIntrinsics, DepthCalibration, Detection, FrameAnalysis
+from .types import (
+    BoxVolumeMeasurement,
+    CameraIntrinsics,
+    DepthCalibration,
+    Detection,
+    FrameAnalysis,
+    ObjectDimensions,
+)
 from .volume import (
     ReferencePlane,
     aggregate_box_measurements,
+    aggregate_object_dimensions,
     calibrate_monocular_depth,
     estimate_box_volume_cuboid,
     estimate_object_dimensions,
@@ -107,6 +115,16 @@ NEGATIVE_WASTE_LABELS = {
 
 def _normalized_label(label: str) -> str:
     return " ".join(label.strip().lower().replace("_", " ").replace("-", " ").split())
+
+
+def _is_rigid_cuboid_label(label: str) -> bool:
+    """Recognize rigid rectangular validation objects despite label drift."""
+    words = set(_normalized_label(label).split())
+    return bool(words & {
+        "box", "boxes", "carton", "cartons", "parcel", "parcels",
+        "package", "packages", "container", "containers", "book", "books",
+        "shoebox",
+    })
 
 
 def accepted_object_class(label: str, operating_mode: str = "waste") -> str | None:
@@ -441,6 +459,10 @@ class VisionPipeline:
             lambda: deque(maxlen=config.box_aggregation_window_frames)
         )
         self._box_frames_considered: dict[int, int] = defaultdict(int)
+        self._dimension_measurement_history: dict[int, deque[ObjectDimensions]] = defaultdict(
+            lambda: deque(maxlen=config.box_aggregation_window_frames)
+        )
+        self._dimension_frames_considered: dict[int, int] = defaultdict(int)
         self._color_history: dict[int, deque[str]] = defaultdict(
             lambda: deque(maxlen=max(3, config.volume_window_frames))
         )
@@ -612,6 +634,8 @@ class VisionPipeline:
             self._volume_history.clear()
             self._box_measurement_history.clear()
             self._box_frames_considered.clear()
+            self._dimension_measurement_history.clear()
+            self._dimension_frames_considered.clear()
             self._color_history.clear()
             self._material_history.clear()
             self._material_frame_counts.clear()
@@ -786,6 +810,19 @@ class VisionPipeline:
                 peer_box_present,
             )
 
+    @staticmethod
+    def _apply_object_dimensions(detection: Detection, dimensions: ObjectDimensions) -> None:
+        detection.footprint_length_mm = round(dimensions.length_mm, 2)
+        detection.footprint_width_mm = round(dimensions.width_mm, 2)
+        detection.physical_height_mm = round(dimensions.height_mm, 2)
+        detection.dimension_confidence = round(dimensions.confidence, 4)
+        detection.dimension_flags = dimensions.flags
+        detection.dimension_method = dimensions.method
+        detection.dimension_frames_considered = dimensions.frames_considered
+        detection.dimension_frames_accepted = dimensions.frames_accepted
+        detection.dimension_std_mm = dimensions.dimension_std_mm
+        detection.height_above_baseline_cm = round(dimensions.height_mm / 10.0, 1)
+
     def _apply_box_cuboid(self, detection: Detection, cuboid: BoxVolumeMeasurement, warnings: list[str]) -> None:
         """Write one `BoxVolumeMeasurement` (single-frame or track-aggregated
         -- see `aggregate_box_measurements`) onto `detection`, including
@@ -810,6 +847,9 @@ class VisionPipeline:
         detection.dimension_confidence = round(cuboid.volume_confidence, 4)
         detection.dimension_flags = cuboid.flags
         detection.dimension_method = "realsense_table_relative_cuboid"
+        detection.dimension_frames_considered = cuboid.frames_considered
+        detection.dimension_frames_accepted = cuboid.frames_accepted
+        detection.dimension_std_mm = cuboid.dimension_std_mm
         template_match = match_box_template(
             cuboid.length_mm, cuboid.width_mm, cuboid.height_mm, self.box_templates,
         )
@@ -876,6 +916,8 @@ class VisionPipeline:
         # cuboid measurement has already been computed.
         pending_box_attempted: set[int] = set()
         pending_box_measurements: dict[int, "BoxVolumeMeasurement"] = {}
+        pending_dimension_attempted: set[int] = set()
+        pending_dimension_measurements: dict[int, ObjectDimensions] = {}
         if depth_m is not None and depth_m.shape != frame.shape[:2]:
             warnings.append("RealSense depth is not aligned to the RGB frame; hardware volume was skipped")
             depth_m = None
@@ -1408,21 +1450,20 @@ class VisionPipeline:
                     min_points=min(60, self.config.min_component_pixels),
                 )
             if dimensions is not None:
-                detection.footprint_length_mm = round(dimensions.length_mm, 2)
-                detection.footprint_width_mm = round(dimensions.width_mm, 2)
-                detection.physical_height_mm = round(dimensions.height_mm, 2)
-                detection.dimension_confidence = round(dimensions.confidence, 4)
                 extra_dimension_flags = (
                     ("live_fitted_support_plane",)
                     if self.support_plane_source == "live-frame-background" else ()
                 )
                 if id(detection) in recovered_measurement_ids:
                     extra_dimension_flags += ("support_plane_mask_recovered",)
-                detection.dimension_flags = tuple(dimensions.flags) + extra_dimension_flags
-                detection.dimension_method = dimensions.method
-                # Use the same plane-relative, elevated-point height shown in
-                # the dimension triplet, not a camera-Z mask median.
-                detection.height_above_baseline_cm = round(dimensions.height_mm / 10.0, 1)
+                if extra_dimension_flags:
+                    dimensions = replace(
+                        dimensions, flags=tuple(dimensions.flags) + extra_dimension_flags,
+                    )
+                pending_dimension_measurements[id(detection)] = dimensions
+                self._apply_object_dimensions(detection, dimensions)
+            if self.camera_id != "logitech" and detection.accepted_class is not None:
+                pending_dimension_attempted.add(id(detection))
             # Table-relative cuboid measurement for box-family detections
             # (Revised Dual-Camera Volume Estimation recipe). RealSense only
             # -- Logitech never supplies metric geometry (PDF hard
@@ -1446,10 +1487,7 @@ class VisionPipeline:
                     detection.accepted_class == "cardboard_box"
                     or (
                         self.config.operating_mode == "geometry_validation"
-                        and bool(
-                            set(_normalized_label(detection.label).split())
-                            & {"box", "boxes", "carton", "cartons", "parcel", "parcels", "package"}
-                        )
+                        and _is_rigid_cuboid_label(detection.label)
                     )
                 )
                 and not _is_phantom_detection(detection)
@@ -1565,6 +1603,27 @@ class VisionPipeline:
         # but never added to experiment databases").
         tracking_detections = detections
         new_ids = self.tracker.update(tracking_detections) if self.config.auto_count else []
+
+        # Stabilize general support-plane L/W/H for every accepted RealSense
+        # object. The V3 trials showed large frame-to-frame changes for the
+        # same stationary backpack, pillow and bag, while only rigid boxes
+        # previously received track-based median aggregation.
+        for detection in detections:
+            if detection.track_id is None or id(detection) not in pending_dimension_attempted:
+                continue
+            self._dimension_frames_considered[detection.track_id] += 1
+            raw_dimensions = pending_dimension_measurements.get(id(detection))
+            if raw_dimensions is None:
+                continue
+            history = self._dimension_measurement_history[detection.track_id]
+            history.append(raw_dimensions)
+            if len(history) >= self.config.box_aggregation_min_frames:
+                aggregated_dimensions = aggregate_object_dimensions(
+                    list(history),
+                    frames_considered=self._dimension_frames_considered[detection.track_id],
+                )
+                if aggregated_dimensions is not None:
+                    self._apply_object_dimensions(detection, aggregated_dimensions)
 
         # Box-cuboid multi-frame track aggregation (Revised Dual-Camera
         # Volume Estimation recipe, section 13), now that every detection in
@@ -1810,6 +1869,8 @@ class VisionPipeline:
             self._volume_history.clear()
             self._box_measurement_history.clear()
             self._box_frames_considered.clear()
+            self._dimension_measurement_history.clear()
+            self._dimension_frames_considered.clear()
             self._color_history.clear()
             self._material_history.clear()
             self._material_frame_counts.clear()
@@ -1861,6 +1922,8 @@ class VisionPipeline:
             self._volume_history.clear()
             self._box_measurement_history.clear()
             self._box_frames_considered.clear()
+            self._dimension_measurement_history.clear()
+            self._dimension_frames_considered.clear()
             self._color_history.clear()
             self._material_history.clear()
             self._material_frame_counts.clear()
@@ -1894,6 +1957,8 @@ class VisionPipeline:
             self._volume_history.clear()
             self._box_measurement_history.clear()
             self._box_frames_considered.clear()
+            self._dimension_measurement_history.clear()
+            self._dimension_frames_considered.clear()
             self._color_history.clear()
             self._material_history.clear()
             self._material_frame_counts.clear()
@@ -2345,6 +2410,8 @@ class VisionPipeline:
             self._volume_history.clear()
             self._box_measurement_history.clear()
             self._box_frames_considered.clear()
+            self._dimension_measurement_history.clear()
+            self._dimension_frames_considered.clear()
             return record
 
     def state(self) -> dict[str, Any]:

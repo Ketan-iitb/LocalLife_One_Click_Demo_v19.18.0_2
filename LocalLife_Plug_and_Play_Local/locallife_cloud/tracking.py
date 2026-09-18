@@ -18,6 +18,24 @@ def _family(label: str) -> str:
     return "other"
 
 
+def _detection_family(detection: Detection) -> str:
+    # Geometry-validation prompts can call the same rigid object "book",
+    # "storage container", or "cardboard box" on adjacent frames. They are
+    # all intentionally accepted as one generic measurement class, so do not
+    # break the track (and discard its dimension history) when only that raw
+    # open-vocabulary label changes.
+    if detection.accepted_class == "measurement_object":
+        words = set(detection.label.lower().replace("-", " ").replace("_", " ").split())
+        if words & {
+            "box", "boxes", "carton", "cartons", "parcel", "parcels",
+            "package", "packages", "container", "containers", "book", "books",
+            "shoebox",
+        }:
+            return "measurement_rigid"
+        return f"measurement_{_family(detection.label)}"
+    return _family(detection.label)
+
+
 def _center(box: tuple[int, int, int, int]) -> tuple[float, float]:
     return ((box[0] + box[2]) * 0.5, (box[1] + box[3]) * 0.5)
 
@@ -80,7 +98,11 @@ class ObjectTracker:
         self.total_count = 0
 
     def _association(self, track: Track, detection: Detection) -> tuple[bool, float]:
-        if _family(track.label) != _family(detection.label):
+        track_family = (
+            _detection_family(track.last_detection)
+            if track.last_detection is not None else _family(track.label)
+        )
+        if track_family != _detection_family(detection):
             return False, -1.0
         overlap = intersection_over_union(track.box, detection.box)
         tcx, tcy = _center(track.box)

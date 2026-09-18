@@ -1,8 +1,9 @@
 # Parameterised object references
 
-`reference_objects.csv` converts the ruler dimensions encoded in the image
-filenames into the RealSense contract: support-plane footprint length,
-footprint width, and perpendicular height, all in millimetres.
+`reference_objects.csv` is the authoritative ruler-dimension manifest for the
+RealSense contract: support-plane footprint length, footprint width, and
+perpendicular height, all in millimetres. Image filenames are historical
+labels; a later documented ruler remeasurement in the CSV takes precedence.
 
 Only plastic bags, paper bags, and cardboard boxes/cartons are accepted. The
 backpack, laptop sleeve, and fabric laundry hamper are negative controls and

@@ -485,6 +485,18 @@ class TrackingTests(unittest.TestCase):
             tracker.update([Detection("bag", 0.9, (10, 10, 30, 30))])
         self.assertEqual(tracker.total_count, 1)
 
+    def test_validation_label_drift_keeps_one_measurement_track(self) -> None:
+        tracker = ObjectTracker(confirmation_frames=1, max_missing_frames=2)
+        labels = ("book", "storage container", "cardboard box", "book")
+        track_ids = []
+        for label in labels:
+            item = Detection(label, 0.9, (10, 10, 50, 40))
+            item.accepted_class = "measurement_object"
+            tracker.update([item])
+            track_ids.append(item.track_id)
+        self.assertEqual(len(set(track_ids)), 1)
+        self.assertEqual(tracker.total_count, 1)
+
     def test_reappearing_object_is_new_event(self) -> None:
         tracker = ObjectTracker(confirmation_frames=1, max_missing_frames=1)
         tracker.update([Detection("bag", 0.9, (10, 10, 30, 30))])

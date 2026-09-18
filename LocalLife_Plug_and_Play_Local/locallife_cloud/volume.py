@@ -943,7 +943,7 @@ def estimate_box_volume_cuboid(
     reference_plane: ReferencePlane | None,
     *,
     measurement_mask: np.ndarray | None = None,
-    mask_erosion_px: int = 2,
+    mask_erosion_px: int = 0,
     min_points: int = 60,
     height_percentile: float = 90.0,
     fallback_height_percentile: float = 98.0,
@@ -967,7 +967,7 @@ def estimate_box_volume_cuboid(
     (volume_l = length_m * width_m * height_m * 1000).
 
     Returns None if there isn't a usable table plane, or too few valid
-    object points survive mask erosion + depth filtering -- this never
+    object points survive optional mask erosion + depth filtering -- this never
     fabricates a box measurement from insufficient geometry.
     """
     if depth_m is None or intrinsics is None or object_mask is None:
@@ -1020,10 +1020,11 @@ def estimate_box_volume_cuboid(
     # loose semantic mask cannot expand the physical box dimensions.
     height = height_map[valid]
 
-    # Robust top height: median of the upper `height_percentile`, falling
-    # back to a higher, narrower percentile if too few points land in that
-    # band to take a stable median from (PDF section 2's pseudocode: "never
-    # raw max(h)").
+    # Robust top height: retain the median of the upper band as a diagnostic,
+    # but report the bounded 98th percentile. Real D435 masks include lower
+    # side-wall and bevel pixels near a rigid box's outline; their presence
+    # made the old upper-decile median (roughly p95) systematically short in
+    # the V3 ruler trials. p98 remains far less noise-sensitive than raw max.
     threshold = float(np.percentile(height, height_percentile))
     top_band = height[height >= threshold]
     if top_band.size < 5:
@@ -1031,8 +1032,9 @@ def estimate_box_volume_cuboid(
         top_band = height[height >= threshold]
     if top_band.size == 0:
         return None
-    height_m = float(np.median(top_band))
+    height_top_median_m = float(np.median(top_band))
     height_p98_m = float(np.percentile(height, fallback_height_percentile))
+    height_m = height_p98_m
     if height_m <= 0:
         return None
 
@@ -1093,13 +1095,65 @@ def estimate_box_volume_cuboid(
         table_plane_inliers=reference_plane.inlier_pixels,
         table_plane_rmse_mm=plane_rmse_mm,
         height_p98_mm=height_p98_m * 1000.0,
-        height_top_median_mm=height_m * 1000.0,
+        height_top_median_mm=height_top_median_m * 1000.0,
         mask_clipped=mask_clipped,
         flags=tuple(flags),
     )
 
 
 _DIMENSION_INSTABILITY_FRACTION = 0.12
+
+
+def aggregate_object_dimensions(
+    measurements: list[ObjectDimensions],
+    *,
+    frames_considered: int | None = None,
+    dimension_instability_fraction: float = _DIMENSION_INSTABILITY_FRACTION,
+) -> ObjectDimensions | None:
+    """Median-aggregate general RealSense dimensions for one tracked object.
+
+    Household validation objects and deformable bags use the general
+    support-plane estimator rather than the rigid cuboid path. They need the
+    same protection against one noisy depth/mask frame that boxes already
+    receive. This combines L/W/H independently and records the observed
+    spread; it never changes object classification or uses Logitech geometry.
+    """
+    if not measurements:
+        return None
+
+    values = np.asarray(
+        [[item.length_mm, item.width_mm, item.height_mm] for item in measurements],
+        dtype=np.float64,
+    )
+    medians = np.median(values, axis=0)
+    if np.any(~np.isfinite(medians)) or np.any(medians <= 0):
+        return None
+    spreads = np.std(values, axis=0)
+    relative_spreads = spreads / np.maximum(medians, 1e-6)
+    unstable = float(np.max(relative_spreads)) > dimension_instability_fraction
+
+    flags = {flag for item in measurements for flag in item.flags}
+    if unstable:
+        flags.add("dimension_instability")
+    confidence = float(np.median([item.confidence for item in measurements]))
+    if unstable:
+        confidence *= 0.6
+
+    latest = measurements[-1]
+    return ObjectDimensions(
+        length_mm=float(medians[0]),
+        width_mm=float(medians[1]),
+        height_mm=float(medians[2]),
+        confidence=float(np.clip(confidence, 0.0, 0.99)),
+        depth_valid_ratio=float(np.median([item.depth_valid_ratio for item in measurements])),
+        object_points=int(np.median([item.object_points for item in measurements])),
+        mask_clipped=any(item.mask_clipped for item in measurements),
+        flags=tuple(sorted(flags)),
+        method=latest.method,
+        frames_considered=int(frames_considered if frames_considered is not None else len(measurements)),
+        frames_accepted=len(measurements),
+        dimension_std_mm=tuple(round(float(value), 3) for value in spreads),
+    )
 
 
 def aggregate_box_measurements(

@@ -1,6 +1,6 @@
 file,expected_class,accepted,footprint_length_mm,footprint_width_mm,height_mm,shape,reference_volume_liters,notes
 box_11.5_21.5_21.5_cm.jpg,cardboard_box,true,215,115,215,cuboid,5.315875,External LxWxH ruler volume
-box_41_33_14_cm.jpg,cardboard_box,true,410,330,140,cuboid,18.942,External LxWxH ruler volume
+box_41_33_14_cm.jpg,cardboard_box,true,410,315,140,cuboid,18.081,Width remeasured as 315 mm in V3; external LxWxH ruler volume
 "choclate_,milk_box_7_7_23_cm.jpg",cardboard_box,true,70,70,230,cuboid,1.127,Drink carton; external ruler volume not printed contents
 milk_box_7_9.5_23_cm.jpg,cardboard_box,true,95,70,230,cuboid,1.5295,Drink carton; external ruler volume not printed contents
 polythene_42_40_5.jpg,plastic_bag,true,420,400,50,deformable,,Dimensions only; do not infer filled liters

@@ -19,6 +19,11 @@ class ReferenceDimensionValidationTests(unittest.TestCase):
         self.assertEqual(backpack["footprint_length_mm"], 400.0)
         self.assertEqual(backpack["footprint_width_mm"], 300.0)
         self.assertEqual(backpack["height_mm"], 150.0)
+        v3_box = find_reference(references, "box_41_33_14")
+        self.assertEqual(v3_box["footprint_length_mm"], 410.0)
+        self.assertEqual(v3_box["footprint_width_mm"], 315.0)
+        self.assertEqual(v3_box["height_mm"], 140.0)
+        self.assertAlmostEqual(v3_box["reference_volume_liters"], 18.081)
 
     def test_dimension_observation_requires_one_validation_object(self) -> None:
         object_item = {

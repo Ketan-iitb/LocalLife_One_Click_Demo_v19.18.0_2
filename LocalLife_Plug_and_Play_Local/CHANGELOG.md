@@ -9,6 +9,72 @@ configuration changes, validation performed, hardware status, and any known
 limitations. This should make it possible to identify the version that
 introduced a regression without guessing from file modification dates.
 
+## v6 — 2026-09-17 — V3 dimension stability and rigid-object correction
+
+### Status
+
+- Implemented locally as build `19.21.0-local-ai`; not yet deployed to or
+  retested on the friend's RealSense computer.
+- No camera firmware, laser power, exposure, USB, depth preset, ROI, factory
+  intrinsics, baseline files, or volume calibration factor was changed.
+
+### Evidence and reason
+
+- V3 image 8 reported approximately `348 x 227 x 102 mm` for a ruler value of
+  `360 x 245 x 130 mm`; image 9 reported `389 x 302 x 123 mm` for
+  `410 x 315 x 140 mm`.
+- The same stationary household objects also varied materially between
+  frames. A single global scale was rejected because it would worsen other
+  cases, including the laptop bag, and because only two V3 rigid objects have
+  complete independent ruler truth.
+- Rigid objects labelled `book` or `storage container` were incorrectly using
+  the general visible-footprint path instead of the rigid cuboid path.
+
+### Changes
+
+- Rigid validation labels including book, storage container, package, parcel,
+  carton, shoebox, and box now use the RealSense table-relative cuboid
+  estimator. Logitech remains non-authoritative for metric geometry.
+- Removed the cuboid estimator's default two-pixel mask erosion. The existing
+  elevation and percentile filters remain, while explicit erosion is still
+  available for a deliberately noisy-mask experiment.
+- Rigid height now uses the bounded 98th percentile already calculated by the
+  estimator instead of the upper-decile median (approximately p95), avoiding
+  systematic shortening from visible side-wall and bevel pixels without using
+  a noise-sensitive raw maximum.
+- Added per-track median L/W/H aggregation for every RealSense validation
+  object, not only cardboard boxes. The API and dashboard now expose accepted
+  versus considered frames and dimension spread; high spread adds the
+  `dimension_instability` flag and lowers confidence.
+- Geometry-validation tracking now keeps one track when the open-vocabulary
+  label changes between book, storage container, and cardboard box on adjacent
+  frames, preserving the dimension history.
+- Corrected the Amazon reference box manifest/template from the historical
+  filename value `410 x 330 x 140 mm` to the V3 ruler remeasurement
+  `410 x 315 x 140 mm`; its external cuboid reference is now `18.081 L`.
+
+### Validation completed
+
+- Focused rigid/general geometry, tracking, reference validation, camera
+  recovery, streaming, classification, and integration suite: 252 tests
+  passed.
+- Full 294-test discovery is not clean in this reduced WSL interpreter:
+  missing OpenCV/Torch caused eight import/runtime errors, and four unrelated
+  material/noise assertions also failed in that dependency-limited run. The
+  selected 252-test suite above is the valid local regression result; the
+  dependency-specific modules must run in the friend's installed environment.
+- Live V3 accuracy remains pending until build `19.21.0-local-ai` is deployed
+  and the two ruler objects are repeated with one still object and an empty,
+  stable RealSense baseline.
+
+### Known limitations
+
+- No ruler-derived multiplier is hard-coded. Using the same two objects both
+  to fit and claim accuracy would be circular; they remain validation cases.
+- Deformable bags, backpacks, pillows, and clothing expose their current
+  filled visible footprint. Their flat manufactured size is not a valid
+  single-view 3-D ground truth.
+
 ## v5 — 2026-09-16 — Reversible household-object geometry validation
 
 ### Status

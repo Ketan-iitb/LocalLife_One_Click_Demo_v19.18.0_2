@@ -18,9 +18,9 @@ boxes:
     tolerance_mm: 10
     measured: true
     source_image: box_11.5_21.5_21.5_cm.jpg
-  - id: cardboard_box_410x330x140
-    nominal_volume_liters: 18.942
-    dimensions_mm: { length: 410, width: 330, height: 140 }
+  - id: cardboard_box_410x315x140
+    nominal_volume_liters: 18.081
+    dimensions_mm: { length: 410, width: 315, height: 140 }
     tolerance_mm: 12
     measured: true
     source_image: box_41_33_14_cm.jpg

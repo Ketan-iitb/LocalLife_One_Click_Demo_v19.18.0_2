@@ -101,6 +101,9 @@ class Detection:
     dimension_confidence: float | None = None
     dimension_flags: tuple[str, ...] = ()
     dimension_method: str | None = None
+    dimension_frames_considered: int = 1
+    dimension_frames_accepted: int = 1
+    dimension_std_mm: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
     @property
     def area_pixels(self) -> int:
@@ -156,6 +159,13 @@ class Detection:
             "dimension_confidence": self.dimension_confidence,
             "dimension_flags": list(self.dimension_flags),
             "dimension_method": self.dimension_method,
+            "dimension_frames_considered": int(self.dimension_frames_considered),
+            "dimension_frames_accepted": int(self.dimension_frames_accepted),
+            "dimension_std_mm": {
+                "length": round(float(self.dimension_std_mm[0]), 3),
+                "width": round(float(self.dimension_std_mm[1]), 3),
+                "height": round(float(self.dimension_std_mm[2]), 3),
+            } if self.footprint_length_mm is not None else None,
         }
 
 
@@ -223,6 +233,9 @@ class ObjectDimensions:
     mask_clipped: bool
     flags: tuple[str, ...] = ()
     method: str = "realsense_support_plane_footprint"
+    frames_considered: int = 1
+    frames_accepted: int = 1
+    dimension_std_mm: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -237,6 +250,13 @@ class ObjectDimensions:
             "mask_clipped": bool(self.mask_clipped),
             "flags": list(self.flags),
             "method": self.method,
+            "frames_considered": int(self.frames_considered),
+            "frames_accepted": int(self.frames_accepted),
+            "dimension_std_mm": {
+                "length": round(float(self.dimension_std_mm[0]), 3),
+                "width": round(float(self.dimension_std_mm[1]), 3),
+                "height": round(float(self.dimension_std_mm[2]), 3),
+            },
         }
 
 

@@ -28,9 +28,10 @@ from locallife_cloud.pipeline import VisionPipeline
 from locallife_cloud.types import Detection
 
 from locallife_cloud.box_templates import BoxTemplate, match_box_template
-from locallife_cloud.types import BoxVolumeMeasurement, CameraIntrinsics
+from locallife_cloud.types import BoxVolumeMeasurement, CameraIntrinsics, ObjectDimensions
 from locallife_cloud.volume import (
     aggregate_box_measurements,
+    aggregate_object_dimensions,
     estimate_box_volume_cuboid,
     estimate_object_dimensions,
     fit_reference_plane,
@@ -194,20 +195,28 @@ class BoxCuboidVolumeTests(unittest.TestCase):
         self.assertAlmostEqual(result.length_mm, 43.070, delta=0.3)
         self.assertAlmostEqual(result.width_mm, 28.208, delta=0.3)
 
-    def test_default_mask_erosion_shrinks_the_footprint_as_expected(self) -> None:
-        # Numerically verified exact ground truth after accounting for the
-        # default 2px erosion on each side (PDF section 4.1): the footprint
-        # shrinks to the pixel range [row_half-2, col_half-2] on each edge.
-        # length ~= 38.697 mm, width ~= 23.302 mm.
+    def test_default_does_not_erode_a_valid_rigid_footprint(self) -> None:
+        # V3 ruler trials showed that eroding two pixels on every side creates
+        # a systematic physical-size underestimate. Elevation filtering and
+        # percentile trimming already protect the footprint from floor halo,
+        # so the default keeps the complete valid rigid mask.
         depth, mask, intrinsics, plane = self._scene_and_plane()
         result = estimate_box_volume_cuboid(depth, intrinsics, mask, plane)
         self.assertIsNotNone(result)
-        self.assertAlmostEqual(result.length_mm, 38.697, delta=0.3)
-        self.assertAlmostEqual(result.width_mm, 23.302, delta=0.3)
-        # And the un-eroded measurement must be strictly larger in both axes.
-        no_erosion = estimate_box_volume_cuboid(depth, intrinsics, mask, plane, mask_erosion_px=0)
-        self.assertGreater(no_erosion.length_mm, result.length_mm)
-        self.assertGreater(no_erosion.width_mm, result.width_mm)
+        no_erosion = estimate_box_volume_cuboid(
+            depth, intrinsics, mask, plane, mask_erosion_px=0,
+        )
+        self.assertAlmostEqual(result.length_mm, no_erosion.length_mm, places=6)
+        self.assertAlmostEqual(result.width_mm, no_erosion.width_mm, places=6)
+
+    def test_explicit_erosion_remains_available_for_noisy_masks(self) -> None:
+        depth, mask, intrinsics, plane = self._scene_and_plane()
+        eroded = estimate_box_volume_cuboid(
+            depth, intrinsics, mask, plane, mask_erosion_px=2,
+        )
+        complete = estimate_box_volume_cuboid(depth, intrinsics, mask, plane)
+        self.assertLess(eroded.length_mm, complete.length_mm)
+        self.assertLess(eroded.width_mm, complete.width_mm)
 
     def test_volume_liters_equals_length_times_width_times_height(self) -> None:
         depth, mask, intrinsics, plane = self._scene_and_plane()
@@ -390,6 +399,37 @@ class AggregateBoxMeasurementsTests(unittest.TestCase):
         self.assertFalse(diagnostics["mesh_used_for_final_volume"])
 
 
+class AggregateObjectDimensionsTests(unittest.TestCase):
+    @staticmethod
+    def _dimensions(length: float, width: float, height: float) -> ObjectDimensions:
+        return ObjectDimensions(
+            length_mm=length,
+            width_mm=width,
+            height_mm=height,
+            confidence=0.8,
+            depth_valid_ratio=0.9,
+            object_points=500,
+            mask_clipped=False,
+            flags=("single_view_visible_footprint",),
+        )
+
+    def test_general_dimensions_use_track_median_not_latest_outlier(self) -> None:
+        result = aggregate_object_dimensions([
+            self._dimensions(400, 300, 150),
+            self._dimensions(402, 298, 151),
+            self._dimensions(520, 410, 90),
+            self._dimensions(399, 301, 149),
+            self._dimensions(401, 300, 150),
+        ], frames_considered=7)
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result.length_mm, 401.0)
+        self.assertAlmostEqual(result.width_mm, 300.0)
+        self.assertAlmostEqual(result.height_mm, 150.0)
+        self.assertEqual(result.frames_accepted, 5)
+        self.assertEqual(result.frames_considered, 7)
+        self.assertIn("dimension_instability", result.flags)
+
+
 class BoxTemplateMatchTests(unittest.TestCase):
     def test_unmeasured_template_never_matches(self) -> None:
         # Mirrors box_templates.yaml's shipped state: a placeholder template
@@ -448,7 +488,7 @@ class BoxTemplateMatchTests(unittest.TestCase):
         ids = {template.id for template in templates}
         self.assertEqual(ids, {
             "cardboard_box_215x115x215",
-            "cardboard_box_410x330x140",
+            "cardboard_box_410x315x140",
             "chocolate_milk_carton_70x70x230",
             "milk_carton_95x70x230",
         })
@@ -640,6 +680,36 @@ class PeerLabelledBoxGeometryTests(unittest.TestCase):
         measured = [item for item in detections if item.box_length_mm is not None]
         self.assertTrue(measured)
         self.assertNotIn("peer_labelled_box", measured[0].box_volume_flags)
+
+    def test_rigid_validation_label_uses_cuboid_even_when_detector_calls_it_book(self) -> None:
+        config = self._config()
+        config.operating_mode = "geometry_validation"
+        detector = _StubBoxDetector()
+        pipeline = VisionPipeline(config, detector=detector)
+        empty = np.zeros((70, 70, 3), dtype=np.uint8)
+        baseline = np.full((70, 70), 2.0, dtype=np.float32)
+        camera = CameraIntrinsics(fx=100, fy=100)
+        pipeline.set_baseline(empty, baseline, camera)
+        mask = np.zeros((70, 70), dtype=bool)
+        mask[10:40, 10:50] = True
+        frame = empty.copy()
+        frame[mask] = (40, 90, 170)
+        depth = baseline.copy()
+        depth[mask] = 1.7
+
+        analysis = pipeline.process_precomputed(
+            frame,
+            detections=[Detection("book", 0.9, (10, 10, 50, 40), mask.copy())],
+            depth_m=depth,
+            intrinsics=camera,
+            timestamp=100.0,
+            persist=False,
+        )
+
+        item = analysis.detections[0]
+        self.assertEqual(item.accepted_class, "measurement_object")
+        self.assertEqual(item.dimension_method, "realsense_table_relative_cuboid")
+        self.assertIsNotNone(item.box_length_mm)
 
 
 class NoCapturedBaselineVolumeTests(unittest.TestCase):
