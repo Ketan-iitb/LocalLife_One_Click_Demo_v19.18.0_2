@@ -225,6 +225,152 @@ def fit_support_plane_from_background(
     )
 
 
+def fit_local_support_plane(
+    depth_m: np.ndarray | None,
+    intrinsics: CameraIntrinsics | None,
+    object_mask: np.ndarray | None,
+    *,
+    region_mask: np.ndarray | None = None,
+    baseline_depth_m: np.ndarray | None = None,
+    ring_fraction: float = 0.55,
+    minimum_samples: int = 120,
+) -> ReferencePlane | None:
+    """Fit the surface the object is actually RESTING ON, not the room's largest.
+
+    This is the v8 root cause. `fit_reference_plane` runs a RANSAC that keeps
+    the plane with the most inliers, and `set_baseline` runs it across the
+    whole measurement region. In the V3 trials the camera pointed down at a
+    floor, so the largest coherent surface *was* the support surface and the
+    reported dimensions came within a few percent of ruler truth. In the v6-v8
+    trials the camera looks sideways across a bed with a wall behind it. A
+    painted wall is large, flat and low-noise; a duvet is soft, wrinkled and
+    returns sparse speckled depth. RANSAC therefore picks the wall -- entirely
+    correctly by its own criterion -- and every "height above the support
+    plane" becomes the object's distance in FRONT OF THE WALL. That is why a
+    20 cm bag measured 789 mm, a 14 cm carton measured 599 mm, and why the
+    numbers barely moved when the object changed: they were reporting how far
+    the bed is from the wall.
+
+    Tilt does not rescue it either. `ReferencePlane.tilt_degrees` is the angle
+    between the plane normal and the camera axis, so a wall viewed head-on
+    scores a flattering 0 deg while the bed it should have chosen, viewed at a
+    shallow angle, looks steeply tilted. Both of the existing criteria prefer
+    the wall.
+
+    The fix is to stop asking "what is the biggest plane?" and ask "what is
+    this object standing on?". Only background immediately surrounding the
+    object can answer that, weighted towards the pixels BELOW it, because a
+    support surface is by definition underneath whatever it supports. Passing
+    `baseline_depth_m` fits against the empty-scene capture, where the object
+    is absent and the surface it now covers is directly visible.
+
+    Returns None when the neighbourhood holds too little usable background, so
+    the caller can fall back rather than trust a weak local fit.
+    """
+    if depth_m is None or intrinsics is None or object_mask is None:
+        return None
+    if object_mask.shape != depth_m.shape:
+        return None
+    if not 0.0 < ring_fraction <= 4.0:
+        return None
+
+    obj = object_mask.astype(bool)
+    object_pixels = int(np.count_nonzero(obj))
+    if object_pixels < 1:
+        return None
+
+    # Prefer the empty-scene capture: the support surface under the object is
+    # visible there, and the object cannot contaminate its own reference.
+    source = depth_m
+    if baseline_depth_m is not None and baseline_depth_m.shape == depth_m.shape:
+        source = baseline_depth_m
+
+    rows = np.nonzero(obj)[0]
+    columns = np.nonzero(obj)[1]
+    height, width = obj.shape
+    span = max(1, int(round((object_pixels ** 0.5) * ring_fraction)))
+
+    # A generous box around the object, extended further downwards: in image
+    # space the surface an object rests on continues below its lower edge.
+    top = max(0, int(rows.min()) - span // 2)
+    bottom = min(height, int(rows.max()) + span + 1)
+    left = max(0, int(columns.min()) - span)
+    right = min(width, int(columns.max()) + span + 1)
+    neighbourhood = np.zeros_like(obj)
+    neighbourhood[top:bottom, left:right] = True
+
+    exclusion = obj
+    try:
+        import cv2
+
+        # Keep a margin clear of the object: depth at a segmentation boundary
+        # is a mixture of object and surface and would bias the fit.
+        kernel_size = max(3, (span // 2) | 1)
+        exclusion = cv2.dilate(
+            obj.astype(np.uint8), np.ones((kernel_size, kernel_size), dtype=np.uint8),
+            iterations=1,
+        ).astype(bool)
+    except ImportError:
+        pass
+
+    background = neighbourhood & ~exclusion
+    if region_mask is not None and region_mask.shape == background.shape:
+        background &= region_mask.astype(bool)
+    background &= np.isfinite(source) & (source > 0.10) & (source < 20.0)
+
+    # Weight towards what is underneath the object. Rows at or below its
+    # midpoint are where a support surface has to be; the band above it is
+    # usually the wall, the headboard, or open room.
+    below = background.copy()
+    below[: int(np.percentile(rows, 50.0)), :] = False
+    if int(np.count_nonzero(below)) >= minimum_samples:
+        background = below
+
+    if int(np.count_nonzero(background)) < minimum_samples:
+        return None
+    return fit_reference_plane(
+        source, intrinsics, mask=background, minimum_samples=minimum_samples,
+    )
+
+
+def support_plane_explains_object(
+    depth_m: np.ndarray | None,
+    intrinsics: CameraIntrinsics | None,
+    object_mask: np.ndarray | None,
+    plane: ReferencePlane | None,
+    *,
+    max_height_m: float = 0.80,
+    min_height_m: float = 0.005,
+    minimum_above_fraction: float = 0.55,
+) -> bool:
+    """Whether an object plausibly STANDS ON this plane.
+
+    A measurement is only meaningful if the surface it is expressed relative
+    to is the one the object rests on. Against the wall plane the v8 bag sat
+    790 mm "above" a surface it was merely in front of -- arithmetically fine,
+    physically meaningless. Requiring most of the object to lie within a
+    plausible height band above the plane rejects that without needing to know
+    which way is down.
+    """
+    if plane is None or not reference_plane_is_usable(plane):
+        return False
+    if depth_m is None or intrinsics is None or object_mask is None:
+        return False
+    if object_mask.shape != depth_m.shape:
+        return False
+
+    height_map = _plane_perpendicular_height(
+        depth_m.astype(np.float64, copy=False), intrinsics, plane.coefficients,
+    )
+    if height_map is None:
+        return False
+    sampled = height_map[object_mask.astype(bool) & np.isfinite(height_map)]
+    if sampled.size < 12:
+        return False
+    within = np.count_nonzero((sampled >= min_height_m) & (sampled <= max_height_m))
+    return (within / sampled.size) >= minimum_above_fraction
+
+
 def synthesize_plane_depth(
     shape: tuple[int, int],
     intrinsics: CameraIntrinsics | None,

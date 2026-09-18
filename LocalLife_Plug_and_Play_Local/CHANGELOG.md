@@ -9,6 +9,111 @@ configuration changes, validation performed, hardware status, and any known
 limitations. This should make it possible to identify the version that
 introduced a regression without guessing from file modification dates.
 
+## v8 — 2026-09-18 — The support plane was the wall
+
+### Status
+
+- Implemented locally after the `images/v8` hardware run. Not yet retested on
+  the RealSense computer. No camera firmware, intrinsics, or calibration
+  factor was changed, and the dimension formulas themselves are unchanged.
+
+### Evidence
+
+v8 showed the mask work from v7/v7.1 had landed: RealSense masks now sit on
+the object, one live track instead of four to nine, and
+`mask_constrained_to_new_surface` appears on the results. The numbers were
+still wrong, and wrong in a very specific way:
+
+| Object | Reported | Ruler |
+|---|---|---|
+| Black polythene bag | `392 x 106 x 789 mm` | roughly 20 cm tall |
+| Amazon carton | `847 x 394 x 599 mm` | `410 x 315 x 140 mm` |
+| Third object | `635 x 159 x 611 mm` | — |
+
+The heights are all 599-789 mm and barely move when the object changes, which
+is the signature of a measurement that is not about the object at all. One
+result reported 85% confidence with no `mask_clipped` or
+`low_elevated_fraction` flag: by every check the build had, it was a good
+measurement.
+
+The V3 trials, by contrast, reported `389 x 302 x 123 mm` for the
+`410 x 315 x 140 mm` carton and 15.3 cm for a 13 cm shoebox, on essentially
+this same code.
+
+### Reason
+
+`fit_reference_plane` runs a RANSAC that keeps the plane with the most
+inliers, and `set_baseline` runs it across the whole measurement region. In
+V3 the camera pointed down at a floor, so the largest coherent surface *was*
+the surface objects rested on. From v6 onward the camera looks sideways
+across a bed with a painted wall behind it. A wall is large, flat and
+low-noise; a duvet is soft, wrinkled and returns sparse speckled depth.
+RANSAC therefore selected the wall -- correctly, by its own criterion -- and
+every "height above the support plane" became the object's distance in front
+of the wall.
+
+Tilt did not catch it. `tilt_degrees` is the angle between the plane normal
+and the camera axis, so a wall viewed head-on scores a flattering 0 degrees
+while the bed it should have chosen looks steeply tilted. Both existing
+criteria preferred the wall, which is why this survived rounds of fixes aimed
+at masks, baselines and tracking.
+
+Note also that v7 made this worse rather than causing it: before v7 no
+baseline was ever captured, so the live per-frame fit -- which already biased
+towards the band below the object -- was used. Once baselines existed, the
+region-wide baseline plane took precedence.
+
+### Changes
+
+- Added `fit_local_support_plane()`. It fits the plane from background
+  immediately around the object, weighted towards the pixels below it, and
+  prefers the captured empty baseline as its source so the object cannot
+  contaminate its own reference. The question it answers is "what is this
+  object standing on?", not "what is the biggest plane in the room?".
+- Added `support_plane_explains_object()`: most of an object must lie within
+  a plausible height band above a plane before that plane may be used to
+  measure it. The wall fails this while the surface underneath passes.
+- Each detection now selects its own plane: the local surface when it
+  explains the object, the region-wide plane when it does, and otherwise none
+  at all -- in which case dimensions are withheld with `no_supporting_surface`
+  and a warning telling the operator to aim the camera down at the surface.
+  Results measured against a local fit carry `local_support_plane`.
+- Closed the cuboid-path hole: `estimate_box_volume_cuboid()` writes the same
+  L/W/H fields as the general estimator but bypassed the untrustworthy-flag
+  gate added in v7.1, so a `mask_clipped` box still published
+  `1150 x 609 x 771 mm` in the v8 run while the general path beside it
+  correctly withheld its own numbers.
+- The dashboard now opens with camera-aim guidance, because no amount of
+  plane selection makes a near-horizontal view of a horizontal surface a good
+  measurement geometry.
+
+### Validation completed
+
+- Focused suite: 304 tests passed, including 7 new ones in
+  `tests/test_support_plane_selection.py`. Those build a synthetic version of
+  the v8 geometry -- a flat wall filling most of the frame, an object on a
+  lower receding surface -- and assert the failure is genuinely reproduced
+  (measuring against the wall inflates a 14 cm object past 400 mm) before
+  asserting the local fit recovers 140 mm. A further test measures three
+  different true heights to confirm the result tracks reality rather than
+  returning a plausible constant, and another holds the V3 downward-camera
+  geometry to the same accuracy so the case that already worked does not
+  regress.
+- The same 9 pre-existing OpenCV/Torch-dependent failures remain, confirmed
+  failing on the unmodified tree.
+- No hardware accuracy claim. These are synthetic scenes; ruler validation on
+  the rig is still outstanding.
+
+### Known limitations
+
+- A camera looking nearly horizontally at a horizontal surface remains a poor
+  geometry regardless of this fix: the plane model `z = a*x + b*y + c` cannot
+  represent a surface parallel to the camera axis at all, and it degrades
+  steeply as that angle is approached. Aiming down is a real requirement, not
+  a preference.
+- Deformable label drift can still fork a track, and there is still no
+  single-dominant-object gate for validation trials.
+
 ## v7.1 — 2026-09-18 — Measure only the new surface; stop publishing flagged dimensions
 
 ### Status

@@ -53,8 +53,10 @@ from .volume import (
     fit_reference_plane,
     fit_support_plane_from_background,
     reference_plane_is_usable,
+    fit_local_support_plane,
     newly_introduced_mask,
     recover_elevated_object_mask,
+    support_plane_explains_object,
     synthesize_plane_depth,
 )
 
@@ -333,6 +335,7 @@ UNTRUSTWORTHY_DIMENSION_FLAGS = (
     "low_elevated_fraction",
     "high_plane_rmse",
     "no_newly_introduced_surface",
+    "no_supporting_surface",
 )
 
 
@@ -1465,6 +1468,46 @@ class VisionPipeline:
             # would erase exactly the holes coverage exists to detect and
             # would let a sparse-depth object look fully measured. The
             # separate `dimension_mask` below carries the constraint.
+            # v8 FIX: choose the plane this object is standing on, rather
+            # than reusing one plane fitted across the whole region. The v8
+            # run measured heights of 599-789 mm for objects 14-20 cm tall,
+            # and those numbers hardly moved when the object changed, because
+            # the region-wide RANSAC had locked onto the bedroom WALL -- the
+            # largest flat low-noise surface in a side-on view -- so every
+            # "height above the support plane" was really the object's
+            # distance in front of the wall. The V3 trials came within a few
+            # percent of ruler truth with this same code purely because the
+            # camera pointed down at a floor, which made the largest plane
+            # and the support plane the same surface.
+            object_plane = measurement_plane
+            local_plane = fit_local_support_plane(
+                depth_m,
+                intrinsics,
+                instance_mask,
+                region_mask=bin_region,
+                baseline_depth_m=self.baseline_realsense,
+            ) if depth_m is not None and intrinsics is not None else None
+            local_explains = support_plane_explains_object(
+                depth_m, intrinsics, instance_mask, local_plane,
+                max_height_m=self.config.max_object_height_m,
+                min_height_m=minimum_height_m * 0.5,
+            )
+            region_explains = support_plane_explains_object(
+                depth_m, intrinsics, instance_mask, measurement_plane,
+                max_height_m=self.config.max_object_height_m,
+                min_height_m=minimum_height_m * 0.5,
+            )
+            support_plane_scope = "region"
+            if local_explains:
+                # The local surface supports the object: prefer it even when
+                # the region-wide plane also looks acceptable, because the
+                # local one is what the object is physically resting on.
+                object_plane = local_plane
+                support_plane_scope = "local"
+            elif not region_explains:
+                object_plane = None
+                support_plane_scope = "none"
+
             dimension_mask = instance_mask
             dimension_mask_rejected = False
             mask_change_constrained = False
@@ -1586,6 +1629,18 @@ class VisionPipeline:
             if dimension_mask_rejected:
                 detection.measurement_quality = "rejected-no-newly-introduced-surface"
                 detection.dimension_flags = ("no_newly_introduced_surface",)
+            elif support_plane_scope == "none" and self.camera_id != "logitech":
+                # No fitted plane puts this object at a plausible height above
+                # it, so there is no surface here it can be said to stand on.
+                # Reporting L/W/H against a plane the object merely faces is
+                # what produced the v8 wall measurements.
+                detection.measurement_quality = "rejected-no-supporting-surface"
+                detection.dimension_flags = ("no_supporting_surface",)
+                if "rests on" not in " ".join(warnings):
+                    warnings.append(
+                        "No surface was found that this object rests on; aim the camera down at "
+                        "the surface holding the object rather than across it at a wall"
+                    )
             elif (
                 self.camera_id != "logitech"
                 and detection.accepted_class is not None
@@ -1595,7 +1650,7 @@ class VisionPipeline:
                     depth_m,
                     intrinsics,
                     dimension_mask,
-                    measurement_plane,
+                    object_plane,
                     measurement_mask=bin_region,
                     min_height_m=minimum_height_m,
                     max_height_m=self.config.max_object_height_m,
@@ -1610,6 +1665,8 @@ class VisionPipeline:
                     extra_dimension_flags += ("support_plane_mask_recovered",)
                 if mask_change_constrained:
                     extra_dimension_flags += ("mask_constrained_to_new_surface",)
+                if support_plane_scope == "local":
+                    extra_dimension_flags += ("local_support_plane",)
                 if extra_dimension_flags:
                     dimensions = replace(
                         dimensions, flags=tuple(dimensions.flags) + extra_dimension_flags,
@@ -1671,7 +1728,7 @@ class VisionPipeline:
                     depth_m,
                     intrinsics,
                     dimension_mask,
-                    measurement_plane,
+                    object_plane,
                     measurement_mask=bin_region,
                     min_height_m=minimum_height_m,
                     max_height_m=self.config.max_object_height_m,
@@ -1694,7 +1751,20 @@ class VisionPipeline:
                 # `pending_box_attempted`) can fold it into that now-known
                 # track's multi-frame aggregation history.
                 pending_box_attempted.add(id(detection))
-                if cuboid is not None:
+                # v8: the cuboid path writes the same L/W/H fields as the
+                # general estimator but bypassed the untrustworthy-flag gate,
+                # so a `mask_clipped` box still published 1150x609x771 mm in
+                # the v8 run while the general path beside it correctly
+                # withheld its own numbers.
+                cuboid_blocking = (
+                    untrustworthy_dimension_flags(cuboid.flags) if cuboid is not None else ()
+                )
+                if cuboid is not None and cuboid_blocking and self.config.reject_flagged_dimensions:
+                    detection.box_volume_flags = tuple(cuboid.flags)
+                    detection.measurement_quality = (
+                        "rejected-untrustworthy-dimensions: " + ", ".join(cuboid_blocking)
+                    )
+                elif cuboid is not None:
                     pending_box_measurements[id(detection)] = cuboid
                     self._apply_box_cuboid(detection, cuboid, warnings)
             if self.calibration is not None and logitech_ready and logitech_height_coherent:
