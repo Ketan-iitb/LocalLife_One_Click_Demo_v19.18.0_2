@@ -275,6 +275,72 @@ def synthesize_plane_depth(
     return depth.astype(np.float32)
 
 
+def newly_introduced_mask(
+    depth_m: np.ndarray | None,
+    baseline_depth_m: np.ndarray | None,
+    *,
+    region_mask: np.ndarray | None = None,
+    min_change_m: float = 0.012,
+    max_change_m: float = 5.0,
+    noise_map_m: np.ndarray | None = None,
+    min_points: int = 40,
+) -> np.ndarray | None:
+    """Pixels that now read measurably closer than the empty-scene baseline.
+
+    This is the only evidence the system has that an object was *introduced*
+    rather than always being part of the room. A bed, a duvet fold and a
+    pillow are all elevated above the floor plane and all connected to each
+    other, so elevation alone can never separate them from a bag placed on
+    top; the bag is distinguished by the fact that the surface under it moved
+    towards the camera relative to the captured empty baseline.
+
+    Returns None when no usable baseline exists, so callers can keep their
+    existing behaviour instead of silently treating "no evidence of change"
+    as "nothing changed".
+    """
+    if (
+        depth_m is None or baseline_depth_m is None
+        or depth_m.ndim != 2 or baseline_depth_m.shape != depth_m.shape
+    ):
+        return None
+    if min_change_m <= 0 or max_change_m <= min_change_m:
+        return None
+
+    current = depth_m.astype(np.float64, copy=False)
+    baseline = baseline_depth_m.astype(np.float64, copy=False)
+    valid = (
+        np.isfinite(current) & (current > 0.10) & (current < 20.0)
+        & np.isfinite(baseline) & (baseline > 0.10) & (baseline < 20.0)
+    )
+    if region_mask is not None and region_mask.shape == valid.shape:
+        valid &= region_mask.astype(bool)
+
+    threshold = np.full(current.shape, float(min_change_m), dtype=np.float64)
+    if noise_map_m is not None and noise_map_m.shape == current.shape:
+        # Where the empty baseline itself was noisy, demand a correspondingly
+        # larger change before believing something is physically there.
+        threshold = np.maximum(threshold, np.nan_to_num(
+            noise_map_m.astype(np.float64, copy=False), nan=0.0, posinf=0.0,
+        ) * 3.0)
+
+    change = baseline - current
+    introduced = valid & (change >= threshold) & (change <= max_change_m)
+
+    try:
+        import cv2
+
+        introduced = cv2.morphologyEx(
+            introduced.astype(np.uint8), cv2.MORPH_CLOSE,
+            np.ones((5, 5), dtype=np.uint8), iterations=1,
+        ).astype(bool)
+    except ImportError:
+        pass
+
+    if int(np.count_nonzero(introduced)) < min_points:
+        return np.zeros(current.shape, dtype=bool)
+    return introduced
+
+
 def recover_elevated_object_mask(
     depth_m: np.ndarray | None,
     intrinsics: CameraIntrinsics | None,
@@ -286,6 +352,8 @@ def recover_elevated_object_mask(
     max_height_m: float = 0.80,
     min_points: int = 60,
     max_expansion: float = 6.0,
+    change_mask: np.ndarray | None = None,
+    min_change_fraction: float = 0.0,
 ) -> np.ndarray | None:
     """Recover the complete depth surface anchored by a semantic detection.
 
@@ -299,6 +367,17 @@ def recover_elevated_object_mask(
 
     The result is a *measurement mask*, not a new classifier: without an
     accepted plastic-bag, paper-bag, or cardboard seed, nothing is recovered.
+
+    v7: elevation above the support plane is necessary but nowhere near
+    sufficient on a real surface. On a bed, the object, the duvet folds and a
+    pillow form one *connected* elevated component, so the largest-overlap
+    rule below happily returned the whole bed and the estimator measured it
+    honestly (the reported ~1021 x 669 mm). When `change_mask` is supplied --
+    the pixels that read closer than the captured empty baseline, see
+    `newly_introduced_mask` -- elevation is intersected with it, so unchanged
+    furniture can no longer be annexed into the measured surface. A recovered
+    mask that is still mostly unchanged background fails
+    `min_change_fraction` and is rejected rather than measured.
     """
     if (
         depth_m is None or intrinsics is None or seed_mask is None
@@ -335,6 +414,16 @@ def recover_elevated_object_mask(
         & (height_map >= min_height_m)
         & (height_map <= max_height_m)
     )
+    introduced: np.ndarray | None = None
+    if change_mask is not None and change_mask.shape == depth_m.shape:
+        introduced = change_mask.astype(bool)
+        constrained = elevated & introduced
+        # Only honour the constraint when the changed region still explains
+        # the seed. If the baseline is stale or the object was already present
+        # when it was captured, falling back to plain elevation preserves the
+        # previous behaviour instead of silently measuring nothing.
+        if int(np.count_nonzero(constrained & seed)) >= max(min_points // 4, 12):
+            elevated = constrained
 
     # Bridge only small RealSense holes on the same physical surface. A tight
     # close is sufficient for stereo speckle and cannot span the large gap to
@@ -365,15 +454,32 @@ def recover_elevated_object_mask(
         if overlap > best_overlap:
             best_overlap = overlap
             best = component.astype(bool)
+    # Deliberately loose: v4 added this recovery precisely because a detector
+    # can return only a printed logo or centre panel, and that seed is a small
+    # fraction of the true object. Contamination is prevented by the change
+    # constraint above, not by starving a legitimately partial seed.
     minimum_overlap = max(12, min_points // 4, int(np.ceil(seed_pixels * 0.015)))
     if best is None or best_overlap < minimum_overlap:
         return None
 
     recovered_pixels = int(np.count_nonzero(best))
+    # Kept in force even when the change constraint applied. "Newly
+    # introduced" is not automatically small: a stale baseline, or one
+    # captured from a different camera pose, can mark most of the frame as
+    # changed, and without this bound the recovered surface would then be
+    # unbounded again. A seed too small to reach its object under this ratio
+    # falls back to the semantic mask -- undersized, but never the furniture.
     if recovered_pixels > int(seed_pixels * max_expansion):
         # A huge jump is more likely a contaminated/incorrect plane than a
         # legitimately partial object mask. Keep the semantic seed instead.
         return None
+    if introduced is not None and min_change_fraction > 0.0:
+        changed_fraction = int(np.count_nonzero(best & introduced)) / max(1, recovered_pixels)
+        if changed_fraction < min_change_fraction:
+            # The recovered surface is mostly scenery that was already there
+            # before the object arrived. Measuring it would report the
+            # furniture's dimensions under the object's label.
+            return None
     return best
 
 

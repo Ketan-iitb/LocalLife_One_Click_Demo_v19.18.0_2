@@ -9,6 +9,104 @@ configuration changes, validation performed, hardware status, and any known
 limitations. This should make it possible to identify the version that
 introduced a regression without guessing from file modification dates.
 
+## v7 — 2026-09-18 — Baseline deadlock and measured-object novelty
+
+### Status
+
+- Implemented locally; not yet deployed to or retested on the friend's
+  RealSense computer. No camera firmware, laser power, exposure, USB, depth
+  preset, ROI, factory intrinsics, or volume calibration factor was changed.
+- No dimension mathematics was changed. This version corrects which pixels
+  reach the estimator, not how the estimator turns pixels into millimetres.
+
+### Evidence and reason
+
+The v6 hardware trial measured the bed rather than the bag placed on it: one
+green bag produced simultaneous handbag/duffel/backpack/pillow detections,
+the RealSense object counter climbed to 29-51 with 4-9 live tracks in a
+mostly unchanged scene, and reported dimensions included approximately
+1021 x 669 x 394 mm and 1074 x 355 x 359 mm. The dashboard flagged
+`dimension_instability`, `mask_clipped`, `low_elevated_fraction`,
+`low_valid_depth`, `live_fitted_support_plane` and
+`support_plane_mask_recovered` throughout.
+
+Reading the mask/baseline/dedup/tracking path found a deadlock rather than a
+geometry error. `_consider_automatic_baseline()` reset its empty-scene
+countdown on any accepted detection; `geometry_validation` mode's broad
+household prompt bank detects the room's own furniture in every frame, so the
+countdown never completed and no empty-scene baseline was ever captured. With
+no baseline:
+
+- the support plane was refitted from every frame's own background, and that
+  background is defined by excluding the frame's own detections, which change
+  constantly, so the plane moved every frame and the measured object changed
+  shape while standing still;
+- there was no notion of "newly introduced" at all. Elevation above the
+  support plane was the only test a surface had to pass, and on a bed the
+  bag, the duvet folds and a pillow form one *connected* elevated component,
+  so depth-supported mask recovery annexed the lot and the estimator measured
+  it faithfully.
+
+### Changes
+
+- The automatic empty-scene countdown no longer resets on detections while
+  `geometry_validation` mode is active; it gates on camera and scene
+  stillness alone, and reports `verifying-still-scene-N-of-M` with an
+  explicit warning to keep the reference object out of view until setup
+  completes. Production `waste` mode still requires a genuinely empty scene,
+  unchanged. Reversible through
+  `LOCALLIFE_VALIDATION_BASELINE_IGNORES_DETECTIONS=false`.
+- Added `newly_introduced_mask()`: the RealSense pixels now reading
+  measurably closer than the captured empty baseline. Where the baseline's
+  own noise map is larger, the change threshold rises with it. With no
+  baseline it returns None, so an uncalibrated installation keeps its
+  previous behaviour rather than showing an empty dashboard.
+- Detections whose masks contain almost no newly-introduced pixels are
+  rejected before tracking or measurement. An unchanged pillow, duvet or
+  headboard is therefore rejected on physical grounds whatever the
+  open-vocabulary detector chooses to call it, which no amount of prompt-bank
+  tuning can achieve: a closed prompt bank always assigns every salient
+  region its nearest accepted label.
+- Depth-supported mask recovery intersects the elevated surface with that
+  newly-introduced region, and rejects a recovered mask that is still mostly
+  unchanged scenery. The constraint is skipped when the changed region no
+  longer explains the semantic seed, so a stale baseline degrades to the
+  previous behaviour instead of silently measuring nothing.
+- Added `newly_introduced_pixels` to the API/state diagnostics. Zero with an
+  object in view means the baseline is stale or was captured with the object
+  already present.
+
+### Validation completed
+
+- Focused suite: 293 tests passed, including 11 new regression tests in
+  `tests/test_baseline_change_gating.py` covering novelty detection, the bed
+  contamination case, rejection of unchanged furniture detections, and the
+  validation-mode baseline capture that waste mode must not inherit.
+- The 9 remaining failures in this dependency-limited WSL interpreter
+  (`test_calibration_fusion`, `test_material`, `test_noise_robustness`) are
+  pre-existing and require OpenCV/Torch; they were confirmed failing on the
+  unmodified tree before these changes. Three further modules
+  (`test_local_offline_mode`, `test_material_transformers_compat`,
+  `test_recipe_pipeline`) cannot import without `cv2`/`torch` and must be run
+  in the friend's installed environment.
+- No hardware accuracy claim is made. This version must be retested on the
+  RealSense rig with a ruler-measured object.
+
+### Known limitations and pending work
+
+- Steps 4-6 of the agreed correction are not in this version: dimensions are
+  still published when the estimator has already flagged them untrustworthy
+  (`mask_clipped`, `high_plane_rmse`, live-fitted plane); label drift between
+  deformable labels still forks a track, so one bag can still be counted
+  several times; and no single-dominant-object gate exists for validation
+  trials yet.
+- `max_expansion` still bounds recovery by a ratio to the semantic seed. A
+  very small seed on a much larger object therefore falls back to the
+  semantic mask -- undersized, but no longer the furniture.
+- If the baseline is captured with the reference object already in view, that
+  object becomes part of the scene and will be rejected as unchanged.
+  `newly_introduced_pixels` reading zero is the signal to recapture.
+
 ## v6 — 2026-09-17 — V3 dimension stability and rigid-object correction
 
 ### Status

@@ -53,6 +53,7 @@ from .volume import (
     fit_reference_plane,
     fit_support_plane_from_background,
     reference_plane_is_usable,
+    newly_introduced_mask,
     recover_elevated_object_mask,
     synthesize_plane_depth,
 )
@@ -320,6 +321,49 @@ def deduplicate_overlapping_detections(
     return sorted(unique, key=lambda item: item.area_pixels, reverse=True)
 
 
+def reject_unchanged_background_detections(
+    detections: list[Detection],
+    change_mask: np.ndarray | None,
+    frame_shape: tuple[int, ...],
+    *,
+    min_change_fraction: float,
+) -> tuple[list[Detection], int]:
+    """Drop detections that sit entirely on scenery present in the baseline.
+
+    An open-vocabulary detector with a closed prompt bank assigns every
+    salient region its *nearest* prompt, so in geometry_validation mode a
+    duvet fold becomes "folded clothing" and a headboard cushion becomes
+    "pillow" -- both accepted, both measured, neither placed there by the
+    operator. No amount of label tuning fixes that, because the labels are
+    the detector's best available answer.
+
+    Physical novelty is the reliable discriminator: a genuinely placed object
+    makes its pixels read closer than the captured empty baseline. A
+    detection whose mask contains almost none of those pixels is furniture,
+    whatever it is called. Returns the surviving detections and how many were
+    rejected. With no baseline (``change_mask`` is None) nothing is rejected,
+    so this can never blank the dashboard on an uncalibrated installation.
+    """
+    if change_mask is None or min_change_fraction <= 0.0:
+        return detections, 0
+    if change_mask.shape != tuple(frame_shape[:2]):
+        return detections, 0
+    kept: list[Detection] = []
+    rejected = 0
+    for detection in detections:
+        mask = combined_mask([detection], frame_shape[:2])
+        area = int(np.count_nonzero(mask))
+        if area <= 0:
+            kept.append(detection)
+            continue
+        changed = int(np.count_nonzero(mask & change_mask))
+        if changed / area < min_change_fraction:
+            rejected += 1
+            continue
+        kept.append(detection)
+    return kept, rejected
+
+
 def summarize_depth_signal(depth_m: np.ndarray | None) -> dict[str, Any]:
     """Expose whether a real, usable depth signal reaches the cloud service."""
     if depth_m is None or depth_m.ndim != 2:
@@ -477,6 +521,10 @@ class VisionPipeline:
         self.saved_profile_loaded = False
         self.baseline_restore_state = "disabled" if not config.restore_saved_baseline else "not-found"
         self.saved_baseline_changed_fraction: float | None = None
+        # v7 diagnostics: how many pixels read closer than the empty baseline
+        # in the most recent RealSense frame. Zero with an object in view
+        # means the baseline is stale or was captured with the object present.
+        self.last_introduced_pixels: int | None = None
         self._saved_baseline_matching_frames = 0
         self._automatic_baseline_stable_frames = 0
         self._automatic_baseline_previous: np.ndarray | None = None
@@ -935,6 +983,42 @@ class VisionPipeline:
         )
         detections = filter_waste_detections(detections, frame.shape, bin_region, self.config)
 
+        # v7: evidence that a candidate surface was physically introduced
+        # after the empty baseline was captured. Prefer the captured empty
+        # baseline over the working reference, which advances after each
+        # committed item and therefore already contains earlier objects.
+        change_baseline = (
+            self.baseline_realsense
+            if self.baseline_realsense is not None else self.reference_realsense
+        )
+        introduced_mask = newly_introduced_mask(
+            depth_m,
+            change_baseline,
+            region_mask=bin_region,
+            min_change_m=self.config.baseline_change_min_depth_m,
+            max_change_m=self.config.max_object_height_m * 2.0,
+            noise_map_m=self.baseline_noise_map,
+        ) if self.camera_id != "logitech" else None
+        self.last_introduced_pixels = (
+            None if introduced_mask is None else int(np.count_nonzero(introduced_mask))
+        )
+        detections, unchanged_rejected = reject_unchanged_background_detections(
+            detections,
+            introduced_mask,
+            frame.shape[:2],
+            # Half the measurement threshold. A raw YOLOE mask routinely
+            # spills a little onto the surface around the object, so the
+            # admission gate only has to establish that something was placed
+            # here at all; the stricter fraction is applied later to the
+            # recovered mask that dimensions are actually computed from.
+            min_change_fraction=self.config.measurement_change_min_fraction * 0.5,
+        )
+        if unchanged_rejected:
+            warnings.append(
+                f"Rejected {unchanged_rejected} detection(s) that have not changed since the "
+                "empty baseline; they are part of the fixed scene, not a placed object"
+            )
+
         if self.camera_id == "logitech":
             detections, segmentation_warnings = bound_logitech_detections(
                 frame,
@@ -1176,6 +1260,12 @@ class VisionPipeline:
                     min_height_m=minimum_height_m,
                     max_height_m=self.config.max_object_height_m,
                     min_points=min(60, self.config.min_component_pixels),
+                    max_expansion=self.config.measurement_max_mask_expansion,
+                    change_mask=introduced_mask,
+                    min_change_fraction=(
+                        self.config.measurement_change_min_fraction
+                        if introduced_mask is not None else 0.0
+                    ),
                 )
                 if recovered is not None and int(np.count_nonzero(recovered)) > int(np.count_nonzero(seed) * 1.08):
                     measurement_masks[id(detection)] = recovered
@@ -1989,7 +2079,30 @@ class VisionPipeline:
         if self.baseline_rgb is not None:
             self._automatic_baseline_status = "ready"
             return
-        if detections or peer_bag_present:
+        # v7 BUGFIX: this reset used to be unconditional, which deadlocked
+        # geometry_validation mode. That mode deliberately recognizes ordinary
+        # household objects, so a room's own furniture (the bed, a pillow, a
+        # folded blanket) is detected in literally every frame, the countdown
+        # reset in literally every frame, and no empty-scene baseline was ever
+        # captured. Without a baseline there is no reference depth, so the
+        # support plane is refitted from each frame's own background -- and
+        # that background is defined by excluding this frame's detections,
+        # which change constantly. The plane then moves every frame, the set
+        # of "elevated" pixels moves with it, and the measured object changes
+        # shape while physically standing still. It also disabled every
+        # "what is new since empty?" test downstream, which is what let
+        # unchanged bedding be measured as a test object at all.
+        #
+        # In validation mode the countdown therefore gates on stillness only
+        # (checked below). The operator keeps the reference object out of
+        # shot until the status reads ready; furniture that is legitimately
+        # part of the scene is supposed to be in the baseline, because that is
+        # precisely what makes it subtractable afterwards.
+        ignore_detections = (
+            self.config.operating_mode == "geometry_validation"
+            and self.config.validation_baseline_ignores_detections
+        )
+        if (detections or peer_bag_present) and not ignore_detections:
             self._automatic_baseline_stable_frames = 0
             self._automatic_baseline_previous = None
             self._automatic_baseline_status = "waiting-for-empty-scene"
@@ -2022,8 +2135,15 @@ class VisionPipeline:
         self._automatic_baseline_stable_frames += 1
         required = self.config.automatic_baseline_frames
         self._automatic_baseline_status = (
+            f"verifying-still-scene-{self._automatic_baseline_stable_frames}-of-{required}"
+            if ignore_detections else
             f"verifying-empty-scene-{self._automatic_baseline_stable_frames}-of-{required}"
         )
+        if ignore_detections and self._automatic_baseline_stable_frames == 1:
+            warnings.append(
+                "Capturing the validation baseline from the current still scene; "
+                "keep the reference object out of view until setup completes"
+            )
         if self._automatic_baseline_stable_frames < required:
             return
         try:
@@ -2459,6 +2579,7 @@ class VisionPipeline:
                     ),
                 },
                 "saved_baseline_changed_fraction": self.saved_baseline_changed_fraction,
+                "newly_introduced_pixels": self.last_introduced_pixels,
                 "hardware_depth_baseline_ready": self.baseline_realsense is not None,
                 "monocular_calibrated": (
                     self.calibration is not None

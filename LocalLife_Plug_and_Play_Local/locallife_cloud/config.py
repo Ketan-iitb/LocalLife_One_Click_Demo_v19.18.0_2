@@ -316,6 +316,31 @@ class AppConfig:
     automatic_baseline: bool = True
     automatic_baseline_frames: int = 9
     automatic_baseline_motion_threshold: float = 3.0
+    # v7: the automatic empty-scene countdown resets on *any* accepted
+    # detection. In geometry_validation mode the broad household prompt bank
+    # always detects the room's own furniture (a bed, a pillow, a folded
+    # blanket), so that countdown never completed, no baseline was ever
+    # captured, and every downstream "what changed since empty?" test was
+    # silently unavailable. In validation mode the countdown therefore
+    # gates on camera/scene stillness alone: the operator is responsible for
+    # keeping the reference object out of shot until the baseline is ready.
+    validation_baseline_ignores_detections: bool = True
+    # v7: how much closer than the empty baseline a pixel must read before it
+    # counts as newly introduced foreground. Below this, RealSense stereo
+    # noise and the baseline's own residual jitter dominate.
+    baseline_change_min_depth_m: float = 0.012
+    # v7: the fraction of a recovered measurement mask that must consist of
+    # newly-introduced pixels. A mask that has crawled off the object onto
+    # unchanged bedding or floor fails this and is rejected rather than
+    # measured.
+    measurement_change_min_fraction: float = 0.55
+    # Bound on how far depth-supported recovery may expand a semantic seed.
+    # Left at the v4 value: a detector that returns only a printed logo needs
+    # a generous bound to recover the real bag, and tightening it here was
+    # measured to break that recovery. What stops the expansion running onto
+    # unchanged bedding is the newly-introduced-pixel constraint, which is
+    # targeted at the actual failure instead of penalising small seeds.
+    measurement_max_mask_expansion: float = 6.0
     sync_interval_seconds: int = 180
     enable_bucket_sync: bool = True
     max_upload_mb: int = 24
@@ -509,6 +534,22 @@ class AppConfig:
                 "LOCALLIFE_TRACK_MAX_CENTER_DISTANCE", defaults.tracker_max_center_distance,
             )),
             automatic_baseline=_bool_env("LOCALLIFE_AUTOMATIC_BASELINE", defaults.automatic_baseline),
+            validation_baseline_ignores_detections=_bool_env(
+                "LOCALLIFE_VALIDATION_BASELINE_IGNORES_DETECTIONS",
+                defaults.validation_baseline_ignores_detections,
+            ),
+            baseline_change_min_depth_m=float(os.environ.get(
+                "LOCALLIFE_BASELINE_CHANGE_MIN_DEPTH_M",
+                defaults.baseline_change_min_depth_m,
+            )),
+            measurement_change_min_fraction=float(os.environ.get(
+                "LOCALLIFE_MEASUREMENT_CHANGE_MIN_FRACTION",
+                defaults.measurement_change_min_fraction,
+            )),
+            measurement_max_mask_expansion=float(os.environ.get(
+                "LOCALLIFE_MEASUREMENT_MAX_MASK_EXPANSION",
+                defaults.measurement_max_mask_expansion,
+            )),
             automatic_baseline_frames=int(os.environ.get(
                 "LOCALLIFE_AUTOMATIC_BASELINE_FRAMES", defaults.automatic_baseline_frames,
             )),
@@ -627,6 +668,12 @@ class AppConfig:
             raise ValueError("Tracker IoU and center-distance thresholds are invalid")
         if self.tracker_phantom_max_missing_frames < 0:
             raise ValueError("Tracker phantom missing-frame budget cannot be negative")
+        if self.baseline_change_min_depth_m <= 0:
+            raise ValueError("Baseline change threshold must be positive")
+        if not 0 < self.measurement_change_min_fraction <= 1:
+            raise ValueError("Measurement change fraction must be between 0 and 1")
+        if self.measurement_max_mask_expansion < 1.0:
+            raise ValueError("Measurement mask expansion limit must be at least 1.0")
         if self.automatic_baseline_frames < 2 or self.automatic_baseline_motion_threshold < 0:
             raise ValueError("Automatic baseline requires stable frames and a non-negative motion threshold")
         if not 0 <= self.saved_baseline_rgb_threshold <= 255:
