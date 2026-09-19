@@ -1167,6 +1167,9 @@ class VisionPipeline:
             "baseline_noise_map": self.baseline_noise_map,
             "noise_sigma": self.config.depth_noise_sigma,
             "reject_outliers": self.config.reject_depth_outliers,
+            "grid_size_m": self.config.volume_grid_size_m,
+            "min_points_per_cell": self.config.volume_min_points_per_cell,
+            "cell_height_percentile": self.config.volume_cell_height_percentile,
         }
 
         hardware_total = estimate_volume(

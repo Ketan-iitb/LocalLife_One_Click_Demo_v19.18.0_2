@@ -459,20 +459,25 @@ class TiltCorrectedVolumeTests(unittest.TestCase):
         self.assertAlmostEqual(naive.height_p90_m, corrected.height_p90_m, delta=1e-6)
         self.assertAlmostEqual(naive.liters, corrected.liters, delta=1e-6)
 
-    def test_default_volume_geometry_is_now_reference_plane(self) -> None:
-        # Correction (round 16): ray-frustum was defaulted here in round 12
-        # on the claim that it is exact regardless of mounting tilt. That
-        # claim was wrong in a way real-hardware testing confirmed -- its
-        # volume sum is computed directly from raw camera-Z depth and never
-        # reads the tilt-corrected height at all (see volume.py's corrected
-        # comment on the ray-frustum branch, and config.py's
-        # `volume_geometry` comment for the full story). reference-plane's
-        # volume sum genuinely uses the corrected height (height above the
-        # fitted table plane, times footprint area at the table depth).
-        # Locking this in as a regression guard: silently reverting the
-        # default would resurrect the accuracy bug this whole test class
-        # exists to catch.
-        self.assertEqual(AppConfig().volume_geometry, "reference-plane")
+    def test_default_volume_geometry_is_the_height_map_grid(self) -> None:
+        # The default has moved twice, each time to fix a real accuracy bug.
+        # Round 12 chose ray-frustum believing it was exact regardless of
+        # mounting tilt; round 16 found its volume sum never reads the
+        # tilt-corrected height at all and switched to reference-plane, whose
+        # sum does. reference-plane then carried its own systematic error:
+        # it anchors each pixel's footprint area to the REFERENCE depth, so
+        # an object standing proud of the bin floor has its footprint
+        # overstated by (z_reference / z_object)^2 -- 44% for the 0.6 m/0.5 m
+        # scene in test_known_volume_validation.py, which documented the bias
+        # as understood-and-accepted rather than fixing it.
+        #
+        # height-map-grid removes the whole class of error by never deriving a
+        # footprint from a pixel at all: it bins backprojected 3-D points into
+        # fixed physical cells on the calibrated floor, so the area of a cell
+        # is a constant the depth of the surface above it cannot distort.
+        # Locking this in as a regression guard -- reverting the default would
+        # resurrect both accuracy bugs this test class exists to catch.
+        self.assertEqual(AppConfig().volume_geometry, "height-map-grid")
 
 
 if __name__ == "__main__":

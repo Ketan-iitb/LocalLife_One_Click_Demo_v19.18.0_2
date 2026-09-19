@@ -153,18 +153,22 @@ class PlugAndPlayProfileTests(unittest.TestCase):
                 frame, depth_m=depth, intrinsics=intrinsics, persist=False
             )
             self.assertEqual(len(result.detections), 1)
-            # reference-plane (default since round 16; see volume.py's
-            # ray-frustum branch comment and config.py's `volume_geometry`
-            # comment for why it replaced ray-frustum as the default -- the
-            # short version: ray-frustum's own volume sum never actually
-            # used the tilt-corrected height, so it wasn't the fix round 12
-            # believed it was). No `reference_plane` is fitted in this test
-            # (baseline/reference are set directly, bypassing set_baseline),
-            # so this is the plain, uncorrected case: pixel_area_m2 =
-            # reference_depth^2 / (fx*fy) = 2.0^2 / 100^2 = 0.0004 m^2;
-            # contributions_m3 = height * pixel_area_m2 = 0.5 * 0.0004 =
-            # 0.0002 m^3 per pixel; 100 pixels * 0.0002 m^3 = 0.02 m^3 = 20 L.
-            self.assertAlmostEqual(result.detections[0].realsense_volume_l, 20.0, places=4)
+            # Closed-form truth for this scene: the 10x10 px top face sits at
+            # 1.5 m, where one pixel spans 1.5/100 = 0.015 m, so the object
+            # measures 0.15 m x 0.15 m = 0.0225 m^2 and stands 0.5 m above the
+            # 2.0 m reference -- 0.01125 m^3, i.e. 11.25 L.
+            #
+            # The superseded reference-plane default reported 20 L here, and
+            # the 78% overshoot was the formula, not the scene: it anchored
+            # each pixel's footprint to the REFERENCE depth (2.0^2/100^2 =
+            # 0.0004 m^2) rather than to the depth the object was actually
+            # seen at, inflating every footprint by (2.0/1.5)^2 = 1.78x.
+            # height-map-grid bins the backprojected points into fixed cells on
+            # the floor instead, so the reading no longer depends on how far
+            # the object stands above the reference. What remains is grid
+            # discretization: cells straddling the object's edge round outward,
+            # a few percent on an object this small.
+            self.assertAlmostEqual(result.detections[0].realsense_volume_l, 11.25, delta=1.2)
 
     def test_box_family_detection_gets_table_relative_cuboid_measurement(self) -> None:
         # Round 16 wiring test: a box-labeled detection processed through

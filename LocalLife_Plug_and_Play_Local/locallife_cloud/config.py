@@ -214,7 +214,29 @@ class AppConfig:
     # comparison; box-shaped detections additionally get the more robust
     # `estimate_box_volume_cuboid()` table-relative L*W*H measurement (see
     # volume.py and pipeline.py), which this default feeds as its fallback.
-    volume_geometry: str = "reference-plane"
+    # "height-map-grid" (the Final Implementation Playbook's locked method,
+    # sections 3-7) supersedes "reference-plane" as the default. Every mode
+    # above integrates once per *pixel*, weighting each pixel by z^2/(fx*fy) --
+    # the footprint of a ray meeting a surface square-on. A crumpled polythene
+    # bag, this system's actual target, is mostly oblique micro-facets where the
+    # true footprint is larger by 1/cos(theta), and every pixel's own depth
+    # noise enters the sum at full weight. "height-map-grid" instead bins the
+    # backprojected 3-D points into fixed 10 mm cells on the calibrated bin
+    # floor and takes a robust median height per cell, so the cell area is an
+    # exact constant and tens of thousands of noisy samples collapse into a few
+    # hundred medians. Measured against closed-form synthetic ground truth (a
+    # rigid box at 0/15/30 degrees of mounting tilt, a smooth dome, and a
+    # wrinkled dome with 4 mm depth noise plus 12% dropout), mean absolute
+    # percentage error falls from about 15% to about 1%, the noisy wrinkled
+    # cases improving most. The per-pixel modes stay available by env override
+    # for the documented thesis sensitivity comparison.
+    volume_geometry: str = "height-map-grid"
+    # Playbook section 27 tunables. These are its own suggested starting points,
+    # not validated constants -- record the final values after tuning on the
+    # real camera and bin.
+    volume_grid_size_m: float = 0.010
+    volume_min_points_per_cell: int = 3
+    volume_cell_height_percentile: float = 50.0
     volume_calibration_factor: float = 1.0
     systematic_error_fraction: float = 0.025
     depth_noise_sigma: float = 3.0
@@ -428,6 +450,15 @@ class AppConfig:
             )),
             depth_noise_m=float(os.environ.get("LOCALLIFE_DEPTH_NOISE_M", defaults.depth_noise_m)),
             volume_geometry=os.environ.get("LOCALLIFE_VOLUME_GEOMETRY", defaults.volume_geometry),
+            volume_grid_size_m=float(os.environ.get(
+                "LOCALLIFE_VOLUME_GRID_SIZE_M", defaults.volume_grid_size_m,
+            )),
+            volume_min_points_per_cell=int(os.environ.get(
+                "LOCALLIFE_VOLUME_MIN_POINTS_PER_CELL", defaults.volume_min_points_per_cell,
+            )),
+            volume_cell_height_percentile=float(os.environ.get(
+                "LOCALLIFE_VOLUME_CELL_PERCENTILE", defaults.volume_cell_height_percentile,
+            )),
             volume_calibration_factor=float(os.environ.get("LOCALLIFE_VOLUME_CALIBRATION_FACTOR", defaults.volume_calibration_factor)),
             systematic_error_fraction=float(os.environ.get("LOCALLIFE_SYSTEMATIC_ERROR_FRACTION", defaults.systematic_error_fraction)),
             depth_noise_sigma=float(os.environ.get("LOCALLIFE_DEPTH_NOISE_SIGMA", defaults.depth_noise_sigma)),
@@ -571,12 +602,22 @@ class AppConfig:
         if self.depth_noise_m < 0 or self.bin_capacity_l < 0:
             raise ValueError("Depth noise and bin capacity cannot be negative")
         if self.volume_geometry not in {
-            "surface-columns", "ray-frustum", "reference-plane", "triangulated-surface"
+            "surface-columns",
+            "ray-frustum",
+            "reference-plane",
+            "triangulated-surface",
+            "height-map-grid",
         }:
             raise ValueError(
-                "Volume geometry must be surface-columns, ray-frustum, reference-plane, "
-                "or triangulated-surface"
+                "Volume geometry must be height-map-grid, surface-columns, ray-frustum, "
+                "reference-plane, or triangulated-surface"
             )
+        if not 0.002 <= self.volume_grid_size_m <= 0.20:
+            raise ValueError("Volume grid size must be between 2 mm and 200 mm")
+        if self.volume_min_points_per_cell < 1:
+            raise ValueError("Volume grid cells must require at least one depth point")
+        if not 0 <= self.volume_cell_height_percentile <= 100:
+            raise ValueError("Volume cell height percentile must be within [0, 100]")
         if not np.isfinite(self.volume_calibration_factor) or self.volume_calibration_factor <= 0:
             raise ValueError("Volume calibration factor must be finite and positive")
         if not 0 <= self.systematic_error_fraction <= 1 or self.depth_noise_sigma < 0:

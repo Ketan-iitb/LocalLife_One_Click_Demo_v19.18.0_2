@@ -338,21 +338,15 @@ class EndToEndKnownVolumeCalibrationTests(unittest.TestCase):
             self.assertIsNotNone(observed_liters)
             uncalibrated_error = abs(observed_liters - true_liters) / true_liters
             # This scene's footprint (`full_side_px`) is deliberately sized
-            # using the OBJECT's own depth, so a formula that also uses the
-            # object's own depth for pixel footprint area (ray-frustum,
-            # surface-columns) reproduces true_liters almost exactly at zero
-            # tilt. reference-plane (default since round 16 -- see
-            # config.py's `volume_geometry` comment) instead uses the
-            # REFERENCE/baseline depth for footprint area, which is farther
-            # from the camera than the object here (0.6 m vs 0.5 m) and so
-            # overstates each pixel's real-world footprint by
-            # (0.6/0.5)^2 = 1.44x before erosion/discretization effects --
-            # numerically verified at exactly 0.2544 (25.44%) for this exact
-            # scene. That is an expected, understood consequence of which
-            # depth reference-plane's footprint area is anchored to, not a
-            # regression: what this test actually verifies (below) is that
-            # `calibrate_known_volume()` corrects this detection's own
-            # reading to true_liters exactly, regardless of the starting bias.
+            # using the OBJECT's own depth. The former reference-plane default
+            # anchored each pixel's footprint area to the REFERENCE depth
+            # instead, which is farther from the camera than the object here
+            # (0.6 m vs 0.5 m), overstating every footprint by (0.6/0.5)^2 =
+            # 1.44x and this scene's volume by 25.44% -- a bias this test used
+            # to record as understood-and-accepted. The height-map-grid default
+            # derives no footprint from any pixel: cell area on the calibrated
+            # floor is a constant, so the bias is gone and this scene now reads
+            # true_liters essentially exactly, uncalibrated.
             self.assertLess(uncalibrated_error, 0.30)
 
             # Regression guard for the `calibrate_known_volume()` fix: the
@@ -366,7 +360,12 @@ class EndToEndKnownVolumeCalibrationTests(unittest.TestCase):
             recalibrated = [item for item in second.detections if item.confidence > 0][0]
             calibrated_error = abs(recalibrated.realsense_volume_l - true_liters) / true_liters
             self.assertLess(calibrated_error, CALIBRATED_TOLERANCE_FRACTION)
-            self.assertLess(calibrated_error, uncalibrated_error)
+            # Never worse, rather than strictly better: the height-map default
+            # already measures this scene exactly, so there is no starting bias
+            # left for the calibration factor to remove. Demanding strict
+            # improvement here would mean demanding that the uncalibrated
+            # measurement stay wrong.
+            self.assertLessEqual(calibrated_error, uncalibrated_error)
 
 
 class _SingleShotDetector:
