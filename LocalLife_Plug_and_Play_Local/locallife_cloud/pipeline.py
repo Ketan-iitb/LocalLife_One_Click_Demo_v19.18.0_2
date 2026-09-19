@@ -1595,6 +1595,7 @@ class VisionPipeline:
         if self._previous_bin_total_l is not None:
             for track_id in new_ids:
                 self._bin_total_before_track[track_id] = self._previous_bin_total_l
+        self._release_expired_track_state(self.tracker.last_expired_ids)
 
         # Box-cuboid multi-frame track aggregation (Revised Dual-Camera
         # Volume Estimation recipe, section 13), now that every detection in
@@ -1853,7 +1854,11 @@ class VisionPipeline:
                         "detection": detection.to_dict(),
                     },
                 )
-        if newly_deposited and len(newly_deposited) == len(detections):
+        if (
+            self.config.advance_reference_on_deposit
+            and newly_deposited
+            and len(newly_deposited) == len(detections)
+        ):
             self._remember_occupied_objects(newly_deposited)
             self._advance_reference()
             self.committed_bags = self.ledger.summary()["deposited_bags"]
@@ -1906,8 +1911,9 @@ class VisionPipeline:
             record = self.accept_current()
             for detection in self.latest_analysis.detections:
                 self.ledger.deposit(detection)
-            self._remember_occupied_objects(self.latest_analysis.detections)
-            self._advance_reference()
+            if self.config.advance_reference_on_deposit:
+                self._remember_occupied_objects(self.latest_analysis.detections)
+                self._advance_reference()
             self.committed_bags = self.ledger.summary()["deposited_bags"]
             self._volume_history.clear()
             self._box_measurement_history.clear()
@@ -2528,6 +2534,29 @@ class VisionPipeline:
             and self.reference_plane is not None
             and self.reference_plane.tilt_degrees > self.config.logitech_hard_max_tilt_degrees
         )
+
+    def _release_expired_track_state(self, expired_ids: list[int]) -> None:
+        """Drop every per-track buffer belonging to a track the tracker closed.
+
+        These histories are keyed by track id and were previously only ever
+        emptied wholesale at a baseline capture or an explicit reset, so a
+        session that presented fifty objects carried fifty objects' worth of
+        colour votes, material votes, volume samples and box measurements for
+        as long as it ran. Freeing them at expiry bounds the pipeline's state by
+        the number of *live* tracks rather than by the number ever seen, and
+        guarantees a later track can never read another object's history --
+        including after `reset_live_tracking()`, which restarts id allocation.
+        `_session_seen_tracks` is deliberately excluded: it is the session
+        summary the dashboard counts, not a measurement input.
+        """
+        for track_id in expired_ids:
+            self._volume_history.pop(track_id, None)
+            self._box_measurement_history.pop(track_id, None)
+            self._box_frames_considered.pop(track_id, None)
+            self._color_history.pop(track_id, None)
+            self._material_history.pop(track_id, None)
+            self._material_frame_counts.pop(track_id, None)
+            self._bin_total_before_track.pop(track_id, None)
 
     def _record_added_volume(
         self, detection: Detection, bin_total: VolumeMeasurement | None,

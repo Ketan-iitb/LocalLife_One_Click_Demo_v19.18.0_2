@@ -86,6 +86,24 @@ class ColourSupportTests(unittest.TestCase):
         self.assertEqual(classify_color(frame, mask, min_support=0.05)[0], "green")
         self.assertEqual(classify_color(frame, mask, min_support=0.95)[0], "unknown")
 
+    def test_dark_objects_are_black_not_blue_or_cyan(self) -> None:
+        # Reported from hardware: black bags and parcels labelled blue or cyan.
+        # HSV saturation is relative, so a few counts of blue-biased shadow
+        # noise on a dark surface reads as a confident hue.
+        for bgr in ((60, 50, 45), (70, 58, 52), (45, 40, 38), (28, 22, 20)):
+            with self.subTest(bgr=bgr):
+                self.assertEqual(classify_color(*swatch(bgr))[0], "black")
+
+    def test_genuinely_dark_colours_are_still_recognised(self) -> None:
+        # The guard must not swallow real chroma just because it is dark.
+        for bgr, expected in (
+            ((20, 90, 20), "green"),
+            ((20, 20, 110), "red"),
+            ((150, 60, 30), "blue"),
+        ):
+            with self.subTest(bgr=bgr):
+                self.assertEqual(classify_color(*swatch(bgr))[0], expected)
+
     def test_the_pale_yellow_fix_survives_the_support_check(self) -> None:
         # Regression guard: the LAB b* rule that stopped a cream carton being
         # called grey runs per pixel now, so it has to hold up when the same

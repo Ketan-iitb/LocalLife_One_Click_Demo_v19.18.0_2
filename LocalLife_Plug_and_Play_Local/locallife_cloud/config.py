@@ -230,6 +230,23 @@ class AppConfig:
     # percentage error falls from about 15% to about 1%, the noisy wrinkled
     # cases improving most. The per-pixel modes stay available by env override
     # for the documented thesis sensitivity comparison.
+    # Whether depositing an object rewrites the scene reference (and, on
+    # Logitech, permanently marks its pixels occupied) so the object counts as
+    # background from then on. That made sense when it was the only way to
+    # measure the next bag incrementally in a bin that is never emptied -- but
+    # it mutates the very reference that `detect_scene_objects` and
+    # `estimate_volume` subtract from, with the object still physically in
+    # frame. Present an object, deposit it, take it away, and the reference now
+    # holds an object that is not there; after several sequential objects the
+    # reference is a collage of all of them and the largest "changed" region is
+    # background rather than the new object. Playbook sections 4 and 10 forbid
+    # it outright ("the empty-bin calibration is the fixed coordinate
+    # reference"), and the incremental measurement it existed to provide now
+    # comes from `volume_before_l`/`volume_after_l`/`added_volume_l`, which
+    # difference against that fixed baseline instead of moving it. Off by
+    # default; set LOCALLIFE_ADVANCE_REFERENCE_ON_DEPOSIT=true only for a bin
+    # whose contents genuinely stay put.
+    advance_reference_on_deposit: bool = False
     volume_geometry: str = "height-map-grid"
     # Playbook section 27 tunables. These are its own suggested starting points,
     # not validated constants -- record the final values after tuning on the
@@ -449,6 +466,9 @@ class AppConfig:
                 "LOCALLIFE_MIN_FOREGROUND_FRACTION", defaults.minimum_foreground_fraction,
             )),
             depth_noise_m=float(os.environ.get("LOCALLIFE_DEPTH_NOISE_M", defaults.depth_noise_m)),
+            advance_reference_on_deposit=_bool_env(
+                "LOCALLIFE_ADVANCE_REFERENCE_ON_DEPOSIT", defaults.advance_reference_on_deposit,
+            ),
             volume_geometry=os.environ.get("LOCALLIFE_VOLUME_GEOMETRY", defaults.volume_geometry),
             volume_grid_size_m=float(os.environ.get(
                 "LOCALLIFE_VOLUME_GRID_SIZE_M", defaults.volume_grid_size_m,

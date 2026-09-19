@@ -654,6 +654,18 @@ def _lab_b_channel(blue: float, green: float, red: float) -> float:
 # deposit event. Section 27's suggested starting point.
 COLOUR_MIN_SUPPORT = 0.35
 
+# Minimum absolute channel spread (max-min, 0-1) before a pixel's hue is
+# believed. HSV saturation is *relative* -- (max-min)/max -- so it inflates as a
+# pixel gets darker: a black bag lit to BGR (60, 50, 45) has a spread of only
+# 15/255, entirely sensor noise and white-balance cast, yet reads as 25%
+# saturation and resolves to a hue of 220 degrees. That is the reported
+# "black object labelled blue or cyan": dark pixels have almost no real chroma,
+# and shadows on most cameras carry a slight blue bias, so the hue that comes
+# out is whichever way the noise leaned. Requiring a real absolute spread sends
+# those pixels to the neutral black/grey branch instead, while a genuinely
+# dark-but-coloured surface (a dark green or maroon bag) clears it easily.
+MIN_ABSOLUTE_CHROMA = 0.10
+
 # The hue bands, and the neutral value/saturation cuts, shared by the per-pixel
 # vote and the median fallback so the two can never disagree about what a given
 # colour is called.
@@ -721,7 +733,7 @@ def _categorise(normalized_bgr: np.ndarray) -> np.ndarray:
         assigned |= band
     codes[~assigned] = _CATEGORIES.index("red")  # hue >= 345 wraps back to red
 
-    neutral = saturation < 0.16
+    neutral = (saturation < 0.16) | (delta < MIN_ABSOLUTE_CHROMA)
     if np.any(neutral):
         warm = _lab_b_channels(normalized_bgr[neutral]) > 6.0
         neutral_codes = np.where(
@@ -839,7 +851,11 @@ def _dominant_color_with_support(
     # and the support fraction behind whichever answer wins.
     categories = _categorise(normalized)
 
-    chromatic = (pixel_saturation >= 0.18) & (bgr_max >= 0.18)
+    chromatic = (
+        (pixel_saturation >= 0.18)
+        & (bgr_max >= 0.18)
+        & ((bgr_max - bgr_min) >= MIN_ABSOLUTE_CHROMA)
+    )
     if int(np.count_nonzero(chromatic)) >= max(20, int(selected.shape[0] * 0.22)):
         evidence = np.bincount(
             categories[chromatic],

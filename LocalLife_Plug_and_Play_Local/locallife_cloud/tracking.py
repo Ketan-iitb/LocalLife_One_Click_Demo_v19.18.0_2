@@ -78,6 +78,12 @@ class ObjectTracker:
         self.tracks: dict[int, Track] = {}
         self.next_track_id = 1
         self.total_count = 0
+        # Track ids closed by the most recent `update()`. The pipeline keeps
+        # per-track colour, material, volume and box histories keyed by id and
+        # has no other way to learn that a track is gone, so without this those
+        # histories are never freed and a long session accumulates one entry per
+        # object ever seen.
+        self.last_expired_ids: list[int] = []
 
     def _association(self, track: Track, detection: Detection) -> tuple[bool, float]:
         if _family(track.label) != _family(detection.label):
@@ -96,6 +102,7 @@ class ObjectTracker:
         return allowed, score
 
     def update(self, detections: list[Detection]) -> list[int]:
+        expired: list[int] = []
         for track in self.tracks.values():
             track.missing += 1
 
@@ -160,17 +167,20 @@ class ObjectTracker:
                 track = self.tracks[track_id]
                 if track.missing > 0 and _is_phantom(track):
                     del self.tracks[track_id]
+                    expired.append(track_id)
 
         new_ids: list[int] = []
         for track_id, track in list(self.tracks.items()):
             limit = self.phantom_max_missing_frames if _is_phantom(track) else self.max_missing_frames
             if track.missing > limit:
                 del self.tracks[track_id]
+                expired.append(track_id)
                 continue
             if not track.counted and track.hits >= self.confirmation_frames:
                 track.counted = True
                 self.total_count += 1
                 new_ids.append(track_id)
+        self.last_expired_ids = expired
         return new_ids
 
     def predicted_detections(self, maximum_missing: int) -> list[Detection]:
@@ -226,3 +236,4 @@ class ObjectTracker:
         self.tracks.clear()
         self.total_count = 0
         self.next_track_id = 1
+        self.last_expired_ids = []

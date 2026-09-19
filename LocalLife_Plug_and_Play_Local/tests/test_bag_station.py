@@ -187,6 +187,11 @@ class FixedBagStationTests(unittest.TestCase):
             self.assertAlmostEqual(float(np.median(pipeline.baseline_realsense)), 2.0, places=5)
 
     def test_committed_bag_becomes_reference_for_next_arriving_bag(self) -> None:
+        # The fixed bag station (BAG_STATION.md) is the one installation where
+        # a committed bag genuinely stays in the bin and should become part of
+        # the background. That is now opt-in: rewriting the reference while an
+        # object is still in frame is exactly what broke sequential testing,
+        # where each object is taken away again, so it must be asked for.
         with tempfile.TemporaryDirectory() as temporary:
             config = AppConfig(
                 results_dir=Path(temporary),
@@ -194,6 +199,7 @@ class FixedBagStationTests(unittest.TestCase):
                 roi=(0.0, 0.0, 1.0, 1.0),
                 min_component_pixels=20,
                 tracker_confirm_frames=1,
+                advance_reference_on_deposit=True,
             )
             detector = MutableBagDetector()
             pipeline = VisionPipeline(config, detector=detector)
