@@ -80,6 +80,15 @@ class Detection:
     volume_before_l: float | None = None
     volume_after_l: float | None = None
     added_volume_l: float | None = None
+    # Volume the committed contents lost while this object arrived (a bag
+    # settling under a new one). Large values mean the old pile moved, which is
+    # rejected rather than counted -- see `heightmap_volume.incremental_deposit`.
+    displaced_volume_l: float | None = None
+    # Why a measurement is still pending or was refused, as a stable code
+    # (collecting_frames, object_moving, unstable_depth, insufficient_depth_coverage,
+    # camera_moved_recalibration_required, possible_existing_object_movement,
+    # new_deposit_not_isolatable, measurement_timeout).
+    volume_rejection_reason: str | None = None
     depth_coverage_percent: float | None = None
     volume_uncertainty_l: float | None = None
     measurement_method: str | None = None
@@ -147,6 +156,8 @@ class Detection:
             "volume_before_l": self.volume_before_l,
             "volume_after_l": self.volume_after_l,
             "added_volume_l": self.added_volume_l,
+            "displaced_volume_l": self.displaced_volume_l,
+            "volume_rejection_reason": self.volume_rejection_reason,
             "depth_coverage_percent": self.depth_coverage_percent,
             "volume_uncertainty_l": self.volume_uncertainty_l,
             "measurement_method": self.measurement_method,

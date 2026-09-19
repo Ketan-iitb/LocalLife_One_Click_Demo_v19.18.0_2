@@ -31,6 +31,14 @@ from .inference import MetricDepthEstimator, create_segmenter
 from .material import MaterialClassifier
 from .ledger import WastePlantLedger, waste_object_type
 from .logitech import bound_logitech_detections, stabilize_background_depth
+from .heightmap_volume import (
+    HeightMapSettings,
+    HeightMapVolume,
+    incremental_deposit,
+    integrate_height_map,
+)
+from uuid import uuid4
+
 from .sorting_rules import classify_sorting, mis_sort_family
 from .storage import ResultStore
 from .tracking import ObjectTracker
@@ -435,6 +443,17 @@ class VisionPipeline:
         # moment it is deposited.
         self._previous_bin_total_l: float | None = None
         self._bin_total_before_track: dict[int, float] = {}
+        # Height grid of the scene as it stood when the last deposit was
+        # accepted. Every later deposit is measured against this, so already
+        # committed material can never be counted again.
+        self._committed_scene: HeightMapVolume | None = None
+        # Track ids already written to measurements.csv, so a row is appended
+        # once per object and never rewritten afterwards.
+        self._csv_logged: set[int] = set()
+        # Support plane recorded at calibration, and whether the live camera
+        # still matches it. An old plane must never be applied to a new pose.
+        self._calibration_id: str | None = None
+        self._calibration_valid = True
         # Table-relative box cuboid: per-track accepted-frame history feeding
         # `aggregate_box_measurements()` (Revised Dual-Camera Volume
         # Estimation recipe, section 13 -- median L/W/H across accepted
@@ -615,6 +634,11 @@ class VisionPipeline:
             # one coherent support surface. The depth/reference arrays remain
             # saved, but unsafe plane-relative L/W/H stays unavailable.
             self.reference_plane = fitted_plane if reference_plane_is_usable(fitted_plane) else None
+            # A calibration is identified by the pose it was fitted at; every
+            # measurement records which one produced it.
+            self._calibration_id = uuid4().hex[:12]
+            self._calibration_valid = True
+            self._committed_scene = None
             self._occupied_logitech_mask = (
                 np.zeros(image.shape[:2], dtype=bool) if self.camera_id == "logitech" else None
             )
@@ -1039,6 +1063,7 @@ class VisionPipeline:
                 fitted_plane = fit_reference_plane(floor, intrinsics, mask=bin_region)
                 if reference_plane_is_usable(fitted_plane):
                     self.reference_plane = fitted_plane
+                    self._calibration_id = uuid4().hex[:12]
                 else:
                     warnings.append(
                         "The captured reference does not contain one reliable support plane; "
@@ -1236,6 +1261,32 @@ class VisionPipeline:
             reference_plane=measurement_plane,
             **precision,
         ) if occupancy_reference is not None and logitech_ready else None
+        # One whole-bin height grid per frame, shared by the deposit-isolation
+        # logic below. It is the same computation `bin_total` already performs,
+        # kept as a grid so a committed scene can be differenced against it.
+        scene_grid = None
+        if (
+            self.camera_id != "logitech"
+            and depth_m is not None
+            and intrinsics is not None
+            and measurement_plane is not None
+            and measurement_plane.coefficients is not None
+        ):
+            scene_grid = integrate_height_map(
+                depth_m,
+                intrinsics,
+                plane_coefficients=measurement_plane.coefficients,
+                mask=bin_region,
+                settings=HeightMapSettings(
+                    grid_size_m=self.config.volume_grid_size_m,
+                    min_height_m=max(minimum_height_m, 1e-4),
+                    max_height_m=self.config.max_object_height_m,
+                    min_points_per_cell=self.config.volume_min_points_per_cell,
+                    cell_height_percentile=self.config.volume_cell_height_percentile,
+                    min_valid_depth_fraction=0.0,
+                    max_fill_fraction=1.0,
+                ),
+            )
         if hardware_total is not None and hardware_total.coverage_ratio < self.config.minimum_depth_coverage:
             warnings.append(
                 f"Only {hardware_total.coverage_ratio * 100:.0f}% of the bag has valid depth; "
@@ -1596,6 +1647,7 @@ class VisionPipeline:
             for track_id in new_ids:
                 self._bin_total_before_track[track_id] = self._previous_bin_total_l
         self._release_expired_track_state(self.tracker.last_expired_ids)
+        self._check_camera_placement(depth_m, intrinsics, bin_region, detections, warnings)
 
         # Box-cuboid multi-frame track aggregation (Revised Dual-Camera
         # Volume Estimation recipe, section 13), now that every detection in
@@ -1769,8 +1821,13 @@ class VisionPipeline:
                 median = float(np.median(recent))
                 tolerance_l = max(0.15, median * self.config.settle_volume_tolerance)
                 if float(np.max(recent) - np.min(recent)) <= tolerance_l:
-                    self._record_added_volume(detection, bin_total)
+                    if not self._record_added_volume(detection, bin_total, scene_grid):
+                        warnings.append(
+                            f"Deposit withheld: {detection.volume_rejection_reason}"
+                        )
+                        continue
                     self.ledger.deposit(detection, timestamp=timestamp)
+                    self._committed_scene = scene_grid
                     newly_deposited.append(detection)
         # This frame's occupancy becomes the "before" state that whatever
         # appears next will be measured against.
@@ -1842,6 +1899,7 @@ class VisionPipeline:
 
         if persist:
             self.store.append_jsonl("frames.jsonl", analysis.to_dict())
+            self._log_measurement_rows(detections, timestamp)
             starting_count = self.tracker.total_count - len(new_ids)
             for index, track_id in enumerate(new_ids, start=1):
                 detection = next(item for item in detections if item.track_id == track_id)
@@ -2535,6 +2593,113 @@ class VisionPipeline:
             and self.reference_plane.tilt_degrees > self.config.logitech_hard_max_tilt_degrees
         )
 
+    # Written once per object, in every operating mode. The waste-ledger CSV
+    # served by the dashboard is empty in geometry_validation mode because that
+    # mode deliberately disables the ledger, which left validation runs with no
+    # spreadsheet output at all -- this is the mode-independent record.
+    MEASUREMENT_CSV_COLUMNS = [
+        "timestamp", "camera_id", "operating_mode", "calibration_id", "track_id",
+        "label", "accepted_class", "color", "color_confidence", "sorting_status",
+        "material", "material_confidence",
+        "volume_l", "added_volume_l", "displaced_volume_l",
+        "volume_before_l", "volume_after_l", "volume_uncertainty_l",
+        "length_mm", "width_mm", "height_mm", "dimension_confidence", "dimension_method",
+        "depth_coverage_percent", "measurement_method", "measurement_quality",
+        "volume_rejection_reason", "calibration_valid",
+    ]
+
+    def _log_measurement_rows(
+        self, detections: list[Detection], timestamp: float | None,
+    ) -> None:
+        """Append one finalized row per object to measurements.csv."""
+        for detection in detections:
+            if detection.track_id is None or detection.track_id in self._csv_logged:
+                continue
+            if detection.realsense_volume_l is None or _is_phantom_detection(detection):
+                continue
+            self._csv_logged.add(detection.track_id)
+            self.store.append_csv(
+                "measurements.csv",
+                {
+                    "timestamp": timestamp,
+                    "camera_id": self.camera_id,
+                    "operating_mode": self.config.operating_mode,
+                    "calibration_id": self._calibration_id,
+                    "track_id": detection.track_id,
+                    "label": detection.label,
+                    "accepted_class": detection.accepted_class,
+                    "color": detection.color,
+                    "color_confidence": round(float(detection.color_confidence), 4),
+                    "sorting_status": detection.sorting_status,
+                    "material": detection.material,
+                    "material_confidence": round(float(detection.material_confidence), 4),
+                    "volume_l": detection.realsense_volume_l,
+                    "added_volume_l": detection.added_volume_l,
+                    "displaced_volume_l": detection.displaced_volume_l,
+                    "volume_before_l": detection.volume_before_l,
+                    "volume_after_l": detection.volume_after_l,
+                    "volume_uncertainty_l": detection.volume_uncertainty_l,
+                    "length_mm": detection.footprint_length_mm,
+                    "width_mm": detection.footprint_width_mm,
+                    "height_mm": detection.physical_height_mm,
+                    "dimension_confidence": detection.dimension_confidence,
+                    "dimension_method": detection.dimension_method,
+                    "depth_coverage_percent": detection.depth_coverage_percent,
+                    "measurement_method": detection.measurement_method,
+                    "measurement_quality": detection.measurement_quality,
+                    "volume_rejection_reason": detection.volume_rejection_reason,
+                    "calibration_valid": self._calibration_valid,
+                },
+                self.MEASUREMENT_CSV_COLUMNS,
+            )
+
+    def _check_camera_placement(
+        self,
+        depth_m: np.ndarray | None,
+        intrinsics: CameraIntrinsics | None,
+        bin_region: np.ndarray,
+        detections: list[Detection],
+        warnings: list[str],
+    ) -> None:
+        """Invalidate the calibration if the camera no longer matches its pose.
+
+        A support plane is only meaningful for the pose it was fitted at. Moving
+        or tilting the camera, or changing its distance to the surface, silently
+        turns every height above that plane into a different quantity -- which
+        is why a measurement captured at one placement cannot be compared with
+        one captured at another. Checked only while the scene is empty, so an
+        object in the bin is never mistaken for the floor having moved.
+        """
+        if (
+            self.reference_plane is None
+            or self.reference_plane.coefficients is None
+            or depth_m is None
+            or intrinsics is None
+            or detections
+        ):
+            return
+        live = fit_reference_plane(depth_m, intrinsics, mask=bin_region)
+        if not reference_plane_is_usable(live) or live.coefficients is None:
+            return
+        tilt_change = abs(float(live.tilt_degrees) - float(self.reference_plane.tilt_degrees))
+        # `c` is the plane's intercept: the camera-axis distance to the surface.
+        distance_change = abs(
+            float(live.coefficients[2]) - float(self.reference_plane.coefficients[2])
+        )
+        moved = (
+            tilt_change > self.config.camera_move_max_tilt_deg
+            or distance_change > self.config.camera_move_max_distance_m
+        )
+        if moved and self._calibration_valid:
+            self._calibration_valid = False
+            warnings.append(
+                "camera_moved_recalibration_required: the support plane moved by "
+                f"{tilt_change:.1f} degrees and {distance_change * 1000:.0f} mm since "
+                "calibration; capture a new empty-scene baseline before trusting any volume"
+            )
+        elif not moved and not self._calibration_valid:
+            self._calibration_valid = True
+
     def _release_expired_track_state(self, expired_ids: list[int]) -> None:
         """Drop every per-track buffer belonging to a track the tracker closed.
 
@@ -2559,25 +2724,57 @@ class VisionPipeline:
             self._bin_total_before_track.pop(track_id, None)
 
     def _record_added_volume(
-        self, detection: Detection, bin_total: VolumeMeasurement | None,
-    ) -> None:
-        """Attach this deposit's incremental occupied volume (playbook sections 5, 10).
+        self,
+        detection: Detection,
+        bin_total: VolumeMeasurement | None,
+        scene_grid: HeightMapVolume | None,
+    ) -> bool:
+        """Attach this deposit's own incremental volume; False withholds the deposit.
 
-        The difference between total bin occupancy before this object arrived
-        and after it settled. Purely additive: it records what the bin gained
-        without influencing whether the deposit happens or what the object's own
-        measured volume is. Both totals have to be real measurements -- an
-        absent one leaves the fields None rather than inventing a difference.
+        Against the *committed* scene, cell by cell, not against the detection's
+        own mask. Two touching black bags merge into one mask and one depth
+        component -- nothing in colour or class can separate identical
+        polythene -- so the first bag's cells already carry its height in the
+        committed grid and differencing leaves only what the second bag raised.
+        Without this the merged pair is remeasured as a single new ~29 L object.
+
+        Returns False when the new material cannot be isolated (nothing changed,
+        or the existing pile moved enough that its volume would be counted
+        twice). The caller then withholds the deposit with an explicit reason
+        rather than recording a combined figure.
         """
         before = self._bin_total_before_track.pop(detection.track_id, None)
-        if before is None or bin_total is None:
-            return
-        after = float(bin_total.liters)
-        detection.volume_before_l = round(before, 6)
-        detection.volume_after_l = round(after, 6)
-        # Section 16: a small negative difference is sensor noise around an
-        # unchanged scene, not a bin that shrank, so it reports as zero.
-        detection.added_volume_l = round(max(0.0, after - before), 6)
+        if bin_total is not None:
+            detection.volume_after_l = round(float(bin_total.liters), 6)
+        if before is not None:
+            detection.volume_before_l = round(before, 6)
+
+        if self._committed_scene is None:
+            # First deposit into a bin with no committed scene: the object's own
+            # measurement is the increment, and there is nothing to double-count.
+            if detection.realsense_volume_l is not None:
+                detection.added_volume_l = detection.realsense_volume_l
+            elif before is not None and bin_total is not None:
+                detection.added_volume_l = round(
+                    max(0.0, float(bin_total.liters) - before), 6
+                )
+            return True
+        increment = incremental_deposit(
+            self._committed_scene,
+            scene_grid,
+            min_change_m=self.config.min_object_height_m,
+            max_added_l=self.config.realsense_max_item_volume_l,
+        )
+        if increment is None:
+            detection.volume_rejection_reason = "unstable_depth"
+            return False
+        if not increment.is_valid:
+            detection.volume_rejection_reason = increment.rejection_reason
+            detection.measurement_quality = increment.rejection_reason
+            return False
+        detection.added_volume_l = round(increment.added_liters, 6)
+        detection.displaced_volume_l = round(increment.displaced_liters, 6)
+        return True
 
     def _logitech_tilt_uncertainty_fraction(self) -> float:
         """Graduated confidence penalty for mounting tilt above the confident zone.

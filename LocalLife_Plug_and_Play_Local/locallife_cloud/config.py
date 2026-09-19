@@ -247,6 +247,11 @@ class AppConfig:
     # default; set LOCALLIFE_ADVANCE_REFERENCE_ON_DEPOSIT=true only for a bin
     # whose contents genuinely stay put.
     advance_reference_on_deposit: bool = False
+    # A support plane is only valid for the pose it was fitted at. Beyond these
+    # tolerances the calibration is marked invalid rather than silently reused
+    # against a camera that has been moved, tilted or repositioned.
+    camera_move_max_tilt_deg: float = 3.0
+    camera_move_max_distance_m: float = 0.05
     volume_geometry: str = "height-map-grid"
     # Playbook section 27 tunables. These are its own suggested starting points,
     # not validated constants -- record the final values after tuning on the
@@ -466,6 +471,12 @@ class AppConfig:
                 "LOCALLIFE_MIN_FOREGROUND_FRACTION", defaults.minimum_foreground_fraction,
             )),
             depth_noise_m=float(os.environ.get("LOCALLIFE_DEPTH_NOISE_M", defaults.depth_noise_m)),
+            camera_move_max_tilt_deg=float(os.environ.get(
+                "LOCALLIFE_CAMERA_MOVE_MAX_TILT_DEG", defaults.camera_move_max_tilt_deg,
+            )),
+            camera_move_max_distance_m=float(os.environ.get(
+                "LOCALLIFE_CAMERA_MOVE_MAX_DISTANCE_M", defaults.camera_move_max_distance_m,
+            )),
             advance_reference_on_deposit=_bool_env(
                 "LOCALLIFE_ADVANCE_REFERENCE_ON_DEPOSIT", defaults.advance_reference_on_deposit,
             ),

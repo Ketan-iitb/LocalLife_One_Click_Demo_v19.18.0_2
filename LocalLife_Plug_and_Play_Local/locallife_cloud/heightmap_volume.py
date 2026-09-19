@@ -104,6 +104,12 @@ class HeightMapVolume:
     quality: str
     rejection_reason: str | None = None
     flags: tuple[str, ...] = field(default_factory=tuple)
+    # The per-cell height map behind `liters`, plus where its (0, 0) sits in
+    # absolute floor-cell coordinates. Retained so a committed scene can be
+    # differenced against a later one; NaN marks a cell nothing was measured in.
+    grid: np.ndarray | None = field(default=None, repr=False)
+    origin_row: int = 0
+    origin_column: int = 0
 
     @property
     def is_valid(self) -> bool:
@@ -443,8 +449,12 @@ def integrate_height_map(
 
     column_index = np.floor(grid_u / cell).astype(np.int64)
     row_index = np.floor(grid_v / cell).astype(np.int64)
-    column_index -= column_index.min()
-    row_index -= row_index.min()
+    # Absolute cell indices on the calibrated floor, kept so two grids captured
+    # at different times can be aligned and differenced (see `align_grids`).
+    origin_column = int(column_index.min())
+    origin_row = int(row_index.min())
+    column_index -= origin_column
+    row_index -= origin_row
     width = int(column_index.max()) + 1
     cell_ids = row_index * width + column_index
 
@@ -508,6 +518,139 @@ def integrate_height_map(
         quality=quality,
         rejection_reason=rejection_reason,
         flags=tuple(flags),
+        grid=np.where(occupied, height_grid, np.where(measured, 0.0, np.nan)),
+        origin_row=origin_row,
+        origin_column=origin_column,
+    )
+
+
+def align_grids(
+    before: HeightMapVolume, after: HeightMapVolume,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Two height grids on a common absolute floor-cell frame.
+
+    Cells either grid never measured come back NaN, so a caller can tell
+    "nothing there" from "never seen".
+    """
+    top = min(before.origin_row, after.origin_row)
+    left = min(before.origin_column, after.origin_column)
+    bottom = max(
+        before.origin_row + before.grid.shape[0], after.origin_row + after.grid.shape[0]
+    )
+    right = max(
+        before.origin_column + before.grid.shape[1],
+        after.origin_column + after.grid.shape[1],
+    )
+    shape = (bottom - top, right - left)
+    canvases = []
+    for item in (before, after):
+        canvas = np.full(shape, np.nan)
+        row = item.origin_row - top
+        column = item.origin_column - left
+        canvas[row : row + item.grid.shape[0], column : column + item.grid.shape[1]] = item.grid
+        canvases.append(canvas)
+    return canvases[0], canvases[1]
+
+
+@dataclass(slots=True)
+class IncrementalDeposit:
+    """What the bin gained from one deposit, measured against the committed scene."""
+
+    added_liters: float
+    displaced_liters: float
+    changed_area_m2: float
+    quality: str
+    rejection_reason: str | None = None
+    flags: tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def is_valid(self) -> bool:
+        return self.quality == "valid"
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "added_volume_l": round(float(self.added_liters), 4),
+            "displaced_volume_l": round(float(self.displaced_liters), 4),
+            "changed_area_m2": round(float(self.changed_area_m2), 6),
+            "volume_quality": self.quality,
+            "rejection_reason": self.rejection_reason,
+            "flags": list(self.flags),
+        }
+
+
+def incremental_deposit(
+    committed: HeightMapVolume | None,
+    current: HeightMapVolume | None,
+    *,
+    min_change_m: float = 0.015,
+    min_changed_area_m2: float = 0.004,
+    max_displaced_fraction: float = 0.35,
+    max_added_l: float = 90.0,
+) -> IncrementalDeposit | None:
+    """Volume of the newly arrived object only, per-cell against the last commit.
+
+    This is what stops two touching bags being reported as one 29 L object. The
+    detector and the segmentation mask both merge adjacent same-coloured bags --
+    no colour or class rule can separate identical black polythene -- so the
+    separation is done on physical geometry instead: every cell the first bag
+    occupies already holds its height in the committed grid, so differencing
+    leaves only the cells the second bag actually raised.
+
+    Semantics, kept deliberately distinct:
+      * `added_liters` -- this deposit's own contribution (sum of *positive*
+        per-cell change). This is what a new ledger entry records.
+      * `displaced_liters` -- volume that went *down* since the commit. An
+        arriving bag squashing the pile slightly is normal; a large drop means
+        the old pile was moved or removed, and then the positive cells are not
+        a new deposit at all but the same material somewhere else, which would
+        double-count. That case is rejected rather than guessed.
+
+    Only positive change is summed, never the whole scene, so a committed
+    deposit can never be counted a second time.
+    """
+    if committed is None or current is None:
+        return None
+    if committed.grid is None or current.grid is None:
+        return None
+    before, after = align_grids(committed, current)
+    # A cell neither grid measured contributes nothing; one measured on only one
+    # side is treated as zero height there rather than unknown, since the floor
+    # is the calibrated reference.
+    seen = np.isfinite(before) | np.isfinite(after)
+    if not np.any(seen):
+        return None
+    before = np.where(np.isfinite(before), before, 0.0)
+    after = np.where(np.isfinite(after), after, 0.0)
+    delta = np.where(seen, after - before, 0.0)
+
+    cell_area_m2 = current.cell_area_m2
+    risen = delta >= min_change_m
+    fallen = delta <= -min_change_m
+    added_liters = float(np.sum(delta[risen]) * cell_area_m2 * 1000.0)
+    displaced_liters = float(-np.sum(delta[fallen]) * cell_area_m2 * 1000.0)
+    changed_area_m2 = float(np.count_nonzero(risen) * cell_area_m2)
+
+    flags: list[str] = []
+    if displaced_liters > 0:
+        flags.append("existing-contents-settled")
+    if changed_area_m2 < min_changed_area_m2:
+        return IncrementalDeposit(
+            0.0, displaced_liters, changed_area_m2, "rejected",
+            "new_deposit_not_isolatable", tuple(flags),
+        )
+    if displaced_liters > max(0.2, added_liters * max_displaced_fraction):
+        return IncrementalDeposit(
+            0.0, displaced_liters, changed_area_m2, "rejected",
+            "possible_existing_object_movement", tuple(flags),
+        )
+    if added_liters > max_added_l:
+        return IncrementalDeposit(
+            0.0, displaced_liters, changed_area_m2, "rejected",
+            f"added volume {added_liters:.1f} L exceeds the plausible deposit bound",
+            tuple(flags),
+        )
+    return IncrementalDeposit(
+        added_liters, displaced_liters, changed_area_m2, "valid", None, tuple(flags),
     )
 
 

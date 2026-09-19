@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import shutil
@@ -25,6 +26,23 @@ class ResultStore:
         destination.parent.mkdir(parents=True, exist_ok=True)
         with self._lock, destination.open("a", encoding="utf-8") as output:
             output.write(json.dumps(record, allow_nan=False, default=str) + "\n")
+        return destination
+
+    def append_csv(self, name: str, row: dict[str, Any], columns: list[str]) -> Path:
+        """Append one row, writing the header the first time the file is created.
+
+        Spreadsheet-readable companion to `append_jsonl`, so an experiment run
+        can be opened directly in Excel without a conversion step.
+        """
+        destination = self.directory / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            new_file = not destination.is_file() or destination.stat().st_size == 0
+            with destination.open("a", encoding="utf-8", newline="") as output:
+                writer = csv.DictWriter(output, fieldnames=columns, extrasaction="ignore")
+                if new_file:
+                    writer.writeheader()
+                writer.writerow({key: row.get(key) for key in columns})
         return destination
 
     def save_json(self, name: str, payload: dict[str, Any]) -> Path:

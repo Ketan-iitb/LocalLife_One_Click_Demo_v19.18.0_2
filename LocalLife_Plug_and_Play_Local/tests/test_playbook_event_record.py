@@ -131,9 +131,10 @@ class DepositEventTests(unittest.TestCase):
                 delta=max(0.5, deposited.realsense_volume_l * 0.25),
             )
 
-    def test_added_volume_is_not_invented_without_a_before_state(self) -> None:
-        # No empty frame first: the bag is already there when measurement
-        # starts, so the bin's prior occupancy was never observed.
+    def test_the_first_deposit_increments_by_its_own_measurement(self) -> None:
+        # With nothing committed yet there is no earlier material that could be
+        # counted twice, so the object's own volume *is* what the bin gained --
+        # this holds even when the bin's prior occupancy was never observed.
         with tempfile.TemporaryDirectory() as directory:
             pipeline, detector, _, _, camera = _pipeline(directory)
             mask, frame, depth, box = _object((25, 45, 25, 45), (40, 190, 40), 0.15)
@@ -142,7 +143,9 @@ class DepositEventTests(unittest.TestCase):
                 analysis = pipeline.process_frame(
                     frame, depth_m=depth, intrinsics=camera, timestamp=timestamp,
                 )
-            self.assertIsNone(analysis.detections[0].added_volume_l)
+            deposited = analysis.detections[0]
+            self.assertIsNone(deposited.volume_before_l)
+            self.assertEqual(deposited.added_volume_l, deposited.realsense_volume_l)
 
 
 class MisSortReportingTests(unittest.TestCase):
