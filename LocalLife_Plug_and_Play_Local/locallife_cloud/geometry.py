@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import colorsys
-from collections import Counter, deque
+from collections import deque
 from math import hypot
 from typing import Iterable, Sequence
 
@@ -154,7 +153,7 @@ def detect_foreground_objects(
                 box=box,
                 mask=mask,
                 source="foreground-fallback",
-                color=dominant_color(frame, mask),
+                **color_fields(frame, mask),
             )
         )
     return sorted(detections, key=lambda detection: detection.area_pixels, reverse=True)
@@ -320,7 +319,7 @@ def detect_scene_objects(
                 box=box,
                 mask=mask,
                 source="depth-scene-segmentation" if depth_changed is not None else "foreground-segmentation",
-                color=dominant_color(frame, mask),
+                **color_fields(frame, mask),
             )
         )
     return sorted(detections, key=lambda detection: detection.area_pixels, reverse=True)
@@ -602,7 +601,7 @@ def fuse_scene_detections(
                 mask=mask,
                 source=detection_source,
                 accepted_class=best.accepted_class if best is not None else None,
-                color=dominant_color(frame, mask),
+                **color_fields(frame, mask),
             )
         )
 
@@ -650,9 +649,135 @@ def _lab_b_channel(blue: float, green: float, red: float) -> float:
     return float(lab[0, 0, 2]) - 128.0
 
 
+# Playbook section 11.6: if no colour class holds a sufficient share of the
+# valid masked pixels, report UNKNOWN rather than forcing a wrong answer onto a
+# deposit event. Section 27's suggested starting point.
+COLOUR_MIN_SUPPORT = 0.35
+
+# The hue bands, and the neutral value/saturation cuts, shared by the per-pixel
+# vote and the median fallback so the two can never disagree about what a given
+# colour is called.
+_HUE_BANDS: tuple[tuple[float, str, str | None, float], ...] = (
+    (12.0, "red", None, 0.0),
+    (38.0, "orange", "brown", 0.50),
+    (70.0, "yellow", "brown", 0.52),
+    (165.0, "green", None, 0.0),
+    (195.0, "cyan", None, 0.0),
+    (260.0, "blue", None, 0.0),
+    (320.0, "purple", None, 0.0),
+    (345.0, "pink", None, 0.0),
+)
+_CATEGORIES: tuple[str, ...] = (
+    "black", "white", "grey", "red", "orange", "brown",
+    "yellow", "green", "cyan", "blue", "purple", "pink",
+)
+
+
+def _lab_b_channels(normalized_bgr: np.ndarray) -> np.ndarray:
+    """LAB b* for many BGR pixels at once (see `_lab_b_channel` for the offset)."""
+    try:
+        import cv2
+    except ImportError:
+        return np.array([
+            _lab_b_channel(float(pixel[0]), float(pixel[1]), float(pixel[2]))
+            for pixel in normalized_bgr
+        ])
+    pixels = np.clip(normalized_bgr * 255.0, 0.0, 255.0).astype(np.uint8).reshape(-1, 1, 3)
+    return cv2.cvtColor(pixels, cv2.COLOR_BGR2LAB)[:, 0, 2].astype(np.float64) - 128.0
+
+
+def _categorise(normalized_bgr: np.ndarray) -> np.ndarray:
+    """Colour class index per pixel, by the rules the median fallback uses.
+
+    Vectorised so that the *support* behind an answer -- what share of the
+    object's own pixels actually agree with it -- can be measured on every
+    frame without a Python loop over tens of thousands of pixels.
+    """
+    blue, green, red = (normalized_bgr[:, index] for index in range(3))
+    value = np.max(normalized_bgr, axis=1)
+    minimum = np.min(normalized_bgr, axis=1)
+    delta = value - minimum
+    saturation = delta / np.maximum(value, 1e-8)
+
+    hue = np.zeros_like(value)
+    chromatic = delta > 1e-8
+    with np.errstate(invalid="ignore", divide="ignore"):
+        red_peak = chromatic & (value == red)
+        green_peak = chromatic & (value == green) & ~red_peak
+        blue_peak = chromatic & ~red_peak & ~green_peak
+        hue[red_peak] = 60.0 * (((green - blue)[red_peak] / delta[red_peak]) % 6.0)
+        hue[green_peak] = 60.0 * (((blue - red)[green_peak] / delta[green_peak]) + 2.0)
+        hue[blue_peak] = 60.0 * (((red - green)[blue_peak] / delta[blue_peak]) + 4.0)
+
+    codes = np.full(value.shape, _CATEGORIES.index("pink"), dtype=np.int64)
+    assigned = np.zeros(value.shape, dtype=bool)
+    for upper, primary, dim, brightness_cut in _HUE_BANDS:
+        band = ~assigned & (hue < upper)
+        if dim is not None:
+            codes[band & (value >= brightness_cut)] = _CATEGORIES.index(primary)
+            codes[band & (value < brightness_cut)] = _CATEGORIES.index(dim)
+        else:
+            codes[band] = _CATEGORIES.index(primary)
+        assigned |= band
+    codes[~assigned] = _CATEGORIES.index("red")  # hue >= 345 wraps back to red
+
+    neutral = saturation < 0.16
+    if np.any(neutral):
+        warm = _lab_b_channels(normalized_bgr[neutral]) > 6.0
+        neutral_codes = np.where(
+            warm & (value[neutral] > 0.40),
+            _CATEGORIES.index("yellow"),
+            np.where(
+                value[neutral] > 0.77,
+                _CATEGORIES.index("white"),
+                np.where(
+                    value[neutral] > 0.33,
+                    _CATEGORIES.index("grey"),
+                    _CATEGORIES.index("black"),
+                ),
+            ),
+        )
+        codes[neutral] = neutral_codes
+    codes[value < 0.18] = _CATEGORIES.index("black")
+    return codes
+
+
+def classify_color(
+    frame_bgr: np.ndarray,
+    mask: np.ndarray | None,
+    *,
+    min_support: float = COLOUR_MIN_SUPPORT,
+) -> tuple[str, float]:
+    """Dominant colour of the masked object, plus the support behind it.
+
+    Playbook section 11: classify from the segmented object pixels only, using
+    robust statistics rather than a mean RGB, and return UNKNOWN when no class
+    holds enough of the valid masked pixels. The returned float is that winning
+    share, which is what the event record publishes as `colour_confidence` --
+    a low number is a genuine "the object is not one colour", not a defect.
+    """
+    colour, support = _dominant_color_with_support(frame_bgr, mask)
+    if colour == "unknown" or support >= min_support:
+        return colour, support
+    return "unknown", support
+
+
 def dominant_color(frame_bgr: np.ndarray, mask: np.ndarray | None) -> str:
+    """Dominant colour name only; see `classify_color` for the support behind it."""
+    return classify_color(frame_bgr, mask)[0]
+
+
+def color_fields(frame_bgr: np.ndarray, mask: np.ndarray | None) -> dict[str, object]:
+    """`Detection` colour keyword arguments, so the name and its support stay together."""
+    colour, support = classify_color(frame_bgr, mask)
+    return {"color": colour, "color_confidence": support}
+
+
+def _dominant_color_with_support(
+    frame_bgr: np.ndarray, mask: np.ndarray | None,
+) -> tuple[str, float]:
     if mask is None or frame_bgr.shape[:2] != mask.shape or np.count_nonzero(mask) < 20:
-        return "unknown"
+        return "unknown", 0.0
 
     material = mask.astype(bool)
     # Open waste bags expose their contents in the middle. Sampling the whole
@@ -710,77 +835,34 @@ def dominant_color(frame_bgr: np.ndarray, mask: np.ndarray | None) -> str:
     bgr_max = np.max(normalized, axis=1)
     bgr_min = np.min(normalized, axis=1)
     pixel_saturation = (bgr_max - bgr_min) / np.maximum(bgr_max, 1e-8)
+    # One classification of every sampled pixel, reused for both the hue vote
+    # and the support fraction behind whichever answer wins.
+    categories = _categorise(normalized)
+
     chromatic = (pixel_saturation >= 0.18) & (bgr_max >= 0.18)
-    chromatic_count = int(np.count_nonzero(chromatic))
-    if chromatic_count >= max(20, int(selected.shape[0] * 0.22)):
-        votes: Counter[str] = Counter()
-        for pixel, saturation_value, brightness in zip(
-            normalized[chromatic], pixel_saturation[chromatic], bgr_max[chromatic], strict=True,
-        ):
-            blue_pixel, green_pixel, red_pixel = (float(value) for value in pixel)
-            degrees_pixel = colorsys.rgb_to_hsv(red_pixel, green_pixel, blue_pixel)[0] * 360.0
-            if degrees_pixel < 12 or degrees_pixel >= 345:
-                category = "red"
-            elif degrees_pixel < 38:
-                category = "orange" if brightness >= 0.50 else "brown"
-            elif degrees_pixel < 70:
-                category = "yellow" if brightness >= 0.52 else "brown"
-            elif degrees_pixel < 165:
-                category = "green"
-            elif degrees_pixel < 195:
-                category = "cyan"
-            elif degrees_pixel < 260:
-                category = "blue"
-            elif degrees_pixel < 320:
-                category = "purple"
-            else:
-                category = "pink"
-            votes[category] += float(saturation_value * brightness)
-        if votes:
-            category, evidence = votes.most_common(1)[0]
-            total_evidence = sum(votes.values())
-            if evidence >= total_evidence * 0.40:
-                return category
+    if int(np.count_nonzero(chromatic)) >= max(20, int(selected.shape[0] * 0.22)):
+        evidence = np.bincount(
+            categories[chromatic],
+            weights=pixel_saturation[chromatic] * bgr_max[chromatic],
+            minlength=len(_CATEGORIES),
+        )
+        total_evidence = float(evidence.sum())
+        if total_evidence > 0:
+            winner = int(np.argmax(evidence))
+            share = float(evidence[winner]) / total_evidence
+            if share >= 0.40:
+                return _CATEGORIES[winner], share
 
-    blue, green, red = (float(value) / 255.0 for value in np.median(selected, axis=0))
-    hue, saturation, value = colorsys.rgb_to_hsv(red, green, blue)
-    degrees = hue * 360.0
-
-    if value < 0.18:
-        return "black"
-    if saturation < 0.16:
-        # HSV saturation alone cannot tell "genuinely neutral grey/white"
-        # from "a pale, washed-out warm surface" -- a cream milk carton or a
-        # translucent yellow-tinted bag both have a small max-min channel
-        # spread (hence low HSV saturation) while still being unmistakably
-        # warm-toned, not neutral. This was silently returning "grey" for
-        # exactly that case (reported directly: a yellow bag/box labelled
-        # grey). LAB b* (see `_lab_b_channel`) is largely independent
-        # evidence: a genuinely neutral grey/white/black surface has b*
-        # close to zero regardless of exposure, while a pale yellow surface
-        # still carries a real positive b* even at low HSV saturation. Only
-        # fall through to neutral white/grey/black once LAB agrees there is
-        # no real warm tint.
-        if _lab_b_channel(blue, green, red) > 6.0 and value > 0.40:
-            return "yellow"
-        if value > 0.77:
-            return "white"
-        return "grey" if value > 0.33 else "black"
-    if degrees < 12 or degrees >= 345:
-        return "red"
-    if degrees < 38:
-        return "orange" if value >= 0.50 else "brown"
-    if degrees < 70:
-        return "yellow" if value >= 0.52 else "brown"
-    if degrees < 165:
-        return "green"
-    if degrees < 195:
-        return "cyan"
-    if degrees < 260:
-        return "blue"
-    if degrees < 320:
-        return "purple"
-    return "pink"
+    # The median fallback, for black/white/grey and pale translucent material
+    # where hue evidence is genuinely weak. Its own support is the share of the
+    # object's pixels that independently agree with the answer, so a mottled or
+    # half-shadowed object reports a low number rather than a confident guess.
+    median_pixel = (np.median(selected, axis=0) / 255.0).reshape(1, 3)
+    answer = _CATEGORIES[int(_categorise(median_pixel)[0])]
+    support = float(
+        np.count_nonzero(categories == _CATEGORIES.index(answer)) / categories.size
+    )
+    return answer, support
 
 
 def combined_mask(detections: Iterable[Detection], shape: tuple[int, int]) -> np.ndarray:

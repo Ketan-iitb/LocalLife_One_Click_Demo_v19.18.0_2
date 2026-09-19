@@ -57,6 +57,13 @@ class Detection:
     # is restricted to the three object families the installation accepts.
     accepted_class: str | None = None
     color: str = "unknown"
+    # Share of the object's own masked pixels that agree with `color`
+    # (playbook section 11.6). A low value means the object genuinely is not
+    # one colour, which is why `color` becomes "unknown" rather than a guess.
+    color_confidence: float = 0.0
+    # Deterministic allowed / mis-sort / unknown verdict (playbook section 12).
+    sorting_status: str = "unknown"
+    sorting_reason: str = ""
     material: str = "unknown"
     material_confidence: float = 0.0
     track_id: int | None = None
@@ -65,6 +72,14 @@ class Detection:
     height_above_baseline_cm: float | None = None
     realsense_volume_l: float | None = None
     monocular_volume_l: float | None = None
+    # Incremental occupied volume across this object's own deposit (playbook
+    # sections 5 and 10): total bin occupancy just before the object appeared,
+    # the total once it settled, and the difference. Populated at the moment of
+    # deposit, and only when both totals were actually measured -- the bin does
+    # not have to be emptied between bags for these to mean something.
+    volume_before_l: float | None = None
+    volume_after_l: float | None = None
+    added_volume_l: float | None = None
     depth_coverage_percent: float | None = None
     volume_uncertainty_l: float | None = None
     measurement_method: str | None = None
@@ -118,6 +133,9 @@ class Detection:
             "source": self.source,
             "accepted_class": self.accepted_class,
             "color": self.color,
+            "color_confidence": round(float(self.color_confidence), 4),
+            "sorting_status": self.sorting_status,
+            "sorting_reason": self.sorting_reason,
             "material": self.material,
             "material_confidence": round(float(self.material_confidence), 4),
             "track_id": self.track_id,
@@ -126,6 +144,9 @@ class Detection:
             "height_above_baseline_cm": self.height_above_baseline_cm,
             "realsense_volume_l": self.realsense_volume_l,
             "monocular_volume_l": self.monocular_volume_l,
+            "volume_before_l": self.volume_before_l,
+            "volume_after_l": self.volume_after_l,
+            "added_volume_l": self.added_volume_l,
             "depth_coverage_percent": self.depth_coverage_percent,
             "volume_uncertainty_l": self.volume_uncertainty_l,
             "measurement_method": self.measurement_method,

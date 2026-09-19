@@ -18,9 +18,9 @@ from .config import (
     GEOMETRY_VALIDATION_REJECT_WORDS,
 )
 from .geometry import (
+    classify_color,
     combined_mask,
     detect_scene_objects,
-    dominant_color,
     fixed_bin_mask,
     fuse_scene_detections,
     intersection_over_union,
@@ -31,6 +31,7 @@ from .inference import MetricDepthEstimator, create_segmenter
 from .material import MaterialClassifier
 from .ledger import WastePlantLedger, waste_object_type
 from .logitech import bound_logitech_detections, stabilize_background_depth
+from .sorting_rules import classify_sorting, mis_sort_family
 from .storage import ResultStore
 from .tracking import ObjectTracker
 from .box_templates import load_box_templates, match_box_template
@@ -426,6 +427,14 @@ class VisionPipeline:
         self._volume_history: dict[int, deque[float]] = defaultdict(
             lambda: deque(maxlen=max(config.volume_window_frames, config.settle_frames))
         )
+        # Playbook sections 5 and 10: the bin is not emptied between deposits,
+        # so a bag's own contribution is the change in total occupied bin
+        # volume across its arrival. `_previous_bin_total_l` is the last frame's
+        # total (the state before whatever appears next), captured per track the
+        # moment that track is created and compared against the total at the
+        # moment it is deposited.
+        self._previous_bin_total_l: float | None = None
+        self._bin_total_before_track: dict[int, float] = {}
         # Table-relative box cuboid: per-track accepted-frame history feeding
         # `aggregate_box_measurements()` (Revised Dual-Camera Volume
         # Estimation recipe, section 13 -- median L/W/H across accepted
@@ -891,7 +900,20 @@ class VisionPipeline:
             if self.config.operating_mode == "geometry_validation" and self.camera_id != "logitech"
             else self.config.min_object_height_m
         )
+        # Playbook section 12: a disallowed object is a mis-sort the operator
+        # needs told about. `filter_waste_detections` below drops it -- rightly,
+        # since it must never be tracked, measured or written to the ledger --
+        # so the verdict is taken here, while the detector's own labels are
+        # still in hand, and surfaced as a warning instead of vanishing.
+        mis_sorted = sorted({
+            family
+            for detection in detections
+            if detection.confidence >= self.config.detector_confidence
+            and (family := mis_sort_family(detection.label)) is not None
+        })
         detections = filter_waste_detections(detections, frame.shape, bin_region, self.config)
+        for family in mis_sorted:
+            warnings.append(f"MIS-SORT: a {family} object was detected; this bin does not accept it")
 
         if self.camera_id == "logitech":
             detections, segmentation_warnings = bound_logitech_detections(
@@ -1141,7 +1163,9 @@ class VisionPipeline:
                     # Re-evaluate colour on the full physical surface. This
                     # avoids a red logo, carpet halo, or small shaded centre
                     # patch deciding the colour of an otherwise white bag.
-                    detection.color = dominant_color(frame, recovered)
+                    detection.color, detection.color_confidence = classify_color(
+                        frame, recovered
+                    )
 
         confirmed_detections = [item for item in detections if not _is_phantom_detection(item)]
         aggregate_detections = confirmed_detections if confirmed_detections else detections
@@ -1568,6 +1592,9 @@ class VisionPipeline:
         # but never added to experiment databases").
         tracking_detections = detections
         new_ids = self.tracker.update(tracking_detections) if self.config.auto_count else []
+        if self._previous_bin_total_l is not None:
+            for track_id in new_ids:
+                self._bin_total_before_track[track_id] = self._previous_bin_total_l
 
         # Box-cuboid multi-frame track aggregation (Revised Dual-Camera
         # Volume Estimation recipe, section 13), now that every detection in
@@ -1619,6 +1646,17 @@ class VisionPipeline:
                     colors.append(detection.color)
                 if colors:
                     detection.color = Counter(colors).most_common(1)[0][0]
+            # Playbook section 12. Applied to every detection, tracked or not,
+            # so a mis-sorted object that never earns a track is still called
+            # out rather than silently dropping off the event record.
+            verdict = classify_sorting(
+                detection.label,
+                confidence=detection.confidence,
+                accepted_class=detection.accepted_class,
+            )
+            detection.sorting_status = verdict.status
+            detection.sorting_reason = verdict.reason
+            if detection.track_id is not None:
                 canonical_material = {
                     "plastic_bag": "polythene bag",
                     "paper_bag": "paper bag",
@@ -1730,8 +1768,18 @@ class VisionPipeline:
                 median = float(np.median(recent))
                 tolerance_l = max(0.15, median * self.config.settle_volume_tolerance)
                 if float(np.max(recent) - np.min(recent)) <= tolerance_l:
+                    self._record_added_volume(detection, bin_total)
                     self.ledger.deposit(detection, timestamp=timestamp)
                     newly_deposited.append(detection)
+        # This frame's occupancy becomes the "before" state that whatever
+        # appears next will be measured against.
+        if bin_total is not None:
+            self._previous_bin_total_l = float(bin_total.liters)
+        elif occupancy_reference is not None and occupancy_depth is not None and logitech_ready:
+            # A bin that was measured and found to hold nothing above the noise
+            # floor occupies 0 L; treating that as unknown would deny the very
+            # first deposit into an empty bin its "before" state.
+            self._previous_bin_total_l = 0.0
         # Reconciled against `aggregate_detections` (not raw `detections`),
         # matching the phantom-excluding mask used to compute the estimate
         # above -- see the `confirmed_object_mask` comment for why.
@@ -2480,6 +2528,27 @@ class VisionPipeline:
             and self.reference_plane is not None
             and self.reference_plane.tilt_degrees > self.config.logitech_hard_max_tilt_degrees
         )
+
+    def _record_added_volume(
+        self, detection: Detection, bin_total: VolumeMeasurement | None,
+    ) -> None:
+        """Attach this deposit's incremental occupied volume (playbook sections 5, 10).
+
+        The difference between total bin occupancy before this object arrived
+        and after it settled. Purely additive: it records what the bin gained
+        without influencing whether the deposit happens or what the object's own
+        measured volume is. Both totals have to be real measurements -- an
+        absent one leaves the fields None rather than inventing a difference.
+        """
+        before = self._bin_total_before_track.pop(detection.track_id, None)
+        if before is None or bin_total is None:
+            return
+        after = float(bin_total.liters)
+        detection.volume_before_l = round(before, 6)
+        detection.volume_after_l = round(after, 6)
+        # Section 16: a small negative difference is sensor noise around an
+        # unchanged scene, not a bin that shrank, so it reports as zero.
+        detection.added_volume_l = round(max(0.0, after - before), 6)
 
     def _logitech_tilt_uncertainty_fraction(self) -> float:
         """Graduated confidence penalty for mounting tilt above the confident zone.

@@ -1,4 +1,81 @@
-# LocalLife One-Click Demonstration — v19.18.0
+# LocalLife One-Click Demonstration — v19.21.0
+
+**v19.21.0 — built against the Final Implementation Playbook; the volume number is
+finally right.** The playbook freezes one method (RealSense metric depth + a one-time
+empty-bin reference + 2.5D height-map grid integration + before/after deposit difference)
+and forbids rebuilding the rest of the project. That is exactly what this round did: the
+detector, segmentation, dashboard and launcher are untouched.
+
+**The volume bug, and it was two bugs compounding.** Every volume mode this project has
+ever shipped integrated once per *pixel*, weighting each pixel by `z²/(fx·fy)`. That is
+the footprint of a ray meeting a surface square-on — and a crumpled polythene bag, the
+thing this system exists to measure, is mostly oblique micro-facets where the true
+footprint is larger by `1/cos θ`. On top of that, the `reference-plane` default (chosen
+in round 16) anchored that footprint to the **reference** depth rather than the depth the
+object was actually seen at, so anything standing proud of the bin floor had its footprint
+inflated by `(z_reference / z_object)²` — **+78% for a 0.5 m object in a 2.0 m bin**. This
+was not hidden: `test_known_volume_validation.py` had measured the bias at 25.44% for its
+own scene and recorded it as understood-and-accepted rather than fixing it. Between the two,
+every liters figure this rig produced was biased high, by an amount that changed with how
+tall the object was — which is why no amount of recalibration ever made it stick.
+
+**The fix, per playbook §3–§7.** New `locallife_cloud/heightmap_volume.py` backprojects
+depth to 3-D, takes each point's perpendicular height above the calibrated floor plane,
+bins those points into fixed **10 mm cells laid out on that plane**, and integrates a robust
+**median height per cell × the constant cell area**. Cell area no longer depends on where
+the surface is, camera tilt cannot distort the grid, and tens of thousands of noisy samples
+collapse into a few hundred medians — which is precisely why it survives a wrinkled bag.
+
+**Measured against closed-form synthetic ground truth** (a rigid box at 0°/15°/30° of
+mounting tilt, a smooth dome, and a wrinkled dome with 4 mm depth noise and 12% dropout):
+
+| | old per-pixel | new height-map grid |
+|---|---|---|
+| mean absolute percentage error | **15.4%** | **1.1%** |
+| crumpled bag + noise, level | +23.4% | −0.2% |
+| crumpled bag + noise, 25° tilt | +13.4% | −1.3% |
+| rigid box, 0° | +31.6% | +4.0% |
+
+Three more real problems were found while building it, each fixed and regression-tested:
+hole cells are now filled from the **lower quartile** of their neighbours rather than the
+median (most holes beside an object are its own occlusion shadow, and a median resolved
+them to the object side, fabricating a full-height ring around a reference box — +12% → +4%);
+the grid **coarsens itself** when the depth image cannot support the configured cell size,
+instead of silently returning nothing; and the settle trigger uses a high percentile rather
+than the median, because a bag still falling covers well under half the bin ROI and the
+median read exactly **zero** change while it was visibly moving.
+
+**Colour (§11).** Classification already ran on masked pixels only; what was missing was
+honesty about support. It now reports the share of the object's own pixels that agree with
+the answer as `color_confidence`, and returns **UNKNOWN** rather than forcing a colour when
+no class holds 35% of them. The per-pixel classifier was vectorised in the process, so this
+costs no extra time per frame.
+
+**Mis-sorting (§12).** New `locallife_cloud/sorting_rules.py` — a deterministic table over
+the labels the existing detector already produces, no new model. Slippers, tools, appliances,
+furniture and textiles are named as MIS-SORT (a disallowed family beats the word "bag", so
+"vacuum cleaner bag" is not waved through); anything unrecognised or low-confidence is
+**UNKNOWN / MANUAL CHECK**, never guessed. Disallowed objects still never enter tracking,
+measurement or the ledger — they now raise a visible mis-sort warning instead of vanishing.
+
+**Per-deposit incremental volume (§5, §10).** The bin no longer has to be emptied between
+bags: each deposit records `volume_before_l`, `volume_after_l` and `added_volume_l` from the
+change in total bin occupancy across the object's arrival. Purely additive — it changes no
+deposit decision and no per-object measurement.
+
+Tunables live in one place (`config.py` / `cloud.env.example`, playbook §27):
+`LOCALLIFE_VOLUME_GRID_SIZE_M`, `LOCALLIFE_VOLUME_MIN_POINTS_PER_CELL`,
+`LOCALLIFE_VOLUME_CELL_PERCENTILE`. The old per-pixel modes remain available via
+`LOCALLIFE_VOLUME_GEOMETRY` for the thesis sensitivity comparison.
+
+**46 new tests** (25 height-map, 15 colour/sorting, 6 end-to-end event record), full suite
+**338 passing**. **Not yet verified on real RealSense hardware** — every number above comes
+from scenes with exact derived ground truth, which is the strongest check available without
+the rig. Per playbook §17 the next step is Day 1's: capture the empty-bin baseline, put one
+measured rigid box in front of the camera, and confirm the terminal's litres before trusting
+the dashboard.
+
+# LocalLife One-Click Demonstration — v19.18.0 (previous)
 
 **v19.18.0 — the root cause of "pending hamesha aa raha hai", finally found.** Your screenshots were
 telling us the answer in plain text the whole time and I kept looking past it. Every single liters cell,
