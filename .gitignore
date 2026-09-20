@@ -1,3 +1,8 @@
 
 # Local configuration with real values (template is .env.example)
 .env
+
+# Compiled bytecode: regenerated on every run, and every test run otherwise
+# leaves the tree dirty with binary churn that hides real changes in a diff.
+__pycache__/
+*.py[cod]
