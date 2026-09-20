@@ -128,9 +128,9 @@ function Invoke-NativeTolerantly {
     # $StdinLines (optional, named-only -- every call site passes it, when at
     # all, as -StdinLines): answers fed to the native process's own stdin,
     # one per line. This exists for gcloud's Windows SSH backend (PuTTY's
-    # plink.exe/pscp.exe -- see $script:PlinkHostKeyAutoAcceptLines below for
-    # why) but is written generically so any future caller can use it the
-    # same way.
+    # plink.exe/pscp.exe) and is written generically so any future caller can
+    # use it the same way. No caller feeds host-key answers through it any
+    # more -- see the verified-cloud-SSH section for what replaced that.
     #
     # Correction to a claim this comment used to make: an earlier version
     # asserted $StdinLines was "never bound positionally by any call site"
@@ -219,122 +219,207 @@ function Get-PythonPackageIdentity {
     }
 }
 
-# Windows' bundled PuTTY (plink.exe/pscp.exe), which is what `gcloud compute
-# ssh`/`gcloud compute scp` actually shell out to on Windows -- confirmed
-# directly (gcloud's own ssh.py hardcodes the PuTTY backend on Windows, with
-# no supported flag or environment variable to switch to OpenSSH instead;
-# there is no unofficial way to do so either without hand-patching the
-# installed Cloud SDK, which `gcloud components update` would silently
-# revert), shows its own interactive "Store key in cache?" prompt on first
-# connection to a host -- entirely separate from, and NOT suppressed by,
-# gcloud's own --strict-host-key-checking flag (confirmed on a real user
-# run: even with that flag set to 'no', the prompt still appeared and then
-# the very next call -- gcloud compute scp -- failed outright with
-# "pscp: unable to open ~/: failure" once per file, because that second,
-# separate plink-family process hit the same never-answered prompt with no
-# interactive terminal able to answer it). The standard, documented way to
-# automate this exact PuTTY prompt is to pipe "y" to the process's own
-# stdin (plink/pscp read one line from stdin as the prompt's answer, exactly
-# as if a person had typed it and pressed Enter) -- verified against public
-# guidance on automating plink/pscp host-key prompts, not assumed. "y"
-# (rather than "n") is used so the key is actually cached, not just
-# accepted for this one connection, since this same VM is reused across
-# multiple gcloud ssh/scp calls within a single run.
+# Why this launcher no longer goes through gcloud's Windows SSH backend.
 #
-# Every gcloud ssh/scp call below also passes --quiet, gcloud's own
-# "never prompt, take the default" flag. That covers gcloud's *own* prompts,
-# which are a separate hang risk from PuTTY's: on a machine that has no
-# ~/.ssh/google_compute_engine yet, `gcloud compute ssh` stops to ask
-# "Enter passphrase (empty for no passphrase):" twice, and the "y" lines
-# piped above would be answered into it as a passphrase rather than
-# declining. --quiet generates the key with no passphrase and moves on, which
-# is what an unattended one-click launcher needs.
-$script:PlinkHostKeyAutoAcceptLines = @('y', 'y', 'y')
+# `gcloud compute ssh`/`scp` shell out to PuTTY (plink.exe/pscp.exe) on Windows
+# -- gcloud's own ssh.py hardcodes that backend, with no supported flag to
+# choose OpenSSH instead. PuTTY runs its own host-key prompts, entirely separate
+# from and NOT suppressed by gcloud's --strict-host-key-checking flag, and those
+# prompts are what blocked cloud startup: gpu.py recreates the VM on a zone move,
+# so the key legitimately changes and plink stops at "Update cached key? (y/n)"
+# in a window nobody is watching.
+#
+# An earlier build answered that prompt by piping "y". It unblocked startup and
+# it was wrong: it accepted whatever key the far end offered, which is precisely
+# the substitution the prompt exists to catch. It has been removed.
+#
+# Everything below instead establishes identity over the authenticated GCP API
+# (see the verified-cloud-SSH section) and connects with Windows OpenSSH under
+# StrictHostKeyChecking=yes against a pinned known_hosts file.
+$script:CloudSshHost = ''
+$script:CloudSshUser = ''
 
-function Get-CloudVmHostAddresses {
+# --------------------------------------------------------------------- #
+# Verified cloud SSH.
+#
+# `gcloud compute ssh` shells out to PuTTY on Windows, and PuTTY's host-key
+# prompts are what actually blocked cloud startup: gpu.py recreates the VM on a
+# zone move, the key legitimately changes, and plink stops for a keystroke in a
+# window nobody is watching.
+#
+# The fix is NOT to answer that prompt automatically. Piping "y" would make the
+# launcher accept any key any host presented -- exactly the man-in-the-middle
+# case the prompt exists to catch. Instead the VM's identity is established over
+# a channel independent of the SSH connection: GCE publishes each instance's own
+# host keys as guest attributes, readable over the authenticated GCP API.
+# locallife_cloud/cloud_ssh.py resolves the instance, pins those keys into a
+# per-session known_hosts file, and everything below connects with Windows
+# OpenSSH under StrictHostKeyChecking=yes -- a matching key connects silently, a
+# mismatched one is refused outright. That logic lives in Python because it is
+# security-critical and therefore worth unit-testing; this is its caller.
+# --------------------------------------------------------------------- #
+function Get-CloudKnownHostsPath {
+    return (Join-Path $script:SessionDirectory 'cloud_known_hosts')
+}
+
+function Assert-CloudSshIdentity {
     <#
-        The addresses PuTTY could have cached a host key against for this VM:
-        its external IP, its internal IP, and its instance name. Returns
-        whatever could be determined; an empty result is an ordinary outcome
-        (no network, not signed in) and never stops the launcher.
+        Pin the VM's published host keys. Returns the parsed verification
+        report. Throws when identity cannot be established -- never downgraded
+        to a warning, and never worked around by relaxing the check.
     #>
     param(
-        [Parameter(Mandatory = $true)][string]$GcloudPath,
+        [Parameter(Mandatory = $true)][string]$PythonExe,
         [Parameter(Mandatory = $true)][string]$Zone
     )
-    $addresses = @($VmName)
+    Write-Step 'Resolving VM identity...'
+    $knownHosts = Get-CloudKnownHostsPath
+    if (-not (Test-Path -LiteralPath $script:SessionDirectory)) {
+        New-Item -ItemType Directory -Path $script:SessionDirectory -Force | Out-Null
+    }
+    Write-Step 'Verifying SSH host key...'
+    $projectRoot = Find-ProjectRoot
     $previousPreference = $ErrorActionPreference
     $ErrorActionPreference = 'SilentlyContinue'
     try {
-        $described = (& $GcloudPath 'compute' 'instances' 'describe' $VmName `
-            ('--zone=' + $Zone) ('--project=' + $CloudProject) `
-            '--format=value(networkInterfaces[0].accessConfigs[0].natIP,networkInterfaces[0].networkIP)' 2>$null | Out-String)
-        if ($LASTEXITCODE -eq 0) {
-            foreach ($token in ($described -split '\s+')) {
-                if ($token -match '^\d{1,3}(\.\d{1,3}){3}$') {
-                    $addresses += $token
-                }
-            }
-        }
-    }
-    catch {
-        # Nothing to add; the instance-name entry below is still worth clearing.
+        $raw = (& $PythonExe '-m' 'locallife_cloud.cloud_ssh' `
+            '--vm' $VmName '--zone' $Zone '--project' $CloudProject `
+            '--known-hosts' $knownHosts 2>&1 | Out-String)
     }
     finally {
         $ErrorActionPreference = $previousPreference
     }
-    return @($addresses | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
-}
-
-# gpu.py deletes and recreates the VM whenever it has to move zones to find
-# GPU capacity, so the same instance name -- and frequently the same external
-# IP, since Google reuses addresses within a region -- legitimately comes back
-# with a brand-new SSH host key. PuTTY then does NOT show its ordinary
-# first-connection prompt (which the piped "y" above answers); it shows a
-# different, stricter one, seen blocking a real user run:
-#
-#   WARNING - POTENTIAL SECURITY BREACH!
-#   The host key does not match the one Plink has cached for this server:
-#     34.6.166.251 (port 22)
-#   ...
-#   Update cached key? (y/n, Return cancels connection, i for more info)
-#
-# Startup then sits there forever waiting for a human to answer -- which is
-# exactly the "cloud is stuck" symptom reported. Dropping the stale cache
-# entry BEFORE connecting turns that prompt back into the ordinary
-# first-connection one, so the existing piped "y" resolves it and the run
-# continues unattended.
-#
-# Deliberately narrow: the current user's own PuTTY cache only, and only
-# values whose name ends in ":<this VM's address>" -- PuTTY names them
-# "<keytype>@<port>:<host>", e.g. "rsa2@22:34.6.166.251". No other host's
-# saved key is read, printed or touched. On a non-Windows host the registry
-# path simply does not exist and this is a no-op.
-function Clear-StalePuttyHostKey {
-    param([string[]]$HostAddresses = @())
-    $cachePath = 'HKCU:\Software\SimonTatham\PuTTY\SshHostKeys'
-    if (-not (Test-Path -LiteralPath $cachePath)) {
-        return
-    }
-    $addresses = @($HostAddresses | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-    if ($addresses.Count -eq 0) {
-        return
-    }
-    $cacheKey = Get-Item -LiteralPath $cachePath -ErrorAction SilentlyContinue
-    if ($null -eq $cacheKey) {
-        return
-    }
-    foreach ($valueName in @($cacheKey.GetValueNames())) {
-        foreach ($address in $addresses) {
-            if ([string]$valueName -match ([regex]::Escape(':' + $address) + '$')) {
-                Remove-ItemProperty -LiteralPath $cachePath -Name $valueName -ErrorAction SilentlyContinue
-                Write-Step ('Cleared the stale saved SSH host key for ' + $address +
-                            ' -- the VM was recreated, so its key legitimately changed. ' +
-                            'Without this, PuTTY stops and waits for a "y" nobody is there to type.')
-                break
-            }
+    $report = $null
+    foreach ($line in ($raw -split "`n")) {
+        $trimmed = "$line".Trim()
+        if ($trimmed.StartsWith('{')) {
+            try { $report = $trimmed | ConvertFrom-Json } catch { }
         }
     }
+    if ($null -eq $report) {
+        throw ('SSH host key mismatch: the VM identity check produced no result. Raw output: ' + $raw.Trim())
+    }
+    if (-not $report.verified) {
+        throw ('SSH host key mismatch: ' + $report.status + ' -- ' + $report.error +
+               ' Cloud mode cannot continue safely. Run locally, or check ' +
+               '`gcloud compute instances describe ' + $VmName + ' --zone=' + $Zone + '`.')
+    }
+    # Logged without credentials: instance id, zone, IP and fingerprints are all
+    # public facts about the machine, and they are what makes a later mismatch
+    # diagnosable.
+    Write-Step ('SSH identity verified: ' + $report.identity.vm_name +
+                ' (instance ' + $report.identity.instance_id + ') in ' + $report.identity.zone +
+                ' at ' + $report.identity.external_ip)
+    foreach ($item in @($report.fingerprints)) {
+        Write-Step ('  host key ' + $item.key_type + ' ' + $item.fingerprint)
+    }
+    $script:CloudSshHost = $report.identity.external_ip
+    return $report
+}
+
+function Get-CloudSshOptions {
+    <#
+        OpenSSH arguments that verify without ever prompting. Set per
+        connection; no global configuration is touched.
+    #>
+    $options = @(
+        '-o', ('UserKnownHostsFile=' + (Get-CloudKnownHostsPath)),
+        '-o', 'StrictHostKeyChecking=yes',
+        '-o', 'BatchMode=yes',
+        '-o', 'ConnectTimeout=20'
+    )
+    $identity = Join-Path $env:USERPROFILE '.ssh\google_compute_engine'
+    if (Test-Path -LiteralPath $identity) {
+        $options += @('-i', $identity, '-o', 'IdentitiesOnly=yes')
+    }
+    return $options
+}
+
+function Resolve-CloudSshUser {
+    <#
+        Which account to log in as.
+
+        gcloud uses the local Windows username for metadata-based SSH and a
+        mangled form of the account e-mail under OS Login, so both are tried --
+        once per run, then cached. BatchMode means a wrong guess fails fast with
+        an authentication error instead of sitting on a password prompt.
+    #>
+    param([Parameter(Mandatory = $true)][string]$HostAddress)
+    if (-not [string]::IsNullOrWhiteSpace($script:CloudSshUser)) {
+        return $script:CloudSshUser
+    }
+    $candidates = @()
+    if (-not [string]::IsNullOrWhiteSpace($env:USERNAME)) { $candidates += $env:USERNAME }
+    $account = Get-GcloudAccount
+    if (-not [string]::IsNullOrWhiteSpace($account)) {
+        $candidates += (($account -split '@')[0] -replace '[^A-Za-z0-9_-]', '_')
+    }
+    $options = Get-CloudSshOptions
+    foreach ($candidate in ($candidates | Select-Object -Unique)) {
+        Write-Step ('Trying cloud SSH account ' + $candidate + '...')
+        Invoke-NativeTolerantly 'ssh' @options ($candidate + '@' + $HostAddress) 'true'
+        if ($LASTEXITCODE -eq 0) {
+            $script:CloudSshUser = $candidate
+            return $candidate
+        }
+    }
+    throw ('SSH authentication failed: none of these accounts could log in to ' + $HostAddress +
+           ' (' + ($candidates -join ', ') + '). Run `gcloud compute ssh ' + $VmName +
+           '` once by hand to provision your key, then start again.')
+}
+
+function Get-GcloudAccount {
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'SilentlyContinue'
+    try {
+        $gcloudPath = Assert-GcloudAvailable
+        return ((& $gcloudPath 'config' 'get-value' 'account' 2>$null | Out-String).Trim())
+    }
+    catch {
+        return ''
+    }
+    finally {
+        $ErrorActionPreference = $previousPreference
+    }
+}
+
+function Invoke-VerifiedCloudSsh {
+    <#
+        Run one command on the cloud VM over a host-key-verified connection.
+        Output goes to the pipeline so callers can inspect it, exactly as the
+        gcloud calls this replaces did.
+    #>
+    param(
+        [string]$Command = '',
+        [string[]]$ExtraOptions = @()
+    )
+    $target = (Resolve-CloudSshUser -HostAddress $script:CloudSshHost) + '@' + $script:CloudSshHost
+    $options = (Get-CloudSshOptions) + $ExtraOptions
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'SilentlyContinue'
+    try {
+        if ([string]::IsNullOrWhiteSpace($Command)) {
+            # The tunnel case: -N means "no remote command", so passing an empty
+            # string would make ssh try to run one and fail.
+            & ssh @options $target
+        }
+        else {
+            & ssh @options $target $Command
+        }
+    }
+    finally {
+        $ErrorActionPreference = $previousPreference
+    }
+}
+
+function Invoke-VerifiedCloudScp {
+    param(
+        [Parameter(Mandatory = $true)][string]$LocalPath,
+        [Parameter(Mandatory = $true)][string]$RemotePath
+    )
+    $target = (Resolve-CloudSshUser -HostAddress $script:CloudSshHost) + '@' + $script:CloudSshHost
+    $options = Get-CloudSshOptions
+    Invoke-NativeTolerantly 'scp' @options '-r' $LocalPath ($target + ':' + $RemotePath)
 }
 
 function Assert-SshAvailable {
@@ -898,11 +983,11 @@ function Start-AppRole {
     $gcloudPath = Assert-GcloudAvailable
 
     # Before ANY window connects, and specifically before the zone file below
-    # releases Windows 2 and 3 to start their own SSH sessions: drop a stale
-    # cached host key for this VM. Doing it first is what makes it safe -- the
-    # other windows only learn the zone once the file exists, so they cannot
-    # race in and hit the prompt this is clearing.
-    Clear-StalePuttyHostKey -HostAddresses (Get-CloudVmHostAddresses -GcloudPath $gcloudPath -Zone $zone)
+    # releases Windows 2 and 3 to start their own SSH sessions: establish and
+    # pin the VM's identity. Doing it first is what makes it safe -- the other
+    # windows only learn the zone once the file exists, so they cannot race in
+    # against an unpinned host.
+    Assert-CloudSshIdentity -PythonExe $pythonExe -Zone $zone | Out-Null
 
     Write-Step 'Recording the zone for the tunnel window...'
     $zoneFile = Join-Path $script:SessionDirectory 'cloud-zone.txt'
@@ -933,8 +1018,7 @@ function Start-AppRole {
         'echo "LOCALLIFE_HOME_CONTENTS:"; ls -1 ~ 2>/dev/null | head -20; ' +
         'if [ -d ~/' + $ProjectDirectory + '/locallife_cloud ]; then echo LOCALLIFE_PROJECT_PRESENT; ' +
         'else echo LOCALLIFE_PROJECT_MISSING; fi'
-    $checkOutput = $script:PlinkHostKeyAutoAcceptLines | & $gcloudPath 'compute' 'ssh' $VmName ('--zone=' + $zone) ('--project=' + $CloudProject) `
-        '--quiet' '--strict-host-key-checking=no' ('--command=' + $checkCommand)
+    $checkOutput = Invoke-VerifiedCloudSsh -Command $checkCommand
     if ($LASTEXITCODE -ne 0) {
         throw 'Could not check the cloud VM over SSH (see its output above). Run `python gpu.py ssh` to investigate.'
     }
@@ -947,8 +1031,7 @@ function Start-AppRole {
         # name. A destination of "vm:~/" therefore transfers every file
         # successfully into a directory literally called "~", so the upload
         # reports 100% while ~/<project> stays empty in any real shell.
-        $homeOutput = $script:PlinkHostKeyAutoAcceptLines | & $gcloudPath 'compute' 'ssh' $VmName ('--zone=' + $zone) ('--project=' + $CloudProject) `
-            '--quiet' '--strict-host-key-checking=no' '--command=echo LOCALLIFE_REMOTE_HOME=$HOME'
+        $homeOutput = Invoke-VerifiedCloudSsh -Command 'echo LOCALLIFE_REMOTE_HOME=$HOME'
         $remoteHome = ''
         foreach ($line in @($homeOutput)) {
             if ("$line" -match 'LOCALLIFE_REMOTE_HOME=(\S+)') { $remoteHome = $Matches[1] }
@@ -957,15 +1040,13 @@ function Start-AppRole {
             throw 'Could not determine the cloud VM home directory over SSH; cannot upload the project safely.'
         }
         Write-Step ('Uploading to ' + $remoteHome + ' on ' + $VmName + '...')
-        Invoke-NativeTolerantly $gcloudPath -StdinLines $script:PlinkHostKeyAutoAcceptLines 'compute' 'scp' '--recurse' ('--zone=' + $zone) ('--project=' + $CloudProject) `
-            '--quiet' '--strict-host-key-checking=no' $projectRoot ($VmName + ':' + $remoteHome + '/')
+        Invoke-VerifiedCloudScp -LocalPath $projectRoot -RemotePath ($remoteHome + '/')
         if ($LASTEXITCODE -ne 0) {
             throw 'Could not upload the project to the cloud VM (see its output above). Run `python gpu.py ssh` and check disk space, or copy it manually.'
         }
         # Verify rather than assume. A partial or wrong-target upload otherwise
         # surfaces minutes later as an unexplained "project is not installed".
-        $verifyOutput = $script:PlinkHostKeyAutoAcceptLines | & $gcloudPath 'compute' 'ssh' $VmName ('--zone=' + $zone) ('--project=' + $CloudProject) `
-            '--quiet' '--strict-host-key-checking=no' ('--command=' + $checkCommand)
+        $verifyOutput = Invoke-VerifiedCloudSsh -Command $checkCommand
         if (($verifyOutput -join "`n") -notmatch 'LOCALLIFE_PROJECT_PRESENT') {
             throw ('The upload reported success but ~/' + $ProjectDirectory +
                    '/locallife_cloud is still missing on ' + $VmName + ' in ' + $zone +
@@ -1037,8 +1118,7 @@ function Start-AppRole {
     # pinned key would otherwise have to be manually cleared on every zone
     # change anyway, and the connection is already gated by the user's own
     # gcloud/IAM auth, not by host-key trust.
-    Invoke-NativeTolerantly $gcloudPath -StdinLines $script:PlinkHostKeyAutoAcceptLines 'compute' 'ssh' $VmName ('--zone=' + $zone) ('--project=' + $CloudProject) `
-        '--quiet' '--strict-host-key-checking=no' ('--command=' + $remoteBootstrap)
+    Invoke-VerifiedCloudSsh -Command $remoteBootstrap
     if ($LASTEXITCODE -ne 0) {
         throw 'The cloud application stopped or could not start. Check `python gpu.py status` and `python gpu.py ssh`.'
     }
@@ -1181,10 +1261,14 @@ function Start-CloudTunnelRole {
     $zone = Wait-ForCloudZoneFile
     Write-Step ('Tunneling to depth-l4 in ' + $zone)
 
-    $gcloudPath = Assert-GcloudAvailable
+    # This window is its own process, so it establishes the VM's identity for
+    # itself rather than trusting a variable Window 1 set. Window 1 has already
+    # pinned the same keys, so this is a fast re-verify that reports "unchanged"
+    # -- and if it ever does NOT match, this window stops instead of tunnelling
+    # to a host that is not the VM.
+    Assert-CloudSshIdentity -PythonExe (Assert-PythonAvailable) -Zone $zone | Out-Null
     $forward = '127.0.0.1:' + $Port + ':127.0.0.1:' + $Port
-    Invoke-NativeTolerantly $gcloudPath -StdinLines $script:PlinkHostKeyAutoAcceptLines 'compute' 'ssh' $VmName ('--zone=' + $zone) ('--project=' + $CloudProject) `
-        '--quiet' '--strict-host-key-checking=no' '--' '-N' '-L' $forward
+    Invoke-VerifiedCloudSsh -Command '' -ExtraOptions @('-N', '-L', $forward)
     if ($LASTEXITCODE -ne 0) {
         throw 'The secure SSH tunnel stopped. Check cloud login and whether the laptop port is already occupied.'
     }
@@ -1206,6 +1290,8 @@ function Initialize-PiCloudTunnel {
     # mainly matters here for someone running `-Role Pi` standalone.
     $zone = Wait-ForCloudZoneFile
     $gcloudPath = Assert-GcloudAvailable
+    # Same reasoning as Window 2: verify identity in this process before using it.
+    Assert-CloudSshIdentity -PythonExe (Assert-PythonAvailable) -Zone $zone | Out-Null
 
     # 1) The Pi needs its own dedicated keypair for this tunnel -- separate
     #    from whatever credential the laptop uses to log into the Pi, and
@@ -1236,8 +1322,7 @@ function Initialize-PiCloudTunnel {
         'sudo chmod 600 /home/' + $script:PiTunnelUser + '/.ssh/authorized_keys && ' +
         'sudo chown ' + $script:PiTunnelUser + ':' + $script:PiTunnelUser + ' /home/' + $script:PiTunnelUser + '/.ssh/authorized_keys'
     $vmBootstrap = ConvertTo-RemoteBootstrap -Command $vmSetupCommand
-    $script:PlinkHostKeyAutoAcceptLines | & $gcloudPath 'compute' 'ssh' $VmName ('--zone=' + $zone) ('--project=' + $CloudProject) `
-        '--quiet' '--strict-host-key-checking=no' ('--command=' + $vmBootstrap)
+    Invoke-VerifiedCloudSsh -Command $vmBootstrap
     if ($LASTEXITCODE -ne 0) {
         throw 'Could not provision the cloud VM''s restricted tunnel user (see its output above). Run `python gpu.py ssh` to investigate.'
     }

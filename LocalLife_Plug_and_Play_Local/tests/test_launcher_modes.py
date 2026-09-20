@@ -335,10 +335,10 @@ class LauncherDiagnosticsTests(unittest.TestCase):
 class CloudStartupBlockingTests(unittest.TestCase):
     """Regression: "cloud wala atak raha hai" -- cloud startup sat there forever.
 
-    gpu.py deletes and recreates the VM on a zone move, so the host key changes
-    and PuTTY shows its stricter "POTENTIAL SECURITY BREACH ... Update cached
-    key?" prompt instead of the ordinary first-connection one the piped "y"
-    answers. Nobody is watching that window, so startup never proceeds.
+    gpu.py recreates the VM on a zone move, so the host key legitimately
+    changes and PuTTY stops at "Update cached key?" in a window nobody is
+    watching. The fix must unblock that WITHOUT accepting an unverified key, so
+    these assert the security properties as much as the unblocking.
 
     There is no PowerShell interpreter in this environment, so these assert on
     the script's text: they cannot prove the script runs, only that the fix is
@@ -351,37 +351,46 @@ class CloudStartupBlockingTests(unittest.TestCase):
             Path(__file__).resolve().parent.parent.parent / "Start-LocalLife-Demo.ps1"
         ).read_text(encoding="utf-8", errors="replace")
 
-    def test_the_stale_host_key_is_cleared_before_connecting(self) -> None:
-        self.assertIn("function Clear-StalePuttyHostKey", self.script)
-        self.assertIn(r"HKCU:\Software\SimonTatham\PuTTY\SshHostKeys", self.script)
-        self.assertIn("Clear-StalePuttyHostKey -HostAddresses", self.script)
+    def test_identity_is_verified_against_the_authenticated_api(self) -> None:
+        self.assertIn("function Assert-CloudSshIdentity", self.script)
+        self.assertIn("locallife_cloud.cloud_ssh", self.script)
+        self.assertIn("Assert-CloudSshIdentity -PythonExe", self.script)
 
-    def test_the_key_is_cleared_before_the_other_windows_are_released(self) -> None:
+    def test_nothing_auto_accepts_an_unverified_host_key(self) -> None:
+        # The v21 approach, and every other form of blanket acceptance.
+        for bypass in (
+            "PlinkHostKeyAutoAcceptLines",
+            "strict-host-key-checking=no",
+            "StrictHostKeyChecking=no",
+            "StrictHostKeyChecking=accept-new' ('--zone",
+        ):
+            with self.subTest(bypass=bypass):
+                self.assertNotIn(bypass, self.script)
+
+    def test_cloud_connections_pin_a_known_hosts_file_and_check_strictly(self) -> None:
+        self.assertIn("'StrictHostKeyChecking=yes'", self.script)
+        self.assertIn("UserKnownHostsFile=", self.script)
+        self.assertIn("function Get-CloudKnownHostsPath", self.script)
+
+    def test_an_unverified_identity_stops_rather_than_continues(self) -> None:
+        self.assertIn("if (-not $report.verified)", self.script)
+        self.assertIn("SSH host key mismatch", self.script)
+
+    def test_identity_is_pinned_before_the_other_windows_are_released(self) -> None:
         # Windows 2 and 3 start their own SSH sessions as soon as the zone file
-        # exists. Clearing after that write would let them race straight into
-        # the prompt this removes.
-        cleared = self.script.index("Clear-StalePuttyHostKey -HostAddresses")
+        # exists, so pinning after that write would let them race an unpinned host.
+        pinned = self.script.index("Assert-CloudSshIdentity -PythonExe")
         zone_file_written = self.script.index("Set-Content -LiteralPath $zoneFile")
-        self.assertLess(cleared, zone_file_written)
+        self.assertLess(pinned, zone_file_written)
 
-    def test_only_this_vm_s_cached_keys_are_removed(self) -> None:
-        # A blunt "wipe SshHostKeys" would silently discard every other host the
-        # operator has ever trusted on this laptop.
-        self.assertNotIn("Remove-Item -LiteralPath $cachePath", self.script)
-        self.assertIn("Remove-ItemProperty -LiteralPath $cachePath -Name $valueName", self.script)
-
-    def test_every_gcloud_ssh_call_declines_gcloud_s_own_prompts(self) -> None:
-        # Separate hang risk from PuTTY's: without --quiet, a laptop with no
-        # google_compute_engine key yet is asked for an SSH passphrase, and the
-        # piped "y" would be typed in as the passphrase.
-        calls = [
-            line for line in self.script.splitlines()
-            if "--strict-host-key-checking=no" in line
-        ]
-        self.assertTrue(calls)
-        for line in calls:
-            with self.subTest(line=line.strip()[:60]):
-                self.assertIn("'--quiet'", line)
+    def test_the_tunnel_and_command_paths_both_go_through_the_verified_helper(self) -> None:
+        # No raw `gcloud compute ssh` / `scp` calls may remain: they would route
+        # back through PuTTY and reintroduce the prompt.
+        for stale in ("'compute' 'ssh'", "'compute' 'scp'"):
+            with self.subTest(stale=stale):
+                self.assertNotIn(stale, self.script)
+        self.assertIn("function Invoke-VerifiedCloudSsh", self.script)
+        self.assertIn("function Invoke-VerifiedCloudScp", self.script)
 
     def test_the_wait_message_does_not_cry_wolf_after_one_minute(self) -> None:
         # Observed startup with capacity in the usual zone: ~79 seconds. The
