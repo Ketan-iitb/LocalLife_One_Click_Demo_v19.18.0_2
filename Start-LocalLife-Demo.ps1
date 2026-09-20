@@ -895,7 +895,27 @@ function Start-AppRole {
         'export LOCALLIFE_OPERATING_MODE=' + $OperatingMode + '; ' +
         "pkill -f '[l]ocallife_cloud.server' || true; " +
         'if [ -f .venv/bin/activate ]; then source .venv/bin/activate; fi; ' +
-        'python3 -m pip show locallife-cloud >/dev/null 2>&1 || python3 -m pip install -e . -q; ' +
+        # PEP 668: Debian 12+ / Python 3.12 images mark the system interpreter
+        # "externally managed" and refuse a plain pip install. --user keeps the
+        # install in ~/.local and --break-system-packages is what that refusal
+        # itself names as the override. Harmless on images without the marker.
+        'PIPFLAGS="--user --break-system-packages -q"; ' +
+        'python3 -m pip show locallife-cloud >/dev/null 2>&1 || ' +
+        'python3 -m pip install $PIPFLAGS -e . || ' +
+        'python3 -m pip install --user -q -e . || exit 1; ' +
+        # ultralytics depends on the GUI build of OpenCV, which needs libGL.so.1
+        # -- absent on a headless VM image, so `import cv2` dies with
+        # "libGL.so.1: cannot open shared object file" and takes the detector
+        # and both video streams down with it. Swap in the headless wheel, but
+        # only when cv2 is actually broken, so a healthy VM pays nothing.
+        'python3 -c "import cv2" >/dev/null 2>&1 || { ' +
+        'echo "LOCALLIFE: repairing OpenCV (headless VM has no libGL)"; ' +
+        'python3 -m pip uninstall -y -q opencv-python opencv-contrib-python >/dev/null 2>&1; ' +
+        'python3 -m pip install $PIPFLAGS --force-reinstall opencv-python-headless || ' +
+        'python3 -m pip install --user -q --force-reinstall opencv-python-headless; }; ' +
+        'python3 -c "import cv2" >/dev/null 2>&1 || { ' +
+        'echo "ERROR: OpenCV still will not import on this VM. Run: sudo apt-get install -y libgl1"; ' +
+        'exit 1; }; ' +
         'exec python3 -m locallife_cloud.server --host 127.0.0.1 --port ' + $Port
 
     $remoteBootstrap = ConvertTo-RemoteBootstrap -Command $remoteCommand

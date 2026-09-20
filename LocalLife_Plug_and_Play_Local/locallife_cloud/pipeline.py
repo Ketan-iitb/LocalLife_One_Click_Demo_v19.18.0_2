@@ -2470,6 +2470,12 @@ class VisionPipeline:
             return {
                 "camera_id": self.camera_id,
                 "camera_name": "Intel RealSense D435" if self.camera_id == "realsense" else "Logitech C920",
+                # How many objects this session has finalised into
+                # measurements.csv. A download that comes back with only a
+                # header is almost always this being zero because no empty-bin
+                # baseline was captured, so the page can say so instead of
+                # handing the operator a blank file with no explanation.
+                "measurements_recorded": len(self._csv_logged),
                 "measurement_method": (
                     "hardware-stereo-depth" if self.camera_id == "realsense"
                     else "local-rgb-tracking" if self.depth_estimator is None

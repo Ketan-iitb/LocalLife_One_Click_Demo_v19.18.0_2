@@ -213,3 +213,22 @@ class OperatorSessionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MeasurementCountTests(unittest.TestCase):
+    """The page must explain an empty CSV rather than just serving a header."""
+
+    def test_state_reports_how_many_measurements_were_finalised(self) -> None:
+        app, client, directory = _app()
+        self.addCleanup(directory.cleanup)
+        station = app.config["CAMERA_COORDINATOR"].camera("realsense")
+        self.assertEqual(client.get("/api/state").get_json()["measurements_recorded"], 0)
+        station._csv_logged.update({1, 2, 3})
+        self.assertEqual(client.get("/api/state").get_json()["measurements_recorded"], 3)
+
+    def test_the_page_explains_a_missing_baseline(self) -> None:
+        app, client, directory = _app()
+        self.addCleanup(directory.cleanup)
+        body = client.get("/").get_data(as_text=True)
+        self.assertIn("csv-note", body)
+        self.assertIn("SETUP / RECALIBRATE", body)
