@@ -1,4 +1,53 @@
-# LocalLife One-Click Demonstration — v19.22.0 (cloud + operator page)
+# LocalLife One-Click Demonstration — v19.23.0 (mode selector)
+
+**Branch `Working_branch_v21_cloud_local_launcher`**, from `Working_branch_v21_cloud` @ `e69df07`
+(which descends from `Working_branch_v20_deposit_isolation` @ `eb4b0cd`).
+
+The operator now chooses how to run the system before anything starts.
+
+```
+START_LOCAL_LIFE.cmd
+   -> control service (127.0.0.1:8765)
+   -> welcome page  "How would you like to run the system?"
+        [ Run Locally ]   [ Run with Cloud GPU ]   [ Try Cloud, Fall Back to Local ]
+   -> Start-LocalLife-Demo.ps1 -Mode Local | Cloud   (the existing launcher)
+   -> operator dashboard (127.0.0.1:8000)  ->  measurements.csv
+```
+
+A browser cannot start Python, cameras, PowerShell or an SSH tunnel on its own, so
+the launcher starts a small control service first and opens the welcome page against
+it. **That service binds to 127.0.0.1 only**, and the sole thing the page can
+influence is one enum — `local`, `cloud` or `auto`. The command is built from
+configuration, runs without a shell, and no request value is ever interpolated into it.
+
+**Modes.** *Local* never touches the VM and works with no internet. *Cloud* requires an
+explicit billing confirmation, and **fails loudly rather than downgrading** — claiming
+cloud while processing locally would corrupt every `processing_mode` field. *Automatic*
+tries cloud, and on failure records the reason and falls back to local (disable with
+`ALLOW_LOCAL_FALLBACK=false`). `CLOUD_STARTUP_TIMEOUT_SECONDS` guarantees a launch
+always resolves — there is no indefinite pending state.
+
+Both modes run the **same** pipeline, calibration and `measurements.csv` writer, so
+results are directly comparable. Selecting a mode does not alter the measurement path.
+
+**Configuration:** `.env.example` (placeholders only; `.env` is git-ignored). Google Cloud
+auth comes from the `gcloud` CLI login — no key file is read or stored.
+
+## Manual hardware checklist — not executed here
+
+Requires Windows, GCP credentials, the Pi, and both cameras:
+
+- [ ] `START_LOCAL_LIFE.cmd` opens the welcome page in the default browser
+- [ ] Pi / internet / cloud rows show real state; camera rows show "unknown" until started
+- [ ] **Run Locally** starts with the network cable unplugged
+- [ ] **Run with Cloud GPU** prompts for billing, starts the VM, and the dashboard shows `Cloud`
+- [ ] Preferred zone exhausted → `gpu.py` relocates and the VM disk is preserved
+- [ ] **Automatic** with `gcloud` signed out falls back to local and states the reason
+- [ ] One bag dropped → one dashboard row, one CSV row, count +1
+- [ ] Two touching bags → two separate events, no combined volume
+- [ ] `LocalLife_Stop.exe` flushes the CSV and stops the VM after confirmation
+
+# LocalLife One-Click Demonstration — v19.22.0 (cloud + operator page, previous)
 
 **Branch `Working_branch_v21_cloud`**, from `Working_branch_v20_deposit_isolation` @ `eb4b0cd`.
 

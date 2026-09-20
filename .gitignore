@@ -1,0 +1,3 @@
+
+# Local configuration with real values (template is .env.example)
+.env
