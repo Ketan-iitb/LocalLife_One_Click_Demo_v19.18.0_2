@@ -56,7 +56,14 @@ param(
     [string]$VmName = 'depth-l4',
 
     [ValidatePattern('^[a-z][-a-z0-9:.]*[a-z0-9]$')]
-    [string]$CloudProject = 'locallife-thesis-depth'
+    [string]$CloudProject = 'locallife-thesis-depth',
+
+    # Blank in Local mode, where there is no VM. Cloud mode overwrites it with
+    # the zone gpu.py actually landed in, which can differ from any default
+    # after a capacity move -- deliberately unvalidated, because a validation
+    # attribute here would also be enforced on that later assignment and could
+    # reject a perfectly good zone the tool discovered at runtime.
+    [string]$Zone = ''
 )
 
 Set-StrictMode -Version Latest
@@ -815,7 +822,13 @@ function Start-AppRole {
     # sign of what was looked for, or of what is actually on the VM, is the
     # hardest possible message to act on -- and the usual cause is SSHing into
     # a different project's VM than the one the upload went to.
-    $checkCommand = 'echo "LOCALLIFE_HOME_CONTENTS:"; ls -1 ~ 2>/dev/null | head -20; ' +
+    # Earlier builds uploaded to "vm:~/", which pscp turned into a directory
+    # literally named "~". Move anything stranded there back into the real home
+    # before checking, so an affected VM repairs itself instead of re-uploading
+    # gigabytes every run. mv only relocates; nothing is deleted.
+    $checkCommand = 'if [ -d "$HOME/~" ]; then echo "LOCALLIFE_REPAIRING_TILDE_DIR"; ' +
+        'mv -n "$HOME/~"/* "$HOME"/ 2>/dev/null; rmdir "$HOME/~" 2>/dev/null; fi; ' +
+        'echo "LOCALLIFE_HOME_CONTENTS:"; ls -1 ~ 2>/dev/null | head -20; ' +
         'if [ -d ~/' + $ProjectDirectory + '/locallife_cloud ]; then echo LOCALLIFE_PROJECT_PRESENT; ' +
         'else echo LOCALLIFE_PROJECT_MISSING; fi'
     $checkOutput = $script:PlinkHostKeyAutoAcceptLines | & $gcloudPath 'compute' 'ssh' $VmName ('--zone=' + $zone) ('--project=' + $CloudProject) `
@@ -826,8 +839,24 @@ function Start-AppRole {
     if (($checkOutput -join "`n") -notmatch 'LOCALLIFE_PROJECT_PRESENT') {
         Write-Step 'Project not found on the cloud VM -- uploading it now (first time only; can take several minutes)...'
         $projectRoot = Find-ProjectRoot
+        # Ask the VM where its home actually is, and upload to that absolute
+        # path. Windows' pscp.exe -- which `gcloud compute scp` shells out to --
+        # does NOT expand a leading "~": it treats it as an ordinary directory
+        # name. A destination of "vm:~/" therefore transfers every file
+        # successfully into a directory literally called "~", so the upload
+        # reports 100% while ~/<project> stays empty in any real shell.
+        $homeOutput = $script:PlinkHostKeyAutoAcceptLines | & $gcloudPath 'compute' 'ssh' $VmName ('--zone=' + $zone) ('--project=' + $CloudProject) `
+            '--strict-host-key-checking=no' '--command=echo LOCALLIFE_REMOTE_HOME=$HOME'
+        $remoteHome = ''
+        foreach ($line in @($homeOutput)) {
+            if ("$line" -match 'LOCALLIFE_REMOTE_HOME=(\S+)') { $remoteHome = $Matches[1] }
+        }
+        if ([string]::IsNullOrWhiteSpace($remoteHome)) {
+            throw 'Could not determine the cloud VM home directory over SSH; cannot upload the project safely.'
+        }
+        Write-Step ('Uploading to ' + $remoteHome + ' on ' + $VmName + '...')
         Invoke-NativeTolerantly $gcloudPath -StdinLines $script:PlinkHostKeyAutoAcceptLines 'compute' 'scp' '--recurse' ('--zone=' + $zone) ('--project=' + $CloudProject) `
-            '--strict-host-key-checking=no' $projectRoot ($VmName + ':~/')
+            '--strict-host-key-checking=no' $projectRoot ($VmName + ':' + $remoteHome + '/')
         if ($LASTEXITCODE -ne 0) {
             throw 'Could not upload the project to the cloud VM (see its output above). Run `python gpu.py ssh` and check disk space, or copy it manually.'
         }
