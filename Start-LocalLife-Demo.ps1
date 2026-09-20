@@ -706,6 +706,14 @@ function Start-AppRole {
                 $env:LOCALLIFE_API_TOKEN = $ApiToken
             }
             $env:LOCALLIFE_OPERATING_MODE = $OperatingMode
+            # The backend cannot see the VM itself; these tell the operator
+            # page which deployment it was started under so it can show
+            # "Cloud GPU" or "Local" honestly instead of guessing.
+            $env:CLOUD_ENABLED = $(if ($Mode -eq 'Cloud') { 'true' } else { 'false' })
+            $env:LOCALLIFE_GCP_PROJECT = $CloudProject
+            $env:LOCALLIFE_VM_NAME = $VmName
+            $env:LOCALLIFE_VM_ZONE = $Zone
+            $env:LOCALLIFE_PI_HOST = $PiHost
             Write-Step ('Operating mode: ' + $OperatingMode)
             # --disable-sync: the background bucket-sync thread (BucketSync
             # in storage.py) is a Cloud-mode concern -- syncing results to a

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
+import shutil
 import threading
 import time
 from collections import Counter
@@ -15,6 +17,7 @@ import numpy as np
 
 from . import __version__
 
+from .accuracy import fuse_pair_volume
 from .config import AppConfig
 from .geometry import fixed_bin_mask, is_phantom_source
 from .inference import MetricDepthEstimator, create_segmenter
@@ -103,6 +106,25 @@ def match_deposits(
             "matched_at": max(_event_time(left), _event_time(right)),
             "match_basis": "object-type-and-timestamp",
         })
+        # Operational fusion (ported from Accuracy Deployment v3.0): one
+        # weighted figure per matched physical drop, plus the colour the
+        # operator page shows. Raw per-camera values above are unchanged --
+        # fusion is an operational reading, never ground truth.
+        pair = pairs[-1]
+        fused = fuse_pair_volume(left, right)
+        pair["fused_volume_l"] = fused["volume_l"]
+        pair["fusion_reliability"] = fused["reliability"]
+        pair["realsense_weight"] = fused["realsense_weight"]
+        pair["logitech_weight"] = fused["logitech_weight"]
+        if pair["color_agreement"]:
+            pair["operational_color"] = pair["realsense_color"]
+        else:
+            left_confidence = float(left.get("color_confidence") or 0.0)
+            right_confidence = float(right.get("color_confidence") or 0.0)
+            pair["operational_color"] = (
+                pair["realsense_color"] if left_confidence >= right_confidence
+                else pair["logitech_color"]
+            )
     return pairs
 
 
@@ -344,6 +366,87 @@ class DualCameraCoordinator:
     def reference_trials(self) -> list[dict[str, Any]]:
         return self.store.read_jsonl(REFERENCE_FILE)
 
+    def operator_session(self) -> dict[str, Any]:
+        """The current operator session, created on first use and kept on disk."""
+        location = self.config.results_dir / "operator_session.json"
+        if location.is_file():
+            try:
+                payload = json.loads(location.read_text(encoding="utf-8"))
+                if isinstance(payload, dict) and payload.get("session_id"):
+                    return payload
+            except (OSError, json.JSONDecodeError):
+                pass
+        payload = {"session_id": uuid4().hex[:12], "started_at": time.time()}
+        location.parent.mkdir(parents=True, exist_ok=True)
+        location.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return payload
+
+    def update_color_map(self, mapping: dict[str, str]) -> dict[str, Any]:
+        """Set the operational colour-to-waste-stream labels.
+
+        These are operator labels only: the colour each camera actually
+        measured stays in the raw record untouched.
+        """
+        cleaned = {
+            str(key).strip().lower(): str(value).strip()
+            for key, value in mapping.items()
+            if str(key).strip() and str(value).strip()
+        }
+        self.config.color_waste_streams = cleaned
+        for station in self.pipelines.values():
+            station.config.color_waste_streams = dict(cleaned)
+            station.ledger.color_streams = dict(cleaned)
+        payload = {
+            "mapping": cleaned,
+            "updated_at": time.time(),
+            "note": "Mapping changes affect future operational interpretation; "
+                    "raw detected color remains stored.",
+        }
+        self.store.save_json("color_map.json", payload)
+        return payload
+
+    def start_new_operator_session(self) -> dict[str, Any]:
+        """Archive the finished session and start a clean one.
+
+        Nothing is deleted: each camera's ledger and the reference trials are
+        copied into results_dir/sessions/<stamp>-<id>/ before the live lists are
+        cleared, so restarting a session never destroys earlier measurements.
+        """
+        root = self.config.results_dir
+        previous = self.operator_session()
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+        archive = root / "sessions" / f"{stamp}-{previous['session_id']}"
+        archive.mkdir(parents=True, exist_ok=True)
+        copied: list[str] = []
+        for camera_id in CAMERA_IDS:
+            camera_results = self.camera(camera_id).config.results_dir
+            for name, saved_as in (
+                ("waste_plant_ledger.jsonl", f"{camera_id}_history.jsonl"),
+                ("measurements.csv", f"{camera_id}_measurements.csv"),
+            ):
+                source = camera_results / name
+                if source.is_file():
+                    shutil.copy2(source, archive / saved_as)
+                    copied.append(saved_as)
+        references = self.store.directory / REFERENCE_FILE
+        if references.is_file():
+            shutil.copy2(references, archive / REFERENCE_FILE)
+            copied.append(REFERENCE_FILE)
+        (archive / "session.json").write_text(
+            json.dumps({**previous, "ended_at": time.time(), "files": copied}, indent=2),
+            encoding="utf-8",
+        )
+        resets = {camera_id: self.camera(camera_id).clear_history() for camera_id in CAMERA_IDS}
+        if references.is_file():
+            references.unlink()
+        current = {
+            "session_id": uuid4().hex[:12],
+            "started_at": time.time(),
+            "previous_session_archive": str(archive),
+        }
+        (root / "operator_session.json").write_text(json.dumps(current, indent=2), encoding="utf-8")
+        return {**current, "reset": resets}
+
     def comparison(self) -> dict[str, Any]:
         pairs = self.pairs()
         differences = [float(pair["difference_l"]) for pair in pairs if pair["difference_l"] is not None]
@@ -360,7 +463,30 @@ class DualCameraCoordinator:
             webcam_errors.append(float(trial["logitech_volume_l"]) - known)
         hardware_total = self.camera("realsense").ledger.summary()["deposited_count"]
         webcam_total = self.camera("logitech").ledger.summary()["deposited_count"]
+        operational_colors: dict[str, dict[str, Any]] = {}
+        for pair in pairs:
+            color = str(pair.get("operational_color") or "unknown")
+            item = operational_colors.setdefault(color, {
+                "color": color, "count": 0, "volume_l": 0.0,
+                "waste_stream": self.config.color_waste_streams.get(color.lower()),
+            })
+            item["count"] += 1
+            item["volume_l"] += float(pair.get("fused_volume_l") or 0.0)
+        operational = {
+            "deposited_count": len(pairs),
+            "cumulative_volume_l": round(
+                sum(float(pair.get("fused_volume_l") or 0.0) for pair in pairs), 6
+            ),
+            "colors": sorted(
+                ({**item, "volume_l": round(float(item["volume_l"]), 6)}
+                 for item in operational_colors.values()),
+                key=lambda item: (-item["count"], item["color"]),
+            ),
+            "color_map": dict(self.config.color_waste_streams),
+            "note": "One matched physical drop is counted once; fusion is operational, not ground truth.",
+        }
         return {
+            "operational": operational,
             "paired_count": len(pairs),
             "realsense_unmatched": hardware_total - len(pairs),
             "logitech_unmatched": webcam_total - len(pairs),
@@ -594,7 +720,21 @@ class DualCameraCoordinator:
     def state(self) -> dict[str, Any]:
         states = {camera_id: station.state() for camera_id, station in self.pipelines.items()}
         # Preserve the previous single-camera API for existing RealSense bridges.
+        cloud = {
+            "enabled": bool(self.config.cloud_enabled),
+            "processing_mode": "cloud" if self.config.cloud_enabled else "local",
+            "project": self.config.cloud_project or None,
+            "vm_name": self.config.cloud_vm_name or None,
+            "zone": self.config.cloud_zone or None,
+            # Only the launcher knows whether the VM is actually up; the
+            # backend reports "unknown" rather than inventing a status.
+            "vm_status": self.config.cloud_vm_status or (
+                "unknown" if self.config.cloud_enabled else "not used"
+            ),
+            "pi_host": self.config.pi_host or None,
+        }
         return {**states["realsense"], "mode": "independent-dual-camera-comparison",
+                "cloud": cloud, "operator_session": self.operator_session(),
                 "operating_mode": self.config.operating_mode,
                 "build_version": __version__,
                 "frames_processed": self.frames_processed, "cameras": states, "comparison": self.comparison(),

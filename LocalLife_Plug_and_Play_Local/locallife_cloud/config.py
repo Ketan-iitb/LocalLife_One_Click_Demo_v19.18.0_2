@@ -246,6 +246,16 @@ class AppConfig:
     # difference against that fixed baseline instead of moving it. Off by
     # default; set LOCALLIFE_ADVANCE_REFERENCE_ON_DEPOSIT=true only for a bin
     # whose contents genuinely stay put.
+    # Cloud deployment (Windows launcher -> gpu.py -> GPU VM). The backend
+    # itself always runs the same pipeline; these describe which deployment it
+    # was started under so the operator page can show it, and are reported as
+    # unknown rather than guessed when the launcher did not set them.
+    cloud_enabled: bool = False
+    cloud_project: str = ""
+    cloud_vm_name: str = ""
+    cloud_zone: str = ""
+    cloud_vm_status: str = ""
+    pi_host: str = ""
     advance_reference_on_deposit: bool = False
     # A support plane is only valid for the pose it was fitted at. Beyond these
     # tolerances the calibration is marked invalid rather than silently reused
@@ -477,6 +487,12 @@ class AppConfig:
             camera_move_max_distance_m=float(os.environ.get(
                 "LOCALLIFE_CAMERA_MOVE_MAX_DISTANCE_M", defaults.camera_move_max_distance_m,
             )),
+            cloud_enabled=_bool_env("CLOUD_ENABLED", defaults.cloud_enabled),
+            cloud_project=os.environ.get("LOCALLIFE_GCP_PROJECT", defaults.cloud_project),
+            cloud_vm_name=os.environ.get("LOCALLIFE_VM_NAME", defaults.cloud_vm_name),
+            cloud_zone=os.environ.get("LOCALLIFE_VM_ZONE", defaults.cloud_zone),
+            cloud_vm_status=os.environ.get("LOCALLIFE_VM_STATUS", defaults.cloud_vm_status),
+            pi_host=os.environ.get("LOCALLIFE_PI_HOST", defaults.pi_host),
             advance_reference_on_deposit=_bool_env(
                 "LOCALLIFE_ADVANCE_REFERENCE_ON_DEPOSIT", defaults.advance_reference_on_deposit,
             ),

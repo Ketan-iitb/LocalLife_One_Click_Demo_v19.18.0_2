@@ -1,0 +1,126 @@
+﻿LOCAL LIFE WASTE MEASUREMENT
+WINDOWS DEPLOYMENT v3.2
+========================================
+
+FOR NORMAL USERS
+----------------
+You do NOT need to open the "app" folder.
+You do NOT need to type commands.
+
+There are only three programs you normally need:
+
+1. LocalLife.exe
+   STARTS the complete Local Life system.
+
+2. LocalLife_Stop.exe
+   SAFELY saves the cloud home directory and stops the GPU VM when work is finished.
+
+3. LocalLife_Check.exe
+   Checks the installation if Local Life will not start.
+
+
+FIRST TIME ON A WINDOWS COMPUTER
+--------------------------------
+Before starting, confirm:
+
+[ ] Raspberry Pi is powered on.
+[ ] Intel RealSense D435 is connected to the Raspberry Pi.
+[ ] Logitech C920 is connected to the Raspberry Pi.
+[ ] Windows laptop has internet access.
+[ ] Windows laptop can reach the Raspberry Pi network.
+[ ] Google Cloud CLI (gcloud) is installed and signed into the authorised Local Life account.
+[ ] Python 3 is installed. The existing Local Life laptop already used Python/gpu.py successfully.
+
+IMPORTANT: Extract the COMPLETE ZIP first.
+Do not run LocalLife.exe while it is still inside the ZIP preview.
+Do not move LocalLife.exe away from the "app" folder.
+
+
+HOW TO START
+------------
+1. Extract the ZIP to Desktop or Documents.
+2. Open the extracted folder.
+3. Double-click:
+
+       LocalLife.exe
+
+4. A Local Life status window will open.
+5. Leave it open while startup completes.
+6. The system will automatically:
+   - find/start the available GPU VM,
+   - update the cloud deployment when needed,
+   - update the Raspberry Pi camera client when needed,
+   - start both camera pipelines,
+   - verify the dashboard,
+   - open the Local Life operator page in the browser.
+
+The normal operator page should show:
+   Accuracy Deployment v3.0 (or later)
+   Camera 1 / RealSense
+   Camera 2 / Logitech
+   setup status
+   current drop
+   session totals
+   colour/waste-stream totals
+
+Research / Advanced Mode remains available from the operator page.
+
+
+HOW TO STOP AT THE END OF THE DAY
+---------------------------------
+1. Close/finish the operator session normally.
+2. Double-click:
+
+       LocalLife_Stop.exe
+
+3. Follow the question about stopping the cloud VM.
+4. Choose to stop it when work is finished so unnecessary GPU charges are avoided.
+
+Closing only the web browser does NOT necessarily stop the cloud VM.
+
+
+IF SOMETHING DOES NOT WORK
+--------------------------
+First double-click:
+
+       LocalLife_Check.exe
+
+It will check the important Windows/cloud setup.
+
+If it still fails:
+1. Do NOT repeatedly change random settings.
+2. Take a screenshot of the complete Local Life error window.
+3. Take a screenshot of the browser if it opened.
+4. Send both screenshots to the project owner.
+
+
+WINDOWS SECURITY NOTICE
+-----------------------
+These EXE files are custom thesis/prototype launchers and are not commercially code-signed.
+Windows may therefore show an unfamiliar-app/security warning on some computers.
+Only run this package on a computer where you trust the Local Life project files and their source.
+Do not disable Windows security software.
+
+
+WHAT IS INSIDE THE "app" FOLDER?
+---------------------------------
+The app folder contains the deployment scripts and GPU manager used by the EXE launchers.
+Normal operators should leave this folder unchanged.
+
+Do not rename, delete, or move individual files inside it.
+
+
+QUICK REFERENCE
+---------------
+Start system     -> LocalLife.exe
+Stop system      -> LocalLife_Stop.exe
+Check system     -> LocalLife_Check.exe
+Instructions     -> HOW_TO_RUN.txt
+Technical files  -> app folder (do not touch during normal use)
+
+
+V3.2 FIX
+--------
+This build fixes a Windows PowerShell 5.1 encoding issue that could falsely report
+"Operator interface verification failed" even when the v3 operator page was running.
+The startup verification now uses ASCII-only markers and prints a page preview if it ever fails.
