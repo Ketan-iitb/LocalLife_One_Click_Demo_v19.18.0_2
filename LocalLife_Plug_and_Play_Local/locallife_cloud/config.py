@@ -256,6 +256,13 @@ class AppConfig:
     cloud_zone: str = ""
     cloud_vm_status: str = ""
     pi_host: str = ""
+    # Welcome-page / run-mode selector (launcher_service.py).
+    local_api_port: int = 8765
+    default_run_mode: str = "ask"
+    allow_local_fallback: bool = True
+    cloud_startup_timeout_seconds: int = 90
+    cloud_request_timeout_seconds: int = 30
+    bin_waste_stream: str = ""
     advance_reference_on_deposit: bool = False
     # A support plane is only valid for the pose it was fitted at. Beyond these
     # tolerances the calibration is marked invalid rather than silently reused
@@ -492,7 +499,15 @@ class AppConfig:
             cloud_vm_name=os.environ.get("LOCALLIFE_VM_NAME", defaults.cloud_vm_name),
             cloud_zone=os.environ.get("LOCALLIFE_VM_ZONE", defaults.cloud_zone),
             cloud_vm_status=os.environ.get("LOCALLIFE_VM_STATUS", defaults.cloud_vm_status),
-            pi_host=os.environ.get("LOCALLIFE_PI_HOST", defaults.pi_host),
+            pi_host=os.environ.get("PI_HOST", os.environ.get("LOCALLIFE_PI_HOST", defaults.pi_host)),
+            local_api_port=int(os.environ.get("LOCAL_API_PORT", defaults.local_api_port)),
+            default_run_mode=os.environ.get("DEFAULT_RUN_MODE", defaults.default_run_mode),
+            allow_local_fallback=_bool_env("ALLOW_LOCAL_FALLBACK", defaults.allow_local_fallback),
+            cloud_startup_timeout_seconds=int(os.environ.get(
+                "CLOUD_STARTUP_TIMEOUT_SECONDS", defaults.cloud_startup_timeout_seconds)),
+            cloud_request_timeout_seconds=int(os.environ.get(
+                "CLOUD_REQUEST_TIMEOUT_SECONDS", defaults.cloud_request_timeout_seconds)),
+            bin_waste_stream=os.environ.get("BIN_WASTE_STREAM", defaults.bin_waste_stream),
             advance_reference_on_deposit=_bool_env(
                 "LOCALLIFE_ADVANCE_REFERENCE_ON_DEPOSIT", defaults.advance_reference_on_deposit,
             ),
