@@ -290,8 +290,12 @@ function Assert-CloudSshIdentity {
     $previousPythonPath = $env:PYTHONPATH
     $env:PYTHONPATH = $projectRoot
     try {
+        # Hand over the gcloud path this script already resolved: on Windows
+        # gcloud is a .cmd, which Python's subprocess does not find from the
+        # bare name.
         $raw = (& $PythonExe '-m' 'locallife_cloud.cloud_ssh' `
             '--vm' $VmName '--zone' $Zone '--project' $CloudProject `
+            '--gcloud' (Assert-GcloudAvailable) `
             '--known-hosts' $knownHosts 2>$errorFile | Out-String)
         $verifyExitCode = $LASTEXITCODE
     }
@@ -316,6 +320,14 @@ function Assert-CloudSshIdentity {
         $detail = $errorText
         if ([string]::IsNullOrWhiteSpace($detail)) { $detail = $raw.Trim() }
         if ([string]::IsNullOrWhiteSpace($detail)) { $detail = '(no output; exit code ' + $verifyExitCode + ')' }
+        # A multi-line traceback shows only its first line ("Traceback (most
+        # recent call last):") once it is inside a thrown message, which is the
+        # one line carrying no information. Print it in full first, then throw a
+        # single-line summary.
+        Write-Host '--- VM identity check output ---' -ForegroundColor Yellow
+        Write-Host $detail -ForegroundColor Yellow
+        Write-Host ('--- (also saved to ' + $errorFile + ') ---') -ForegroundColor Yellow
+        $detail = (($detail -split "`r?`n" | Where-Object { $_.Trim() -ne '' } | Select-Object -Last 1) + '')
         if ($detail -match 'ModuleNotFoundError|No module named') {
             throw ('The VM identity check could not run: Python could not import locallife_cloud from ' +
                    $projectRoot + '. Confirm that folder contains locallife_cloud\. Details: ' + $detail)

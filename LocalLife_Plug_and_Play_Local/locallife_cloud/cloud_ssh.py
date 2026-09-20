@@ -41,6 +41,7 @@ import base64
 import hashlib
 import json
 import logging
+import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -201,9 +202,35 @@ def parse_serial_host_keys(output: str) -> list[HostKey]:
 
 
 def _run(command: Sequence[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        list(command), capture_output=True, text=True, check=False, timeout=120,
-    )
+    """Run a command, turning every launch failure into an ordinary result.
+
+    Two Windows-specific traps, both of which crashed a real run:
+
+    * gcloud on Windows is `gcloud.cmd`, and subprocess without a shell resolves
+      only `.exe` -- so a bare "gcloud" raises FileNotFoundError before the
+      command ever starts. `shutil.which` applies PATHEXT and finds it.
+    * a raised OSError escaped all the way out of the CLI as a traceback, which
+      told the operator nothing. Every failure here becomes a non-zero result
+      the caller can report properly.
+    """
+    arguments = list(command)
+    resolved = shutil.which(arguments[0])
+    if resolved:
+        arguments[0] = resolved
+    try:
+        return subprocess.run(
+            arguments, capture_output=True, text=True, check=False, timeout=120,
+        )
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(
+            arguments, 1, "",
+            f"{command[0]} was not found on PATH. Install the Google Cloud CLI, "
+            "or open a new terminal so PATH is picked up.",
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(arguments, 1, "", f"{command[0]} timed out")
+    except OSError as exc:
+        return subprocess.CompletedProcess(arguments, 1, "", f"{command[0]} could not run: {exc}")
 
 
 class CloudSshVerifier:
@@ -421,10 +448,22 @@ def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover - CLI
     parser.add_argument("--known-hosts", required=True)
     parser.add_argument("--gcloud", default="gcloud")
     arguments = parser.parse_args(argv)
-    report = verify_cloud_ssh(
-        arguments.vm, arguments.zone, arguments.project,
-        Path(arguments.known_hosts), gcloud=arguments.gcloud,
-    )
+    try:
+        report = verify_cloud_ssh(
+            arguments.vm, arguments.zone, arguments.project,
+            Path(arguments.known_hosts), gcloud=arguments.gcloud,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # A bare traceback on stderr told a real operator nothing. The caller
+        # parses one JSON object, so an unexpected failure has to arrive in that
+        # shape too -- with the detail, not instead of it.
+        import traceback
+
+        report = VerificationResult(
+            status=STATUS_VERIFYING,
+            error=f"{type(exc).__name__}: {exc}",
+        ).to_dict()
+        report["traceback"] = traceback.format_exc().strip().splitlines()[-3:]
     print(json.dumps(report))
     return 0 if report["verified"] else 2
 

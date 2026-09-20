@@ -567,3 +567,54 @@ class BenchmarkRouteTests(unittest.TestCase):
 
         self.assertFalse(AppConfig().benchmark_mode)
         self.assertFalse(AppConfig().record_benchmark_evidence)
+
+
+class VerifierRobustnessTests(unittest.TestCase):
+    """A launch failure must arrive as a verdict, never as a traceback.
+
+    A real Windows run crashed here: gcloud is `gcloud.cmd`, which subprocess
+    does not resolve from the bare name, so FileNotFoundError escaped the CLI
+    and the operator saw "Traceback (most recent call last):" and nothing else.
+    """
+
+    def setUp(self) -> None:
+        self._directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        self.known_hosts = Path(self._directory.name) / "kh"
+
+    def test_a_missing_executable_becomes_a_reported_failure(self) -> None:
+        from locallife_cloud.cloud_ssh import _run
+
+        completed = _run(["definitely-not-a-real-command-xyz", "--help"])
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("was not found on PATH", completed.stderr)
+
+    def test_a_missing_gcloud_yields_a_verdict_not_a_crash(self) -> None:
+        from locallife_cloud.cloud_ssh import verify_cloud_ssh
+
+        report = verify_cloud_ssh(
+            "depth-l4", "europe-west4-c", "p", self.known_hosts,
+            gcloud="definitely-not-a-real-command-xyz",
+        )
+        self.assertFalse(report["verified"])
+        self.assertIn("not found on PATH", report["error"])
+
+    def test_the_cli_prints_json_even_when_something_unexpected_raises(self) -> None:
+        import io as _io
+        from contextlib import redirect_stdout
+        from unittest.mock import patch
+
+        from locallife_cloud import cloud_ssh
+
+        buffer = _io.StringIO()
+        with patch.object(cloud_ssh, "verify_cloud_ssh", side_effect=RuntimeError("boom")):
+            with redirect_stdout(buffer):
+                code = cloud_ssh.main([
+                    "--vm", "v", "--zone", "z", "--project", "p",
+                    "--known-hosts", str(self.known_hosts),
+                ])
+        self.assertEqual(code, 2)
+        payload = json.loads(buffer.getvalue())
+        self.assertFalse(payload["verified"])
+        self.assertIn("boom", payload["error"])
+        self.assertTrue(payload["traceback"])
