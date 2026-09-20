@@ -115,6 +115,12 @@ class LaunchController:
         None (rendered "unknown"), never as a confident yes or no. Camera state
         in particular belongs to the backend, which is not running yet.
         """
+        launcher_script: str | None = None
+        launcher_error: str | None = None
+        try:
+            launcher_script = str(self.resolve_launcher_script())
+        except FileNotFoundError as exc:
+            launcher_error = str(exc)
         pi_name, pi_port = _split_pi_host(self.config.pi_host)
         internet = _port_open("8.8.8.8", 53, timeout=1.5)
         gcloud = shutil.which("gcloud") is not None
@@ -137,6 +143,12 @@ class LaunchController:
             "allow_local_fallback": self.config.allow_local_fallback,
             "default_run_mode": self.config.default_run_mode,
             "cloud_startup_timeout_seconds": self.config.cloud_startup_timeout_seconds,
+            # Shown in the diagnostics block: when a start fails on the script
+            # path, the page should say which file it found rather than making
+            # the operator guess.
+            "launcher_script": launcher_script,
+            "launcher_script_error": launcher_error,
+            "working_directory": str(Path.cwd()),
         }
 
     # --------------------------------------------------------------- running

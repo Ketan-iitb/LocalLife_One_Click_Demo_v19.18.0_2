@@ -309,3 +309,24 @@ class CloudDefaultsTests(unittest.TestCase):
 
     def test_cloud_project_overrides_the_default_project_id(self) -> None:
         self.assertEqual(AppConfig(cloud_project="other-project").gcp_project, "other-project")
+
+
+class LauncherDiagnosticsTests(unittest.TestCase):
+    """The page must be able to show which script path the service resolved."""
+
+    def test_readiness_reports_the_resolved_script_and_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            readiness = LaunchController(_config(directory)).readiness()
+            self.assertIsNone(readiness["launcher_script_error"])
+            self.assertTrue(readiness["launcher_script"].endswith("Start-LocalLife-Demo.ps1"))
+            self.assertTrue(Path(readiness["launcher_script"]).is_file())
+            self.assertTrue(readiness["working_directory"])
+
+    def test_a_missing_script_is_reported_rather_than_raising(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            control = LaunchController(
+                _config(directory), launcher_script=Path(directory) / "gone.ps1",
+            )
+            readiness = control.readiness()
+            self.assertIsNone(readiness["launcher_script"])
+            self.assertIn("gone.ps1", readiness["launcher_script_error"])

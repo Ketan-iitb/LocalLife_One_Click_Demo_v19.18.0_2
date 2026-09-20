@@ -94,6 +94,7 @@ function render(){if(!ready)return;
   $('overall').className='status-pill '+(ready.cloud_available?'ok':(good?'warn':'bad'));
   $('overall').textContent=ready.cloud_available?'● READY':(good?'● LOCAL ONLY':'● OFFLINE');
   $('diag').textContent=JSON.stringify({readiness:ready,launch:launch},null,2);
+  if(ready.launcher_script_error){$('overall').className='status-pill bad';$('overall').textContent='● SETUP PROBLEM';}
 }
 async function refresh(){try{const d=await api('/api/launcher/status');ready=d.readiness;launch=d.launch;render();renderLaunch()}catch(e){$('overall').className='status-pill bad';$('overall').textContent='● CONTROL SERVICE LOST'}}
 function renderLaunch(){if(!launch||launch.phase==='idle')return;
