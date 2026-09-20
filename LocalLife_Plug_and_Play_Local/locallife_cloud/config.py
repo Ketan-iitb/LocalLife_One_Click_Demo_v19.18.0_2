@@ -367,6 +367,17 @@ class AppConfig:
     bin_polygon: tuple[tuple[float, float], ...] = ()
     color_waste_streams: dict[str, str] = field(default_factory=dict)
     auto_deposit: bool = True
+    # Whether the measurement history (waste ledger) records deposits.
+    #
+    # None means "follow operating_mode", which is the behaviour every earlier
+    # build had. The operator's enable/disable button sets it explicitly, and
+    # that matters: tying the ledger to operating_mode meant switching history
+    # on also switched the *classifier* to strict waste mode, where only
+    # plastic bags, paper bags and cardboard boxes are accepted -- so a
+    # backpack, a box, or anything else being measured simply stopped being
+    # detected. Recording history and restricting what counts as waste are two
+    # different decisions, so they are two different settings.
+    ledger_enabled: bool | None = None
     settle_frames: int = 5
     settle_volume_tolerance: float = 0.12
     volume_stability_frames: int = 3
@@ -672,6 +683,18 @@ class AppConfig:
     def gcp_project(self) -> str:
         """The project cloud calls target; `cloud_project` overrides `project_id`."""
         return self.cloud_project or self.project_id
+
+    @property
+    def ledger_active(self) -> bool:
+        """Is the measurement history recording right now?
+
+        Independent of `operating_mode`, so geometry-validation runs -- which
+        detect any object rather than only the three waste classes -- can still
+        record their deposits.
+        """
+        if self.ledger_enabled is None:
+            return self.operating_mode == "waste"
+        return self.ledger_enabled
 
     @property
     def processing_mode(self) -> str:

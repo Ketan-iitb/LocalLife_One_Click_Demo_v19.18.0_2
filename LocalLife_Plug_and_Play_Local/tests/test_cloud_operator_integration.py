@@ -262,26 +262,59 @@ class WasteLedgerToggleTests(unittest.TestCase):
     def test_the_toggle_switches_every_station_not_just_the_coordinator(self) -> None:
         # Each station holds its own replace()d config copy.
         self.client.post("/api/waste-ledger", json={"enabled": False})
-        self.assertEqual(self.manager.config.operating_mode, "geometry_validation")
+        self.assertFalse(self.manager.config.ledger_active)
         for camera_id in ("realsense", "logitech"):
             with self.subTest(camera=camera_id):
-                self.assertEqual(
-                    self.manager.camera(camera_id).config.operating_mode,
-                    "geometry_validation",
-                )
+                self.assertFalse(self.manager.camera(camera_id).config.ledger_active)
+
+    def test_the_toggle_never_changes_what_the_detector_accepts(self) -> None:
+        # The bug this replaces: switching history on also switched the
+        # classifier to strict waste mode, where only plastic bags, paper bags
+        # and cardboard boxes count -- so a backpack stopped being detected at
+        # all. operating_mode must not move.
+        for mode in ("waste", "geometry_validation"):
+            with self.subTest(mode=mode):
+                app, client, directory = _app(operating_mode=mode)
+                self.addCleanup(directory.cleanup)
+                manager = app.config["CAMERA_COORDINATOR"]
+                for enabled in (True, False, True):
+                    client.post("/api/waste-ledger", json={"enabled": enabled})
+                    self.assertEqual(manager.config.operating_mode, mode)
+                    for camera_id in ("realsense", "logitech"):
+                        self.assertEqual(
+                            manager.camera(camera_id).config.operating_mode, mode
+                        )
+
+    def test_history_can_record_in_geometry_validation_mode(self) -> None:
+        # The combination the operator actually needs: detect any object, and
+        # still record the deposits.
+        app, client, directory = _app(operating_mode="geometry_validation")
+        self.addCleanup(directory.cleanup)
+        manager = app.config["CAMERA_COORDINATOR"]
+        self.assertFalse(manager.config.ledger_active)
+        client.post("/api/waste-ledger", json={"enabled": True})
+        self.assertTrue(manager.config.ledger_active)
+        self.assertEqual(manager.config.operating_mode, "geometry_validation")
+        camera = client.get("/api/state").get_json()["cameras"]["realsense"]
+        self.assertTrue(camera["waste_ledger_enabled"])
+        self.assertEqual(camera["operating_mode"], "geometry_validation")
+
+    def test_untouched_config_still_follows_the_operating_mode(self) -> None:
+        # Nothing changes until the button is pressed.
+        self.assertTrue(AppConfig(operating_mode="waste").ledger_active)
+        self.assertFalse(AppConfig(operating_mode="geometry_validation").ledger_active)
 
     def test_enabling_turns_the_ledger_back_on(self) -> None:
         self.client.post("/api/waste-ledger", json={"enabled": False})
         response = self.client.post("/api/waste-ledger", json={"enabled": True})
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.get_json()["waste_ledger_enabled"])
-        self.assertEqual(self.manager.camera("realsense").config.operating_mode, "waste")
+        self.assertTrue(self.manager.camera("realsense").config.ledger_active)
 
     def test_the_state_reports_the_switch_position(self) -> None:
         self.client.post("/api/waste-ledger", json={"enabled": False})
         camera = self.client.get("/api/state").get_json()["cameras"]["realsense"]
         self.assertFalse(camera["waste_ledger_enabled"])
-        self.assertEqual(camera["operating_mode"], "geometry_validation")
 
     def test_a_non_boolean_is_rejected(self) -> None:
         for bad in ({"enabled": "yes"}, {"enabled": 1}, {}):

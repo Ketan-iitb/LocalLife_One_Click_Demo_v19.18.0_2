@@ -1799,7 +1799,7 @@ class VisionPipeline:
                 should_observe = should_observe and self._measurement_is_recordable(detection)
             # A track can become measurable several frames after it was born.
             # Check on every confirmed frame, not only when its ID is new.
-            if self.config.operating_mode == "waste":
+            if self.config.ledger_active:
                 if should_observe:
                     self.ledger.observe(detection, timestamp=timestamp)
                 # Preserve production behavior: an already-observed record
@@ -1808,7 +1808,7 @@ class VisionPipeline:
                 self.ledger.refresh(detection)
 
         newly_deposited: list[Detection] = []
-        if self.config.auto_deposit and self.config.operating_mode == "waste":
+        if self.config.auto_deposit and self.config.ledger_active:
             for detection in detections:
                 if detection.track_id is None or self.ledger.is_deposited(detection.track_id):
                     continue
@@ -2551,7 +2551,7 @@ class VisionPipeline:
                 "camera_intrinsics_origin": self.latest_intrinsics_origin,
                 "volume_status": volume_status,
                 "operating_mode": self.config.operating_mode,
-                "waste_ledger_enabled": self.config.operating_mode == "waste",
+                "waste_ledger_enabled": self.config.ledger_active,
                 "allow_unclassified_foreground": self.config.allow_unclassified_foreground,
                 "bag_only": self.config.bag_only,
                 "baseline_frame_count": self.baseline_frame_count,
@@ -2660,7 +2660,7 @@ class VisionPipeline:
         validation runs used to produce no spreadsheet at all -- so here a
         settled, non-phantom, measured track is the finalised event.
         """
-        if self.config.operating_mode == "waste" and self.config.auto_deposit:
+        if self.config.ledger_active and self.config.auto_deposit:
             return
         for detection in detections:
             if detection.track_id is None or detection.track_id in self._csv_logged:
