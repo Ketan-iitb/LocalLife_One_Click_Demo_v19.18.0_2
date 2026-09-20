@@ -19,6 +19,7 @@ from . import __version__
 from .comparison import DualCameraCoordinator, infer_camera_id
 from .config import AppConfig
 from .dashboard import DUAL_DASHBOARD
+from .operator_dashboard import OPERATOR_DASHBOARD
 from .pipeline import VisionPipeline
 from .storage import BucketSync
 from .streaming import LatestFrameProcessor
@@ -196,12 +197,41 @@ def create_app(
 
     @app.get("/")
     def index() -> str:
-        # The dashboard's own POST calls (baseline/reset/calibrate/reference-
-        # distance) hit @protected endpoints; when LOCALLIFE_API_TOKEN is set
-        # (required whenever --host binds outside localhost, e.g. the normal
-        # 0.0.0.0 launcher run) those calls need the token too, so it is
-        # embedded into the page here and attached by the JS fetch calls.
+        """Operator page (Accuracy Deployment v3.0) -- the default landing page."""
+        return render_template_string(OPERATOR_DASHBOARD, api_token=settings.api_token)
+
+    @app.get("/research")
+    def research_dashboard() -> str:
+        # The research page's own POST calls (baseline/reset/calibrate/
+        # reference-distance) hit @protected endpoints; when
+        # LOCALLIFE_API_TOKEN is set (required whenever --host binds outside
+        # localhost, e.g. the normal 0.0.0.0 launcher run) those calls need the
+        # token too, so it is embedded into the page here and attached by the
+        # JS fetch calls.
         return render_template_string(DUAL_DASHBOARD, api_token=settings.api_token)
+
+    @app.get("/api/color-map")
+    def get_color_map() -> Any:
+        return jsonify(mapping=dict(manager.config.color_waste_streams))
+
+    @app.post("/api/color-map")
+    @protected
+    def set_color_map() -> Any:
+        payload = request.get_json(silent=True) or {}
+        mapping = payload.get("mapping")
+        if not isinstance(mapping, dict):
+            return jsonify(
+                error="Provide mapping as a JSON object of color to content label"
+            ), 400
+        return jsonify(ok=True, **manager.update_color_map(mapping))
+
+    @app.post("/api/operator/session/new")
+    @protected
+    def new_operator_session() -> Any:
+        try:
+            return jsonify(ok=True, session=manager.start_new_operator_session())
+        except (OSError, ValueError) as exc:
+            return jsonify(error=str(exc)), 400
 
     @app.get("/health")
     def health() -> Any:
@@ -254,6 +284,38 @@ def create_app(
             output.getvalue(),
             mimetype="text/csv",
             headers={"Content-Disposition": f"attachment; filename={camera_id}_waste_plant_history.csv"},
+        )
+
+    @app.get("/api/measurements.csv")
+    @app.get("/api/cameras/<camera_id>/measurements.csv")
+    def measurements_csv(camera_id: str = "realsense") -> Response | tuple[Any, int]:
+        """The per-object measurement log, in every operating mode.
+
+        The waste-ledger export below is empty in geometry_validation mode
+        because that mode deliberately disables the ledger; this file is written
+        by the pipeline itself for every finalised object, so it is what an
+        operator should download. A run with no completed measurements yet
+        returns the header alone rather than an empty file.
+        """
+        try:
+            station = manager.camera(camera_id)
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 404
+        path = station.store.directory / "measurements.csv"
+        columns = list(station.MEASUREMENT_CSV_COLUMNS)
+        if path.is_file():
+            body = path.read_text(encoding="utf-8")
+        else:
+            output = io.StringIO()
+            csv.DictWriter(output, fieldnames=columns).writeheader()
+            body = output.getvalue()
+        return Response(
+            body,
+            mimetype="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition":
+                    f"attachment; filename={camera_id}_measurements.csv",
+            },
         )
 
     @app.get("/api/comparison")
