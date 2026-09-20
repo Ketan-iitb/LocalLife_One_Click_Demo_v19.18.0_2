@@ -283,6 +283,52 @@ class StartupStateMachineTests(unittest.TestCase):
         self.assertTrue(state["facts"]["ssh_verified"])
 
 
+class DeploymentVersionTests(unittest.TestCase):
+    """Skipping an unnecessary upload, and catching a stale one."""
+
+    def setUp(self) -> None:
+        self._directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        self.root = Path(self._directory.name)
+        (self.root / "pkg").mkdir()
+        (self.root / "pkg" / "a.py").write_text("x = 1\n", encoding="utf-8")
+
+    def _version(self) -> str:
+        from locallife_cloud.cloud_startup import deployment_version
+
+        return deployment_version(self.root)
+
+    def test_unchanged_sources_produce_the_same_version(self) -> None:
+        self.assertEqual(self._version(), self._version())
+
+    def test_changed_sources_produce_a_different_version(self) -> None:
+        before = self._version()
+        (self.root / "pkg" / "a.py").write_text("x = 2\n", encoding="utf-8")
+        self.assertNotEqual(before, self._version())
+
+    def test_a_renamed_file_changes_the_version(self) -> None:
+        before = self._version()
+        (self.root / "pkg" / "a.py").rename(self.root / "pkg" / "b.py")
+        self.assertNotEqual(before, self._version())
+
+    def test_touching_a_file_does_not_change_the_version(self) -> None:
+        # Content-addressed, not timestamp-based: a fresh checkout on the laptop
+        # must not look like a change to the VM.
+        import os
+
+        before = self._version()
+        os.utime(self.root / "pkg" / "a.py", (0, 0))
+        self.assertEqual(before, self._version())
+
+    def test_build_artifacts_are_ignored(self) -> None:
+        before = self._version()
+        cache = self.root / "pkg" / "__pycache__"
+        cache.mkdir()
+        (cache / "a.cpython-311.pyc").write_bytes(b"\x00\x01")
+        (cache / "stray.py").write_text("noise\n", encoding="utf-8")
+        self.assertEqual(before, self._version())
+
+
 class BenchmarkMetricTests(unittest.TestCase):
     def _session(self, mode: str = "local", input_id: str = "clip-1") -> BenchmarkSession:
         session = BenchmarkSession("s1", mode, recorded_input_id=input_id)
@@ -395,3 +441,61 @@ class BenchmarkMetricTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BenchmarkRouteTests(unittest.TestCase):
+    """Benchmark mode reachable from the dashboard, with an honest verdict."""
+
+    def setUp(self) -> None:
+        from locallife_cloud.comparison import DualCameraCoordinator
+        from locallife_cloud.config import AppConfig
+        from locallife_cloud.server import create_app
+
+        self._directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        config = AppConfig(
+            detector_model="local-opencv-background",
+            results_dir=Path(self._directory.name),
+            enable_monocular_depth=False,
+            enable_material_classification=False,
+            enable_bucket_sync=False,
+            restore_saved_baseline=False,
+            benchmark_mode=True,
+            benchmark_input_id="clip-1",
+        )
+        self.coordinator = DualCameraCoordinator(config)
+        self.client = create_app(config, self.coordinator).test_client()
+
+    def test_benchmark_state_is_served(self) -> None:
+        payload = self.client.get("/api/benchmark").get_json()
+        self.assertTrue(payload["enabled"])
+        self.assertEqual(payload["recorded_input_id"], "clip-1")
+        # Nothing measured yet: it must say so, not claim a winner.
+        self.assertFalse(payload["verdict"]["comparable"])
+        self.assertIn("Run both modes", payload["verdict"]["note"])
+
+    def test_both_modes_share_the_recorded_input_id(self) -> None:
+        local = self.coordinator.benchmark_session("local")
+        cloud = self.coordinator.benchmark_session("cloud")
+        self.assertEqual(local.recorded_input_id, cloud.recorded_input_id)
+        self.assertEqual(local.session_id, cloud.session_id)
+
+    def test_the_benchmark_csv_downloads_with_the_required_columns(self) -> None:
+        session = self.coordinator.benchmark_session("local")
+        sample = session.record_capture(1)
+        session.record_submitted(sample)
+        sample.inference_started_at = sample.captured_at + 0.01
+        sample.inference_finished_at = sample.captured_at + 0.05
+        sample.result_available_at = sample.captured_at + 0.06
+        response = self.client.get("/api/benchmark.csv")
+        self.assertEqual(response.headers["Content-Type"], "text/csv; charset=utf-8")
+        self.assertIn("attachment; filename=benchmark.csv", response.headers["Content-Disposition"])
+        rows = list(csv.DictReader(io.StringIO(response.get_data(as_text=True))))
+        self.assertEqual(list(rows[0]), BENCHMARK_COLUMNS)
+        self.assertEqual(rows[0]["processing_mode"], "local")
+
+    def test_benchmark_mode_is_off_by_default(self) -> None:
+        from locallife_cloud.config import AppConfig
+
+        self.assertFalse(AppConfig().benchmark_mode)
+        self.assertFalse(AppConfig().record_benchmark_evidence)

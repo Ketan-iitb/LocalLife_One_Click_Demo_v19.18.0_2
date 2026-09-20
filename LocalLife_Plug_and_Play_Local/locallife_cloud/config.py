@@ -270,6 +270,15 @@ class AppConfig:
     # API calls, so it is quick or it is broken. The frame timeout is the one
     # that catches a camera that never starts sending -- previously an
     # indefinite wait on a screen that just said "starting".
+    # Comparison / Benchmark Mode. Off by default: collecting per-frame samples
+    # is cheap but not free, and a demonstration should not pay for it.
+    benchmark_mode: bool = False
+    # Names the recorded clip both modes process. Without it the comparison
+    # refuses to declare a winner, because two different live moments are not
+    # the same input.
+    benchmark_input_id: str = ""
+    # Benchmark evidence recording (evidence.py). Off by default.
+    record_benchmark_evidence: bool = False
     vm_start_timeout_seconds: int = 300
     ssh_verify_timeout_seconds: int = 60
     backend_ready_timeout_seconds: int = 180
@@ -520,6 +529,11 @@ class AppConfig:
             allow_local_fallback=_bool_env("ALLOW_LOCAL_FALLBACK", defaults.allow_local_fallback),
             cloud_startup_timeout_seconds=int(os.environ.get(
                 "CLOUD_STARTUP_TIMEOUT_SECONDS", defaults.cloud_startup_timeout_seconds)),
+            benchmark_mode=_bool_env("LOCALLIFE_BENCHMARK_MODE", defaults.benchmark_mode),
+            benchmark_input_id=os.environ.get(
+                "LOCALLIFE_BENCHMARK_INPUT_ID", defaults.benchmark_input_id),
+            record_benchmark_evidence=_bool_env(
+                "LOCALLIFE_RECORD_EVIDENCE", defaults.record_benchmark_evidence),
             vm_start_timeout_seconds=int(os.environ.get(
                 "VM_START_TIMEOUT_SECONDS", defaults.vm_start_timeout_seconds)),
             ssh_verify_timeout_seconds=int(os.environ.get(

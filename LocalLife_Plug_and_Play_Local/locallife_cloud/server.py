@@ -358,6 +358,20 @@ def create_app(
             return jsonify(error=f"No recorded event {event_id}"), 404
         return jsonify(ok=True, event_id=event_id.strip(), litres=litres_value)
 
+    @app.get("/api/benchmark")
+    def benchmark_state() -> Any:
+        """Local-versus-cloud comparison, or an explanation of what is missing."""
+        return jsonify(manager.benchmark_summary())
+
+    @app.get("/api/benchmark.csv")
+    def benchmark_csv() -> Response:
+        body = manager.benchmark_csv()
+        return Response(
+            body,
+            content_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": "attachment; filename=benchmark.csv"},
+        )
+
     @app.get("/api/comparison")
     def comparison() -> Any:
         return jsonify(manager.comparison())

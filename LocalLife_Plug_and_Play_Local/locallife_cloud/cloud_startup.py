@@ -23,6 +23,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
 # The happy path, in order. Each entry is a stage the operator can be told they
@@ -278,6 +279,36 @@ class CloudStartupMachine:
             return False, None
         self.complete_stage()
         return True, value
+
+
+DEPLOYMENT_MARKER = ".locallife_deployment"
+
+
+def deployment_version(project_root: Path) -> str:
+    """A short hash of the project's Python sources.
+
+    Two jobs. It stops startup re-uploading a project that has not changed --
+    the expensive step when it does run. And it catches the opposite, quieter
+    bug: the previous check asked only whether the directory existed, so a VM
+    carrying an *old* copy of the code was treated as up to date and silently
+    ran stale software, which is worse than a slow upload.
+
+    Content-addressed rather than timestamp-based: a fresh checkout on the
+    laptop must not look like a change to the VM.
+    """
+    import hashlib
+
+    digest = hashlib.sha256()
+    root = Path(project_root)
+    for path in sorted(root.rglob("*.py")):
+        if any(part in {"__pycache__", ".venv", "build", "dist"} for part in path.parts):
+            continue
+        try:
+            digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+            digest.update(path.read_bytes())
+        except OSError:
+            continue
+    return digest.hexdigest()[:16]
 
 
 def readiness_checklist(facts: dict[str, Any]) -> dict[str, bool | None]:

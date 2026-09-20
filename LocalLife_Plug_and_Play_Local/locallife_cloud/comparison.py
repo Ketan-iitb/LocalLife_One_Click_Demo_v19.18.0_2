@@ -366,6 +366,52 @@ class DualCameraCoordinator:
     def reference_trials(self) -> list[dict[str, Any]]:
         return self.store.read_jsonl(REFERENCE_FILE)
 
+    # ------------------------------------------------------- benchmark mode
+    def benchmark_session(self, mode: str | None = None) -> "BenchmarkSession":
+        """The collector for one processing mode, created on first use.
+
+        Kept per mode rather than per run so a local session and a cloud
+        session over the same recorded input can be compared directly.
+        """
+        from .benchmark import BenchmarkSession
+
+        resolved = mode or self.config.processing_mode
+        if not hasattr(self, "_benchmark_sessions"):
+            self._benchmark_sessions: dict[str, BenchmarkSession] = {}
+        if resolved not in self._benchmark_sessions:
+            self._benchmark_sessions[resolved] = BenchmarkSession(
+                self.operator_session()["session_id"], resolved,
+                recorded_input_id=self.config.benchmark_input_id or None,
+            )
+        return self._benchmark_sessions[resolved]
+
+    def benchmark_summary(self) -> dict[str, Any]:
+        from .benchmark import compare
+
+        sessions = getattr(self, "_benchmark_sessions", {})
+        return {
+            "enabled": self.config.benchmark_mode,
+            "recorded_input_id": self.config.benchmark_input_id or None,
+            **compare(sessions.get("local"), sessions.get("cloud")),
+        }
+
+    def benchmark_csv(self) -> str:
+        """Every sampled frame from every mode, in one export."""
+        import csv
+        import io
+
+        from .benchmark import BENCHMARK_COLUMNS
+
+        output = io.StringIO()
+        writer = csv.DictWriter(
+            output, fieldnames=BENCHMARK_COLUMNS, extrasaction="ignore",
+        )
+        writer.writeheader()
+        for session in getattr(self, "_benchmark_sessions", {}).values():
+            for row in session.rows():
+                writer.writerow(row)
+        return output.getvalue()
+
     def operator_session(self) -> dict[str, Any]:
         """The current operator session, created on first use and kept on disk."""
         location = self.config.results_dir / "operator_session.json"

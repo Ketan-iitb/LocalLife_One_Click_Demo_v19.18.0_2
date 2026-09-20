@@ -1013,17 +1013,43 @@ function Start-AppRole {
     # literally named "~". Move anything stranded there back into the real home
     # before checking, so an affected VM repairs itself instead of re-uploading
     # gigabytes every run. mv only relocates; nothing is deleted.
+    # The deployment version is a hash of this laptop's Python sources. Asking
+    # only whether the directory existed -- what this used to do -- meant a VM
+    # carrying an OLD copy of the project counted as installed and silently ran
+    # stale code. Comparing the hash both catches that and skips the upload
+    # entirely when nothing changed, which is the expensive step.
+    $deploymentVersion = (& $pythonExe '-c' `
+        'import sys,pathlib;sys.path.insert(0,sys.argv[1]);from locallife_cloud.cloud_startup import deployment_version;print(deployment_version(pathlib.Path(sys.argv[1])))' `
+        (Find-ProjectRoot) 2>$null | Out-String).Trim()
+    if ([string]::IsNullOrWhiteSpace($deploymentVersion)) {
+        $deploymentVersion = 'unknown'
+    }
+    Write-Step ('Local deployment version: ' + $deploymentVersion)
     $checkCommand = 'if [ -d "$HOME/~" ]; then echo "LOCALLIFE_REPAIRING_TILDE_DIR"; ' +
         'mv -n "$HOME/~"/* "$HOME"/ 2>/dev/null; rmdir "$HOME/~" 2>/dev/null; fi; ' +
         'echo "LOCALLIFE_HOME_CONTENTS:"; ls -1 ~ 2>/dev/null | head -20; ' +
+        'echo "LOCALLIFE_REMOTE_VERSION=$(cat ~/' + $ProjectDirectory + '/.locallife_deployment 2>/dev/null || echo none)"; ' +
         'if [ -d ~/' + $ProjectDirectory + '/locallife_cloud ]; then echo LOCALLIFE_PROJECT_PRESENT; ' +
         'else echo LOCALLIFE_PROJECT_MISSING; fi'
     $checkOutput = Invoke-VerifiedCloudSsh -Command $checkCommand
     if ($LASTEXITCODE -ne 0) {
         throw 'Could not check the cloud VM over SSH (see its output above). Run `python gpu.py ssh` to investigate.'
     }
-    if (($checkOutput -join "`n") -notmatch 'LOCALLIFE_PROJECT_PRESENT') {
-        Write-Step 'Project not found on the cloud VM -- uploading it now (first time only; can take several minutes)...'
+    $checkText = ($checkOutput -join "`n")
+    $remoteVersion = 'none'
+    if ($checkText -match 'LOCALLIFE_REMOTE_VERSION=(\S+)') { $remoteVersion = $Matches[1] }
+    $projectPresent = ($checkText -match 'LOCALLIFE_PROJECT_PRESENT')
+    $versionMatches = ($remoteVersion -eq $deploymentVersion -and $deploymentVersion -ne 'unknown')
+    if ($projectPresent -and $versionMatches) {
+        Write-Step ('Cloud VM already has this exact code (' + $deploymentVersion + ') -- skipping upload.')
+    }
+    if (-not ($projectPresent -and $versionMatches)) {
+        if ($projectPresent) {
+            Write-Step ('Cloud VM has a different version (' + $remoteVersion + ' vs ' + $deploymentVersion + ') -- updating it...')
+        }
+        else {
+            Write-Step 'Project not found on the cloud VM -- uploading it now (first time only; can take several minutes)...'
+        }
         $projectRoot = Find-ProjectRoot
         # Ask the VM where its home actually is, and upload to that absolute
         # path. Windows' pscp.exe -- which `gcloud compute scp` shells out to --
@@ -1054,7 +1080,13 @@ function Start-AppRole {
                    'actually there. Confirm the VM and project are the ones you expect: ' +
                    'gcloud compute instances list --project=' + $CloudProject)
         }
-        Write-Step 'Upload complete and verified.'
+        # Stamp the version only after the upload has been verified, so a
+        # partial transfer cannot leave a marker claiming code that is not
+        # actually there -- which would make every later run skip the repair.
+        Invoke-VerifiedCloudSsh -Command (
+            'printf %s ' + $deploymentVersion + ' > ~/' + $ProjectDirectory + '/.locallife_deployment'
+        ) | Out-Null
+        Write-Step ('Upload complete and verified (version ' + $deploymentVersion + ').')
     }
 
     # --host 127.0.0.1: the VM server binds its OWN loopback only, never the
@@ -1076,6 +1108,11 @@ function Start-AppRole {
         'exit 1; fi; ' +
         'cd ~/' + $ProjectDirectory + ' || exit 1; ' +
         'export LOCALLIFE_OPERATING_MODE=' + $OperatingMode + '; ' +
+        # Do not restart a backend that is already serving. A reconnect after a
+        # dropped tunnel used to kill a healthy, model-loaded process and pay
+        # the whole model-load cost again for nothing.
+        'if curl -sf -m 3 http://127.0.0.1:' + $Port + '/api/state >/dev/null 2>&1; then ' +
+        'echo "LOCALLIFE_BACKEND_ALREADY_HEALTHY"; exit 0; fi; ' +
         "pkill -f '[l]ocallife_cloud.server' || true; " +
         'if [ -f .venv/bin/activate ]; then source .venv/bin/activate; fi; ' +
         # PEP 668: Debian 12+ / Python 3.12 images mark the system interpreter
