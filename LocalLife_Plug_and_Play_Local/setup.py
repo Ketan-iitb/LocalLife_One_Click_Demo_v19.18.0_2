@@ -29,7 +29,7 @@ def _read_requirements() -> list[str]:
 
 setup(
     name="locallife-cloud",
-    version="19.21.0",
+    version="19.22.0",
     description="LocalLife dual-camera waste volume measurement (local, cloud-free runtime).",
     packages=find_packages(include=["locallife_cloud", "locallife_cloud.*"]),
     # recipe_config.yaml (the v3 recipe pipeline's own default tuning file,

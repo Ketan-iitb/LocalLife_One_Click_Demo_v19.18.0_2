@@ -1,4 +1,81 @@
-# LocalLife One-Click Demonstration — v19.21.0
+# LocalLife One-Click Demonstration — v19.22.0 (cloud + operator page)
+
+**Branch `Working_branch_v21_cloud`**, from `Working_branch_v20_deposit_isolation` @ `eb4b0cd`.
+
+The Accuracy Deployment v3.0 operator page from the Windows v3.2 deployment is now
+the landing page, and the measurement CSV is downloadable from it.
+
+## Architecture
+
+```
+LocalLife.exe / _Check / _Stop   (Windows, Go launchers, -Role Launcher|Doctor|Stop)
+        |  runs app\Start-LocalLife-Demo.ps1  (forwards to the root launcher)
+        v
+Start-LocalLife-Demo.ps1  -Mode Local | Cloud
+        |                         |
+        |  Local                  |  Cloud -> gpu.py (11 EU zones, L4->T4 fallback,
+        |                         |            keeps the VM disk across zone moves)
+        |                         v
+        |                  GCP GPU VM  <-- SSH tunnel --  laptop
+        v                         |
+Raspberry Pi  ── RealSense D435 (metric depth) ──┐
+              └─ Logitech C920  (colour only)  ──┤
+                                                 v
+                      locallife_cloud pipeline (same code both modes)
+                                                 |
+                       ┌─────────────────────────┴───────────────┐
+                       v                                         v
+        operator page  /   (Accuracy v3.0)            measurements.csv
+        research page  /research                      /api/cameras/<id>/measurements.csv
+```
+
+**What was ported** (from `Ketan-iitb/LocalLife_Windows_Deployment_v3_2`): the real
+`operator_dashboard.py` page, `accuracy.py` (weighted two-camera fusion), the
+operational-fusion summary in `comparison.py`, `/api/color-map`,
+`/api/operator/session/new`, and the three EXEs with `app/` + `HOW_TO_RUN.txt`.
+
+**What was deliberately not ported:** that deployment's `pipeline.py`, `geometry.py`,
+`config.py`, `types.py`, `ledger.py`, `server.py` and `comparison.py` are an older and
+much smaller fork (pipeline 1316 lines vs 2906 here). Copying them would have deleted
+the height-map volume method, deposit isolation, colour support, sorting rules and the
+CSV fix. `gpu.py` was already byte-identical and needed no change.
+
+## Running it
+
+| | Command |
+|---|---|
+| Local (free) | `START_LOCAL_LIFE_DEMO.cmd`, or `Start-LocalLife-Demo.ps1 -Mode Local` |
+| Cloud GPU | `START_LOCAL_LIFE_CLOUD.cmd`, or `Start-LocalLife-Demo.ps1 -Mode Cloud` |
+| Check setup | `CHECK_LOCAL_LIFE_SETUP.cmd` / `LocalLife_Check.exe` |
+| Stop + save + shut the VM down | `STOP_LOCAL_LIFE_DEMO.cmd` / `LocalLife_Stop.exe` |
+
+Operator page: `http://127.0.0.1:8000/` · research page: `/research` ·
+CSV: `/api/cameras/realsense/measurements.csv`
+
+**GPU cost warning:** a cloud L4 VM bills whenever it is RUNNING. Closing the browser
+does not stop it — run `LocalLife_Stop.exe` at the end of the day.
+
+## Environment
+
+`CLOUD_ENABLED` (`true` in Cloud mode), `LOCALLIFE_GCP_PROJECT`, `LOCALLIFE_VM_NAME`,
+`LOCALLIFE_VM_ZONE`, `LOCALLIFE_VM_STATUS`, `LOCALLIFE_PI_HOST`, `LOCALLIFE_API_TOKEN`,
+`LOCALLIFE_OPERATING_MODE`, plus the measurement tunables — all in
+`LocalLife_Plug_and_Play_Local/cloud.env.example`. The launcher sets the cloud ones
+itself. No credentials are stored in the repository; Google Cloud CLI login is used as
+before.
+
+## CSV
+
+`<results_dir>/measurements.csv`, one row per finalised object, written by the pipeline
+in **every** operating mode. Columns: timestamp, camera, operating mode, calibration id,
+track id, label, accepted class, colour + confidence, sorting status, material +
+confidence, volume, added/displaced volume, before/after occupancy, uncertainty,
+length/width/height mm, dimension confidence and method, depth coverage, measurement
+method and quality, rejection reason, calibration validity. Previous sessions are
+archived under `<results_dir>/sessions/<timestamp>-<id>/` when a new session is started —
+nothing is deleted.
+
+# LocalLife One-Click Demonstration — v19.21.0 (previous)
 
 **v19.21.0 — built against the Final Implementation Playbook; the volume number is
 finally right.** The playbook freezes one method (RealSense metric depth + a one-time
