@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 import cv2
 import numpy as np
 
+from locallife_cloud import __version__
 from locallife_cloud.config import AppConfig
 from locallife_cloud.comparison import DualCameraCoordinator
 from locallife_cloud.inference import AdaptiveForegroundSegmenter, create_segmenter
@@ -84,7 +85,9 @@ class LocalOfflineDetectorTests(unittest.TestCase):
             self.assertEqual(response.get_json()["status"], "ok")
             state = app.test_client().get("/api/state")
             self.assertEqual(state.status_code, 200)
-            self.assertEqual(state.get_json()["build_version"], "19.20.0-local-ai")
+            # Tracks the package rather than pinning a literal, so a release bump
+            # does not fail an unrelated offline-startup test.
+            self.assertEqual(state.get_json()["build_version"], __version__)
 
     def test_raw_snapshot_endpoint_serves_an_unannotated_jpeg_once_a_frame_arrives(self) -> None:
         # tools/calibrate_dual_camera.py relies on this endpoint to grab

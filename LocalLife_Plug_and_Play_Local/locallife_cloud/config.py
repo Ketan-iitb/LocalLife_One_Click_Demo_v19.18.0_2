@@ -251,11 +251,13 @@ class AppConfig:
     # was started under so the operator page can show it, and are reported as
     # unknown rather than guessed when the launcher did not set them.
     cloud_enabled: bool = False
+    # Blank means "use project_id"; resolved by `gcp_project`, so the cloud
+    # target is configured in one place rather than two.
     cloud_project: str = ""
-    cloud_vm_name: str = ""
+    cloud_vm_name: str = "depth-l4"
     cloud_zone: str = ""
     cloud_vm_status: str = ""
-    pi_host: str = ""
+    pi_host: str = "locallife@locallife.local"
     # Welcome-page / run-mode selector (launcher_service.py).
     local_api_port: int = 8765
     default_run_mode: str = "ask"
@@ -626,6 +628,11 @@ class AppConfig:
             )),
             record_only_measured_objects=_bool_env("LOCALLIFE_RECORD_ONLY_MEASURED", True),
         )
+
+    @property
+    def gcp_project(self) -> str:
+        """The project cloud calls target; `cloud_project` overrides `project_id`."""
+        return self.cloud_project or self.project_id
 
     def validate(self) -> None:
         if self.operating_mode not in {"waste", "geometry_validation"}:

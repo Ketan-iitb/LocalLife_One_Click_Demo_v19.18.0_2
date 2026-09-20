@@ -7,6 +7,7 @@ starting a real process or touching Google Cloud.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
 import unittest
@@ -255,3 +256,56 @@ class ControlApiTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LauncherScriptResolutionTests(unittest.TestCase):
+    """Regression: the reported "-File ... does not exist" startup failure.
+
+    The one-click .cmd chdirs into the Python package before starting the
+    service, but Start-LocalLife-Demo.ps1 lives one level up at the repository
+    root. Resolving it from the working directory therefore looked in
+    LocalLife_Plug_and_Play_Local/ and failed.
+    """
+
+    def setUp(self) -> None:
+        self._directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        self.control = _controller(self._directory.name)
+
+    def test_the_script_is_found_from_any_working_directory(self) -> None:
+        expected = self.control.resolve_launcher_script()
+        self.assertTrue(expected.is_file())
+        self.assertEqual(expected.name, "Start-LocalLife-Demo.ps1")
+        original = Path.cwd()
+        self.addCleanup(os.chdir, original)
+        for where in (Path(__file__).resolve().parent.parent, Path(self._directory.name)):
+            with self.subTest(cwd=str(where)):
+                os.chdir(where)
+                self.assertEqual(self.control.resolve_launcher_script(), expected)
+
+    def test_the_command_points_at_a_file_that_exists(self) -> None:
+        command = self.control._command("local")
+        self.assertTrue(Path(command[command.index("-File") + 1]).is_file())
+
+    def test_a_missing_script_fails_the_launch_cleanly(self) -> None:
+        control = _Controller(
+            _config(self._directory.name),
+            launcher_script=Path(self._directory.name) / "absent.ps1",
+            runner=_ok,
+        )
+        launch = control.start("local")
+        self.assertEqual(launch["phase"], "failed")
+        self.assertIn("absent.ps1", launch["error"])
+
+
+class CloudDefaultsTests(unittest.TestCase):
+    def test_the_cloud_target_is_configured_out_of_the_box(self) -> None:
+        # The welcome page showed "Cloud configuration: Not available" purely
+        # because these defaulted to empty strings.
+        config = AppConfig()
+        self.assertEqual(config.gcp_project, "locallife-thesis-depth")
+        self.assertEqual(config.cloud_vm_name, "depth-l4")
+        self.assertTrue(config.pi_host)
+
+    def test_cloud_project_overrides_the_default_project_id(self) -> None:
+        self.assertEqual(AppConfig(cloud_project="other-project").gcp_project, "other-project")

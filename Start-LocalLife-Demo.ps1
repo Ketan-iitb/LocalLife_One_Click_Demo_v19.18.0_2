@@ -46,7 +46,17 @@ param(
     # (0.0.0.0, needed so the Pi's reverse SSH tunnel can reach it). The
     # Launcher role generates one and passes it to the App/Pi windows it
     # spawns; left blank here only when a role is run standalone.
-    [string]$ApiToken = ''
+    [string]$ApiToken = '',
+
+    # Cloud target. These were previously hardcoded at each gcloud call site,
+    # which meant the instance name could not be changed and --project was
+    # never passed at all -- so every ssh/scp went to whichever project the
+    # active gcloud config pointed at, not necessarily the one holding the VM.
+    [ValidatePattern('^[a-z]([-a-z0-9]*[a-z0-9])?$')]
+    [string]$VmName = 'depth-l4',
+
+    [ValidatePattern('^[a-z][-a-z0-9:.]*[a-z0-9]$')]
+    [string]$CloudProject = 'locallife-thesis-depth'
 )
 
 Set-StrictMode -Version Latest

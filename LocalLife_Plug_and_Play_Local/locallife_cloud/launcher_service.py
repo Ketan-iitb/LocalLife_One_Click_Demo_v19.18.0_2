@@ -123,9 +123,9 @@ class LaunchController:
             "internet": internet,
             "gcloud_installed": gcloud,
             "cloud_configured": bool(
-                self.config.cloud_project and self.config.cloud_vm_name
+                self.config.gcp_project and self.config.cloud_vm_name
             ),
-            "cloud_available": bool(internet and gcloud and self.config.cloud_project),
+            "cloud_available": bool(internet and gcloud and self.config.gcp_project),
             "pi_host": self.config.pi_host or None,
             "pi_reachable": _port_open(pi_name, pi_port, timeout=1.5) if pi_name else None,
             # The cameras hang off the Pi and are only visible once the backend
@@ -146,8 +146,39 @@ class LaunchController:
             command, capture_output=True, text=True, timeout=timeout, check=False,
         )
 
+    def resolve_launcher_script(self) -> Path:
+        """Locate Start-LocalLife-Demo.ps1 relative to this package.
+
+        It sits at the repository root, one level above the Python package,
+        while the service is normally started with the working directory set to
+        the package folder -- so resolving it from the current directory looked
+        for it one level too deep and failed with "the argument ... does not
+        exist". Anchoring to __file__ makes it independent of where the process
+        was launched from.
+        """
+        if self.launcher_script is not None:
+            if self.launcher_script.is_file():
+                return self.launcher_script
+            raise FileNotFoundError(
+                f"Configured launcher script does not exist: {self.launcher_script}"
+            )
+        package_root = Path(__file__).resolve().parent.parent
+        candidates = (
+            package_root.parent / "Start-LocalLife-Demo.ps1",  # repository root
+            package_root / "Start-LocalLife-Demo.ps1",
+            package_root.parent / "app" / "Start-LocalLife-Demo.ps1",
+            Path.cwd() / "Start-LocalLife-Demo.ps1",
+        )
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        searched = "\n  ".join(str(item) for item in candidates)
+        raise FileNotFoundError(
+            "Could not find Start-LocalLife-Demo.ps1. Looked in:\n  " + searched
+        )
+
     def _command(self, mode: str) -> list[str]:
-        script = self.launcher_script or (Path.cwd() / "Start-LocalLife-Demo.ps1")
+        script = self.resolve_launcher_script()
         executable = shutil.which("pwsh") or shutil.which("powershell") or "powershell"
         return [
             executable, "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass",
@@ -164,6 +195,8 @@ class LaunchController:
         self._note(f"Starting {mode} pipeline…")
         try:
             completed = self._runner(self._command(mode), timeout)
+        except FileNotFoundError as exc:
+            return False, str(exc)
         except subprocess.TimeoutExpired:
             return False, f"{mode} startup exceeded {timeout:.0f}s"
         except OSError as exc:
