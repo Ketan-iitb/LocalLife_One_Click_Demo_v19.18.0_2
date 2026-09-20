@@ -330,3 +330,67 @@ class LauncherDiagnosticsTests(unittest.TestCase):
             readiness = control.readiness()
             self.assertIsNone(readiness["launcher_script"])
             self.assertIn("gone.ps1", readiness["launcher_script_error"])
+
+
+class CloudStartupBlockingTests(unittest.TestCase):
+    """Regression: "cloud wala atak raha hai" -- cloud startup sat there forever.
+
+    gpu.py deletes and recreates the VM on a zone move, so the host key changes
+    and PuTTY shows its stricter "POTENTIAL SECURITY BREACH ... Update cached
+    key?" prompt instead of the ordinary first-connection one the piped "y"
+    answers. Nobody is watching that window, so startup never proceeds.
+
+    There is no PowerShell interpreter in this environment, so these assert on
+    the script's text: they cannot prove the script runs, only that the fix is
+    still present and still ordered correctly.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.script = (
+            Path(__file__).resolve().parent.parent.parent / "Start-LocalLife-Demo.ps1"
+        ).read_text(encoding="utf-8", errors="replace")
+
+    def test_the_stale_host_key_is_cleared_before_connecting(self) -> None:
+        self.assertIn("function Clear-StalePuttyHostKey", self.script)
+        self.assertIn(r"HKCU:\Software\SimonTatham\PuTTY\SshHostKeys", self.script)
+        self.assertIn("Clear-StalePuttyHostKey -HostAddresses", self.script)
+
+    def test_the_key_is_cleared_before_the_other_windows_are_released(self) -> None:
+        # Windows 2 and 3 start their own SSH sessions as soon as the zone file
+        # exists. Clearing after that write would let them race straight into
+        # the prompt this removes.
+        cleared = self.script.index("Clear-StalePuttyHostKey -HostAddresses")
+        zone_file_written = self.script.index("Set-Content -LiteralPath $zoneFile")
+        self.assertLess(cleared, zone_file_written)
+
+    def test_only_this_vm_s_cached_keys_are_removed(self) -> None:
+        # A blunt "wipe SshHostKeys" would silently discard every other host the
+        # operator has ever trusted on this laptop.
+        self.assertNotIn("Remove-Item -LiteralPath $cachePath", self.script)
+        self.assertIn("Remove-ItemProperty -LiteralPath $cachePath -Name $valueName", self.script)
+
+    def test_every_gcloud_ssh_call_declines_gcloud_s_own_prompts(self) -> None:
+        # Separate hang risk from PuTTY's: without --quiet, a laptop with no
+        # google_compute_engine key yet is asked for an SSH passphrase, and the
+        # piped "y" would be typed in as the passphrase.
+        calls = [
+            line for line in self.script.splitlines()
+            if "--strict-host-key-checking=no" in line
+        ]
+        self.assertTrue(calls)
+        for line in calls:
+            with self.subTest(line=line.strip()[:60]):
+                self.assertIn("'--quiet'", line)
+
+    def test_the_wait_message_does_not_cry_wolf_after_one_minute(self) -> None:
+        # Observed startup with capacity in the usual zone: ~79 seconds. The
+        # first notice fires at one minute, so it must not announce 15-30.
+        self.assertIn("A normal start takes about 1-3 minutes.", self.script)
+        long_wait = "image capture plus a fresh VM in a new region can take 15-30 minutes"
+        self.assertIn(long_wait, self.script)
+        self.assertIn("if ($minutesWaited -lt 5)", self.script)
+        # The long-wait wording must live on the far side of that branch.
+        self.assertGreater(
+            self.script.index(long_wait), self.script.index("if ($minutesWaited -lt 5)")
+        )

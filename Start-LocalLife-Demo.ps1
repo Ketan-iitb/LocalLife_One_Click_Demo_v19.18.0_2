@@ -240,7 +240,102 @@ function Get-PythonPackageIdentity {
 # (rather than "n") is used so the key is actually cached, not just
 # accepted for this one connection, since this same VM is reused across
 # multiple gcloud ssh/scp calls within a single run.
+#
+# Every gcloud ssh/scp call below also passes --quiet, gcloud's own
+# "never prompt, take the default" flag. That covers gcloud's *own* prompts,
+# which are a separate hang risk from PuTTY's: on a machine that has no
+# ~/.ssh/google_compute_engine yet, `gcloud compute ssh` stops to ask
+# "Enter passphrase (empty for no passphrase):" twice, and the "y" lines
+# piped above would be answered into it as a passphrase rather than
+# declining. --quiet generates the key with no passphrase and moves on, which
+# is what an unattended one-click launcher needs.
 $script:PlinkHostKeyAutoAcceptLines = @('y', 'y', 'y')
+
+function Get-CloudVmHostAddresses {
+    <#
+        The addresses PuTTY could have cached a host key against for this VM:
+        its external IP, its internal IP, and its instance name. Returns
+        whatever could be determined; an empty result is an ordinary outcome
+        (no network, not signed in) and never stops the launcher.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$GcloudPath,
+        [Parameter(Mandatory = $true)][string]$Zone
+    )
+    $addresses = @($VmName)
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'SilentlyContinue'
+    try {
+        $described = (& $GcloudPath 'compute' 'instances' 'describe' $VmName `
+            ('--zone=' + $Zone) ('--project=' + $CloudProject) `
+            '--format=value(networkInterfaces[0].accessConfigs[0].natIP,networkInterfaces[0].networkIP)' 2>$null | Out-String)
+        if ($LASTEXITCODE -eq 0) {
+            foreach ($token in ($described -split '\s+')) {
+                if ($token -match '^\d{1,3}(\.\d{1,3}){3}$') {
+                    $addresses += $token
+                }
+            }
+        }
+    }
+    catch {
+        # Nothing to add; the instance-name entry below is still worth clearing.
+    }
+    finally {
+        $ErrorActionPreference = $previousPreference
+    }
+    return @($addresses | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+}
+
+# gpu.py deletes and recreates the VM whenever it has to move zones to find
+# GPU capacity, so the same instance name -- and frequently the same external
+# IP, since Google reuses addresses within a region -- legitimately comes back
+# with a brand-new SSH host key. PuTTY then does NOT show its ordinary
+# first-connection prompt (which the piped "y" above answers); it shows a
+# different, stricter one, seen blocking a real user run:
+#
+#   WARNING - POTENTIAL SECURITY BREACH!
+#   The host key does not match the one Plink has cached for this server:
+#     34.6.166.251 (port 22)
+#   ...
+#   Update cached key? (y/n, Return cancels connection, i for more info)
+#
+# Startup then sits there forever waiting for a human to answer -- which is
+# exactly the "cloud is stuck" symptom reported. Dropping the stale cache
+# entry BEFORE connecting turns that prompt back into the ordinary
+# first-connection one, so the existing piped "y" resolves it and the run
+# continues unattended.
+#
+# Deliberately narrow: the current user's own PuTTY cache only, and only
+# values whose name ends in ":<this VM's address>" -- PuTTY names them
+# "<keytype>@<port>:<host>", e.g. "rsa2@22:34.6.166.251". No other host's
+# saved key is read, printed or touched. On a non-Windows host the registry
+# path simply does not exist and this is a no-op.
+function Clear-StalePuttyHostKey {
+    param([string[]]$HostAddresses = @())
+    $cachePath = 'HKCU:\Software\SimonTatham\PuTTY\SshHostKeys'
+    if (-not (Test-Path -LiteralPath $cachePath)) {
+        return
+    }
+    $addresses = @($HostAddresses | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($addresses.Count -eq 0) {
+        return
+    }
+    $cacheKey = Get-Item -LiteralPath $cachePath -ErrorAction SilentlyContinue
+    if ($null -eq $cacheKey) {
+        return
+    }
+    foreach ($valueName in @($cacheKey.GetValueNames())) {
+        foreach ($address in $addresses) {
+            if ([string]$valueName -match ([regex]::Escape(':' + $address) + '$')) {
+                Remove-ItemProperty -LiteralPath $cachePath -Name $valueName -ErrorAction SilentlyContinue
+                Write-Step ('Cleared the stale saved SSH host key for ' + $address +
+                            ' -- the VM was recreated, so its key legitimately changed. ' +
+                            'Without this, PuTTY stops and waits for a "y" nobody is there to type.')
+                break
+            }
+        }
+    }
+}
 
 function Assert-SshAvailable {
     if ($null -eq (Get-Command 'ssh.exe' -ErrorAction SilentlyContinue) -and
@@ -800,14 +895,21 @@ function Start-AppRole {
     }
     Write-Step ('GPU VM is running in zone ' + $zone)
 
+    $gcloudPath = Assert-GcloudAvailable
+
+    # Before ANY window connects, and specifically before the zone file below
+    # releases Windows 2 and 3 to start their own SSH sessions: drop a stale
+    # cached host key for this VM. Doing it first is what makes it safe -- the
+    # other windows only learn the zone once the file exists, so they cannot
+    # race in and hit the prompt this is clearing.
+    Clear-StalePuttyHostKey -HostAddresses (Get-CloudVmHostAddresses -GcloudPath $gcloudPath -Zone $zone)
+
     Write-Step 'Recording the zone for the tunnel window...'
     $zoneFile = Join-Path $script:SessionDirectory 'cloud-zone.txt'
     if (-not (Test-Path -LiteralPath $script:SessionDirectory)) {
         New-Item -ItemType Directory -Path $script:SessionDirectory -Force | Out-Null
     }
     Set-Content -LiteralPath $zoneFile -Value $zone -Encoding ASCII -NoNewline
-
-    $gcloudPath = Assert-GcloudAvailable
 
     # One-click means the launcher installs the project on a fresh VM
     # itself instead of throwing "not installed, see the instructions" and
@@ -832,7 +934,7 @@ function Start-AppRole {
         'if [ -d ~/' + $ProjectDirectory + '/locallife_cloud ]; then echo LOCALLIFE_PROJECT_PRESENT; ' +
         'else echo LOCALLIFE_PROJECT_MISSING; fi'
     $checkOutput = $script:PlinkHostKeyAutoAcceptLines | & $gcloudPath 'compute' 'ssh' $VmName ('--zone=' + $zone) ('--project=' + $CloudProject) `
-        '--strict-host-key-checking=no' ('--command=' + $checkCommand)
+        '--quiet' '--strict-host-key-checking=no' ('--command=' + $checkCommand)
     if ($LASTEXITCODE -ne 0) {
         throw 'Could not check the cloud VM over SSH (see its output above). Run `python gpu.py ssh` to investigate.'
     }
@@ -846,7 +948,7 @@ function Start-AppRole {
         # successfully into a directory literally called "~", so the upload
         # reports 100% while ~/<project> stays empty in any real shell.
         $homeOutput = $script:PlinkHostKeyAutoAcceptLines | & $gcloudPath 'compute' 'ssh' $VmName ('--zone=' + $zone) ('--project=' + $CloudProject) `
-            '--strict-host-key-checking=no' '--command=echo LOCALLIFE_REMOTE_HOME=$HOME'
+            '--quiet' '--strict-host-key-checking=no' '--command=echo LOCALLIFE_REMOTE_HOME=$HOME'
         $remoteHome = ''
         foreach ($line in @($homeOutput)) {
             if ("$line" -match 'LOCALLIFE_REMOTE_HOME=(\S+)') { $remoteHome = $Matches[1] }
@@ -856,14 +958,14 @@ function Start-AppRole {
         }
         Write-Step ('Uploading to ' + $remoteHome + ' on ' + $VmName + '...')
         Invoke-NativeTolerantly $gcloudPath -StdinLines $script:PlinkHostKeyAutoAcceptLines 'compute' 'scp' '--recurse' ('--zone=' + $zone) ('--project=' + $CloudProject) `
-            '--strict-host-key-checking=no' $projectRoot ($VmName + ':' + $remoteHome + '/')
+            '--quiet' '--strict-host-key-checking=no' $projectRoot ($VmName + ':' + $remoteHome + '/')
         if ($LASTEXITCODE -ne 0) {
             throw 'Could not upload the project to the cloud VM (see its output above). Run `python gpu.py ssh` and check disk space, or copy it manually.'
         }
         # Verify rather than assume. A partial or wrong-target upload otherwise
         # surfaces minutes later as an unexplained "project is not installed".
         $verifyOutput = $script:PlinkHostKeyAutoAcceptLines | & $gcloudPath 'compute' 'ssh' $VmName ('--zone=' + $zone) ('--project=' + $CloudProject) `
-            '--strict-host-key-checking=no' ('--command=' + $checkCommand)
+            '--quiet' '--strict-host-key-checking=no' ('--command=' + $checkCommand)
         if (($verifyOutput -join "`n") -notmatch 'LOCALLIFE_PROJECT_PRESENT') {
             throw ('The upload reported success but ~/' + $ProjectDirectory +
                    '/locallife_cloud is still missing on ' + $VmName + ' in ' + $zone +
@@ -936,7 +1038,7 @@ function Start-AppRole {
     # change anyway, and the connection is already gated by the user's own
     # gcloud/IAM auth, not by host-key trust.
     Invoke-NativeTolerantly $gcloudPath -StdinLines $script:PlinkHostKeyAutoAcceptLines 'compute' 'ssh' $VmName ('--zone=' + $zone) ('--project=' + $CloudProject) `
-        '--strict-host-key-checking=no' ('--command=' + $remoteBootstrap)
+        '--quiet' '--strict-host-key-checking=no' ('--command=' + $remoteBootstrap)
     if ($LASTEXITCODE -ne 0) {
         throw 'The cloud application stopped or could not start. Check `python gpu.py status` and `python gpu.py ssh`.'
     }
@@ -1039,7 +1141,19 @@ function Wait-ForCloudZoneFile {
         }
         if (($attempt % 20) -eq 0) {
             $minutesWaited = [math]::Round(($attempt * 3) / 60, 1)
-            Write-Step ('Still waiting on Window 1 to bring up the cloud VM (' + $minutesWaited + ' min so far). A zone move (image capture + a fresh VM in a new region) can take 15-30 minutes -- this is normal; watch Window 1''s own output for progress.')
+            # Calibrated against what a real run actually costs. When the usual
+            # zone has GPU capacity the VM is ready in about a minute and a
+            # half, so the old unconditional "a zone move can take 15-30
+            # minutes" fired at the 1-minute mark and made an ordinary,
+            # on-schedule startup read as a hang. The long-wait wording now
+            # appears only once the wait itself has gone past the point where a
+            # zone move is the likely explanation.
+            if ($minutesWaited -lt 5) {
+                Write-Step ('Still waiting on Window 1 to bring up the cloud VM (' + $minutesWaited + ' min so far). A normal start takes about 1-3 minutes.')
+            }
+            else {
+                Write-Step ('Still waiting on Window 1 to bring up the cloud VM (' + $minutesWaited + ' min so far). Past a few minutes this usually means gpu.py is moving the VM to another zone for GPU capacity -- image capture plus a fresh VM in a new region can take 15-30 minutes. That is normal; watch Window 1''s own output for progress.')
+            }
         }
         Start-Sleep -Seconds 3
     }
@@ -1070,7 +1184,7 @@ function Start-CloudTunnelRole {
     $gcloudPath = Assert-GcloudAvailable
     $forward = '127.0.0.1:' + $Port + ':127.0.0.1:' + $Port
     Invoke-NativeTolerantly $gcloudPath -StdinLines $script:PlinkHostKeyAutoAcceptLines 'compute' 'ssh' $VmName ('--zone=' + $zone) ('--project=' + $CloudProject) `
-        '--strict-host-key-checking=no' '--' '-N' '-L' $forward
+        '--quiet' '--strict-host-key-checking=no' '--' '-N' '-L' $forward
     if ($LASTEXITCODE -ne 0) {
         throw 'The secure SSH tunnel stopped. Check cloud login and whether the laptop port is already occupied.'
     }
@@ -1123,7 +1237,7 @@ function Initialize-PiCloudTunnel {
         'sudo chown ' + $script:PiTunnelUser + ':' + $script:PiTunnelUser + ' /home/' + $script:PiTunnelUser + '/.ssh/authorized_keys'
     $vmBootstrap = ConvertTo-RemoteBootstrap -Command $vmSetupCommand
     $script:PlinkHostKeyAutoAcceptLines | & $gcloudPath 'compute' 'ssh' $VmName ('--zone=' + $zone) ('--project=' + $CloudProject) `
-        '--strict-host-key-checking=no' ('--command=' + $vmBootstrap)
+        '--quiet' '--strict-host-key-checking=no' ('--command=' + $vmBootstrap)
     if ($LASTEXITCODE -ne 0) {
         throw 'Could not provision the cloud VM''s restricted tunnel user (see its output above). Run `python gpu.py ssh` to investigate.'
     }
