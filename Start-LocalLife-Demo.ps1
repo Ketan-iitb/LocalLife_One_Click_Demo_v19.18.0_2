@@ -278,16 +278,29 @@ function Assert-CloudSshIdentity {
         New-Item -ItemType Directory -Path $script:SessionDirectory -Force | Out-Null
     }
     Write-Step 'Verifying SSH host key...'
+    # PYTHONPATH, not the current directory: this script lives at the repository
+    # root while the package is one level down in $ProjectDirectory, so
+    # `python -m locallife_cloud.cloud_ssh` from here could not import it at
+    # all. It failed with ModuleNotFoundError on stderr, which the old
+    # SilentlyContinue call then swallowed -- leaving an empty result that was
+    # misreported as a host key mismatch. Setting the path is the fix; the
+    # separate stderr file below is what makes any future failure legible.
     $projectRoot = Find-ProjectRoot
-    $previousPreference = $ErrorActionPreference
-    $ErrorActionPreference = 'SilentlyContinue'
+    $errorFile = Join-Path $script:SessionDirectory 'ssh-verify-stderr.txt'
+    $previousPythonPath = $env:PYTHONPATH
+    $env:PYTHONPATH = $projectRoot
     try {
         $raw = (& $PythonExe '-m' 'locallife_cloud.cloud_ssh' `
             '--vm' $VmName '--zone' $Zone '--project' $CloudProject `
-            '--known-hosts' $knownHosts 2>&1 | Out-String)
+            '--known-hosts' $knownHosts 2>$errorFile | Out-String)
+        $verifyExitCode = $LASTEXITCODE
     }
     finally {
-        $ErrorActionPreference = $previousPreference
+        $env:PYTHONPATH = $previousPythonPath
+    }
+    $errorText = ''
+    if (Test-Path -LiteralPath $errorFile) {
+        $errorText = ((Get-Content -LiteralPath $errorFile -Raw -ErrorAction SilentlyContinue) + '').Trim()
     }
     $report = $null
     foreach ($line in ($raw -split "`n")) {
@@ -297,17 +310,28 @@ function Assert-CloudSshIdentity {
         }
     }
     if ($null -eq $report) {
-        throw ('SSH host key mismatch: the VM identity check produced no result. Raw output: ' + $raw.Trim())
+        # NOT a mismatch. The check never produced a verdict, which is a
+        # different problem with a different fix, and calling it a mismatch sent
+        # the last run looking for a security incident that had not happened.
+        $detail = $errorText
+        if ([string]::IsNullOrWhiteSpace($detail)) { $detail = $raw.Trim() }
+        if ([string]::IsNullOrWhiteSpace($detail)) { $detail = '(no output; exit code ' + $verifyExitCode + ')' }
+        if ($detail -match 'ModuleNotFoundError|No module named') {
+            throw ('The VM identity check could not run: Python could not import locallife_cloud from ' +
+                   $projectRoot + '. Confirm that folder contains locallife_cloud\. Details: ' + $detail)
+        }
+        throw ('The VM identity check could not run (no verdict was produced). ' +
+               'This is a launcher problem, not a security failure. Details: ' + $detail)
     }
     if (-not $report.verified) {
-        throw ('SSH host key mismatch: ' + $report.status + ' -- ' + $report.error +
-               ' Cloud mode cannot continue safely. Run locally, or check ' +
+        throw ('SSH identity could not be established (' + $report.status + '): ' + $report.error +
+               ' Cloud mode will not connect to a host it cannot identify. Run locally, or check ' +
                '`gcloud compute instances describe ' + $VmName + ' --zone=' + $Zone + '`.')
     }
     # Logged without credentials: instance id, zone, IP and fingerprints are all
     # public facts about the machine, and they are what makes a later mismatch
     # diagnosable.
-    Write-Step ('SSH identity verified: ' + $report.identity.vm_name +
+    Write-Step ('SSH identity verified via ' + $report.source + ': ' + $report.identity.vm_name +
                 ' (instance ' + $report.identity.instance_id + ') in ' + $report.identity.zone +
                 ' at ' + $report.identity.external_ip)
     foreach ($item in @($report.fingerprints)) {

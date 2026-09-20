@@ -66,7 +66,27 @@ _DESCRIBE = json.dumps({
 })
 
 
-def _fake_gcloud(describe: str = _DESCRIBE, hostkeys: str | None = None, fail: str = ""):
+def _serial_output(key: str) -> str:
+    """Serial console text as a real VM prints it, boot noise included."""
+    return (
+        "[    0.000000] Linux version 6.1.0-18-cloud-amd64\n"
+        "Starting Google Compute Engine Guest Agent...\n"
+        "-----BEGIN SSH HOST KEY FINGERPRINTS-----\n"
+        "2048 SHA256:abcdef root@depth-l4 (RSA)\n"
+        "-----END SSH HOST KEY FINGERPRINTS-----\n"
+        "-----BEGIN SSH HOST KEY KEYS-----\n"
+        f"ssh-ed25519 {key} root@depth-l4\n"
+        "-----END SSH HOST KEY KEYS-----\n"
+        "startup-script exit status 0\n"
+    )
+
+
+def _fake_gcloud(
+    describe: str = _DESCRIBE,
+    hostkeys: str | None = None,
+    serial: str | None = None,
+    fail: str = "",
+):
     """A gcloud stand-in, so the whole decision path runs without a project."""
     keys = hostkeys if hostkeys is not None else json.dumps(
         [{"key": "ssh-ed25519", "value": _ED25519}]
@@ -78,6 +98,10 @@ def _fake_gcloud(describe: str = _DESCRIBE, hostkeys: str | None = None, fail: s
             return subprocess.CompletedProcess(command, 1, "", "boom")
         if "get-guest-attributes" in joined:
             return subprocess.CompletedProcess(command, 0, keys, "")
+        if "get-serial-port-output" in joined:
+            if serial is None:
+                return subprocess.CompletedProcess(command, 0, "", "")
+            return subprocess.CompletedProcess(command, 0, serial, "")
         if "describe" in joined:
             return subprocess.CompletedProcess(command, 0, describe, "")
         return subprocess.CompletedProcess(command, 0, "", "")
@@ -145,12 +169,56 @@ class HostKeyVerificationTests(unittest.TestCase):
         self.assertTrue(self._verifier().pin(self.known_hosts).unchanged)
 
     def test_missing_published_keys_stop_with_a_security_error(self) -> None:
-        result = self._verifier(hostkeys="[]").pin(self.known_hosts)
+        # Both trusted channels empty: no guest attributes, no serial key block.
+        result = self._verifier(hostkeys="[]", serial="boot noise only\n").pin(self.known_hosts)
         self.assertFalse(result.verified)
         self.assertEqual(result.status, STATUS_VERIFYING)
-        self.assertIn("No usable SSH host key", result.error)
+        self.assertIn("published no SSH host key", result.error)
+        # The message has to name the real cause: guest attributes are OFF by
+        # default on Compute Engine, so "empty" is the normal case, not a fault.
+        self.assertIn("enable-guest-attributes", result.error)
         # Nothing is pinned when identity could not be established.
         self.assertFalse(self.known_hosts.exists())
+
+    def test_the_serial_console_is_used_when_guest_attributes_are_off(self) -> None:
+        # The real-world case: guest attributes are not enabled by default, so
+        # this is the path almost every VM actually takes.
+        result = self._verifier(
+            hostkeys="[]", serial=_serial_output(_ED25519),
+        ).pin(self.known_hosts)
+        self.assertTrue(result.verified)
+        self.assertEqual(result.source, "serial-console")
+        self.assertIn(_ED25519, self.known_hosts.read_text(encoding="utf-8"))
+
+    def test_guest_attributes_are_preferred_when_present(self) -> None:
+        result = self._verifier(serial=_serial_output(_OTHER_ED25519)).pin(self.known_hosts)
+        self.assertTrue(result.verified)
+        self.assertEqual(result.source, "guest-attributes")
+        self.assertIn(_ED25519, self.known_hosts.read_text(encoding="utf-8"))
+
+    def test_serial_parsing_ignores_fingerprints_and_boot_noise(self) -> None:
+        from locallife_cloud.cloud_ssh import parse_serial_host_keys
+
+        keys = parse_serial_host_keys(_serial_output(_ED25519))
+        self.assertEqual(len(keys), 1)
+        self.assertEqual(keys[0].key_type, "ssh-ed25519")
+        self.assertEqual(keys[0].key_base64, _ED25519)
+
+    def test_serial_parsing_rejects_prose_that_mentions_a_key_type(self) -> None:
+        from locallife_cloud.cloud_ssh import parse_serial_host_keys
+
+        noise = "Regenerating ssh-ed25519 key now\nssh-rsa not-base64!! comment\n"
+        self.assertEqual(parse_serial_host_keys(noise), [])
+
+    def test_only_the_newest_key_per_type_survives_several_boots(self) -> None:
+        # A long-lived serial log carries every boot; pinning an old key would
+        # fail the very connection this is meant to allow.
+        serial = _serial_output(_ED25519) + _serial_output(_OTHER_ED25519)
+        result = self._verifier(hostkeys="[]", serial=serial).pin(self.known_hosts)
+        body = self.known_hosts.read_text(encoding="utf-8")
+        self.assertTrue(result.verified)
+        self.assertIn(_OTHER_ED25519, body)
+        self.assertNotIn(_ED25519, body)
 
     def test_an_unresolvable_instance_stops_before_connecting(self) -> None:
         result = self._verifier(fail="describe").pin(self.known_hosts)

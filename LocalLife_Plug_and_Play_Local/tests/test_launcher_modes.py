@@ -434,6 +434,25 @@ class CloudStartupBlockingTests(unittest.TestCase):
         self.assertIn("locallife_cloud.cloud_ssh", self.script)
         self.assertIn("Assert-CloudSshIdentity -PythonExe", self.script)
 
+    def test_the_verifier_is_run_with_the_package_on_the_python_path(self) -> None:
+        # Regression: this script sits at the repository root while the package
+        # is one level down, so `python -m locallife_cloud.cloud_ssh` could not
+        # import it and failed with ModuleNotFoundError before producing any
+        # verdict.
+        self.assertIn("$env:PYTHONPATH = $projectRoot", self.script)
+        self.assertIn("$env:PYTHONPATH = $previousPythonPath", self.script)
+
+    def test_a_check_that_could_not_run_is_not_called_a_mismatch(self) -> None:
+        # The empty result was reported as "SSH host key mismatch", sending the
+        # operator after a security incident that had not happened.
+        self.assertIn("The VM identity check could not run", self.script)
+        self.assertIn("ModuleNotFoundError|No module named", self.script)
+        self.assertNotIn("SSH host key mismatch: the VM identity check", self.script)
+
+    def test_the_verifier_s_stderr_is_captured_rather_than_swallowed(self) -> None:
+        self.assertIn("ssh-verify-stderr.txt", self.script)
+        self.assertIn("2>$errorFile", self.script)
+
     def test_nothing_auto_accepts_an_unverified_host_key(self) -> None:
         # The v21 approach, and every other form of blanket acceptance.
         for bypass in (
@@ -452,7 +471,8 @@ class CloudStartupBlockingTests(unittest.TestCase):
 
     def test_an_unverified_identity_stops_rather_than_continues(self) -> None:
         self.assertIn("if (-not $report.verified)", self.script)
-        self.assertIn("SSH host key mismatch", self.script)
+        self.assertIn("SSH identity could not be established", self.script)
+        self.assertIn("will not connect to a host it cannot identify", self.script)
 
     def test_identity_is_pinned_before_the_other_windows_are_released(self) -> None:
         # Windows 2 and 3 start their own SSH sessions as soon as the zone file
