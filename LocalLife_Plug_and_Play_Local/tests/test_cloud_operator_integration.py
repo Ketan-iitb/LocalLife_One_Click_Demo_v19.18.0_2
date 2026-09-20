@@ -223,8 +223,14 @@ class MeasurementCountTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         station = app.config["CAMERA_COORDINATOR"].camera("realsense")
         self.assertEqual(client.get("/api/state").get_json()["measurements_recorded"], 0)
-        station._csv_logged.update({1, 2, 3})
-        self.assertEqual(client.get("/api/state").get_json()["measurements_recorded"], 3)
+        # Counted from what actually reached disk, not from an in-memory set of
+        # track ids: a row the operator cannot download was never "recorded".
+        for index in (1, 2, 3):
+            station.event_log.record({"event_id": f"event-{index}", "volume_l": index})
+        state = client.get("/api/state").get_json()
+        self.assertEqual(state["measurements_recorded"], 3)
+        self.assertTrue(state["csv_persistence"]["healthy"])
+        self.assertEqual(state["csv_persistence"]["csv_path"], str(station.event_log.path))
 
     def test_the_page_explains_a_missing_baseline(self) -> None:
         app, client, directory = _app()

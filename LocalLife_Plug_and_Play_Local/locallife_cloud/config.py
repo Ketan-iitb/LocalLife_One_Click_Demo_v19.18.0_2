@@ -634,6 +634,16 @@ class AppConfig:
         """The project cloud calls target; `cloud_project` overrides `project_id`."""
         return self.cloud_project or self.project_id
 
+    @property
+    def processing_mode(self) -> str:
+        """Which deployment produced a measurement: "local" or "cloud".
+
+        Recorded on every event row so local and cloud results stay
+        distinguishable in one export -- a benchmark comparison is meaningless
+        if the rows do not say which side measured them.
+        """
+        return "cloud" if self.cloud_enabled else "local"
+
     def validate(self) -> None:
         if self.operating_mode not in {"waste", "geometry_validation"}:
             raise ValueError(

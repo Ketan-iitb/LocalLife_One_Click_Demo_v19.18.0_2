@@ -40,6 +40,7 @@ from .heightmap_volume import (
 from uuid import uuid4
 
 from .sorting_rules import classify_sorting, mis_sort_family
+from .event_log import MeasurementEventLog, STATUS_ACCEPTED, STATUS_REJECTED, resolve_event_id
 from .storage import ResultStore
 from .tracking import ObjectTracker
 from .box_templates import load_box_templates, match_box_template
@@ -447,9 +448,18 @@ class VisionPipeline:
         # accepted. Every later deposit is measured against this, so already
         # committed material can never be counted again.
         self._committed_scene: HeightMapVolume | None = None
-        # Track ids already written to measurements.csv, so a row is appended
-        # once per object and never rewritten afterwards.
+        # Canonical event persistence. Rows are written when a measurement is
+        # *finalised*, keyed by a durable event id -- not per frame, and not
+        # keyed by track_id, which restarts at 1 on every run. See event_log.py
+        # for why the per-frame writer this replaces produced blank exports.
+        self.event_log = MeasurementEventLog(config.results_dir)
+        # Track ids already finalised into the event log this run, so a settled
+        # object is considered once and never re-offered.
         self._csv_logged: set[int] = set()
+        # Volume history length at which a non-ledger mode considers a track
+        # settled; mirrors the ledger's own settle rule so both modes finalise
+        # on the same evidence.
+        self._last_persist_result: dict[str, Any] | None = None
         # Support plane recorded at calibration, and whether the live camera
         # still matches it. An old plane must never be applied to a new pose.
         self._calibration_id: str | None = None
@@ -1825,7 +1835,19 @@ class VisionPipeline:
                         warnings.append(
                             f"Deposit withheld: {detection.volume_rejection_reason}"
                         )
+                        # A withheld deposit is a real outcome, not an absence:
+                        # record it with its reason so a run's rejections are
+                        # auditable instead of vanishing from the export.
+                        self.persist_measurement_event(
+                            detection, timestamp,
+                            status=STATUS_REJECTED,
+                            status_reason=detection.volume_rejection_reason,
+                        )
                         continue
+                    # Persist BEFORE the ledger marks the deposit complete, so
+                    # the dashboard can never show a finalised row that was
+                    # never written to disk.
+                    self.persist_measurement_event(detection, timestamp)
                     self.ledger.deposit(detection, timestamp=timestamp)
                     self._committed_scene = scene_grid
                     newly_deposited.append(detection)
@@ -1899,7 +1921,7 @@ class VisionPipeline:
 
         if persist:
             self.store.append_jsonl("frames.jsonl", analysis.to_dict())
-            self._log_measurement_rows(detections, timestamp)
+            self._finalise_settled_measurements(detections, timestamp)
             starting_count = self.tracker.total_count - len(new_ids)
             for index, track_id in enumerate(new_ids, start=1):
                 detection = next(item for item in detections if item.track_id == track_id)
@@ -2475,7 +2497,11 @@ class VisionPipeline:
                 # header is almost always this being zero because no empty-bin
                 # baseline was captured, so the page can say so instead of
                 # handing the operator a blank file with no explanation.
-                "measurements_recorded": len(self._csv_logged),
+                "measurements_recorded": self.event_log.status()["events_persisted"],
+                # Whether each finalised event actually reached disk, where the
+                # file is, and whether a failure is waiting to be retried.
+                "csv_persistence": self.event_log.status(),
+                "last_persisted_event": self._last_persist_result,
                 "measurement_method": (
                     "hardware-stereo-depth" if self.camera_id == "realsense"
                     else "local-rgb-tracking" if self.depth_estimator is None
@@ -2603,61 +2629,131 @@ class VisionPipeline:
     # served by the dashboard is empty in geometry_validation mode because that
     # mode deliberately disables the ledger, which left validation runs with no
     # spreadsheet output at all -- this is the mode-independent record.
-    MEASUREMENT_CSV_COLUMNS = [
-        "timestamp", "camera_id", "operating_mode", "calibration_id", "track_id",
-        "label", "accepted_class", "color", "color_confidence", "sorting_status",
-        "material", "material_confidence",
-        "volume_l", "added_volume_l", "displaced_volume_l",
-        "volume_before_l", "volume_after_l", "volume_uncertainty_l",
-        "length_mm", "width_mm", "height_mm", "dimension_confidence", "dimension_method",
-        "depth_coverage_percent", "measurement_method", "measurement_quality",
-        "volume_rejection_reason", "calibration_valid",
-    ]
+    # One schema, owned by the event log, shared by local and cloud modes so the
+    # two are directly comparable. Kept as a station attribute because the
+    # download route and the operator page both read it from here.
+    MEASUREMENT_CSV_COLUMNS = MeasurementEventLog.COLUMNS
 
-    def _log_measurement_rows(
+    def _is_settled(self, track_id: int | None) -> bool:
+        """Has this track's volume held steady long enough to be final?
+
+        Exactly the ledger's own settle rule (`settle_frames` samples within
+        `settle_volume_tolerance`), reused rather than reinvented so a mode
+        without a ledger finalises on the same evidence a deposit does.
+        """
+        history = list(self._volume_history.get(track_id, ()))
+        if len(history) < self.config.settle_frames:
+            return False
+        recent = np.asarray(history[-self.config.settle_frames :], dtype=np.float64)
+        median = float(np.median(recent))
+        tolerance_l = max(0.15, median * self.config.settle_volume_tolerance)
+        return float(np.max(recent) - np.min(recent)) <= tolerance_l
+
+    def _finalise_settled_measurements(
         self, detections: list[Detection], timestamp: float | None,
     ) -> None:
-        """Append one finalized row per object to measurements.csv."""
+        """Persist finalised rows in the modes that have no waste ledger.
+
+        In `waste` mode the ledger's own acceptance is the canonical event and
+        persistence happens there, at the moment of the deposit. Geometry
+        validation deliberately disables the ledger, which is precisely why
+        validation runs used to produce no spreadsheet at all -- so here a
+        settled, non-phantom, measured track is the finalised event.
+        """
+        if self.config.operating_mode == "waste" and self.config.auto_deposit:
+            return
         for detection in detections:
             if detection.track_id is None or detection.track_id in self._csv_logged:
                 continue
             if detection.realsense_volume_l is None or _is_phantom_detection(detection):
                 continue
+            if not self._is_settled(detection.track_id):
+                continue
+            self.persist_measurement_event(detection, timestamp)
+
+    def persist_measurement_event(
+        self,
+        detection: Detection,
+        timestamp: float | None,
+        *,
+        status: str = STATUS_ACCEPTED,
+        status_reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Write the canonical row for one finalised measurement.
+
+        Called at the moment a deposit is accepted (or explicitly withheld) --
+        never speculatively per frame -- so a pending object can never become an
+        accepted row. Idempotent: the event log keys on a durable `event_id`, so
+        a repeated frame, a dashboard refresh, a retry or a cloud reconnection
+        resolves to the same id and appends nothing the second time.
+        """
+        event_id = resolve_event_id(
+            self.event_log.session_id, self.camera_id, detection.track_id,
+            suffix=status,
+        )
+        result = self.event_log.record(
+            self._measurement_row(detection, timestamp, event_id, status, status_reason)
+        )
+        if detection.track_id is not None and result.ok:
             self._csv_logged.add(detection.track_id)
-            self.store.append_csv(
-                "measurements.csv",
-                {
-                    "timestamp": timestamp,
-                    "camera_id": self.camera_id,
-                    "operating_mode": self.config.operating_mode,
-                    "calibration_id": self._calibration_id,
-                    "track_id": detection.track_id,
-                    "label": detection.label,
-                    "accepted_class": detection.accepted_class,
-                    "color": detection.color,
-                    "color_confidence": round(float(detection.color_confidence), 4),
-                    "sorting_status": detection.sorting_status,
-                    "material": detection.material,
-                    "material_confidence": round(float(detection.material_confidence), 4),
-                    "volume_l": detection.realsense_volume_l,
-                    "added_volume_l": detection.added_volume_l,
-                    "displaced_volume_l": detection.displaced_volume_l,
-                    "volume_before_l": detection.volume_before_l,
-                    "volume_after_l": detection.volume_after_l,
-                    "volume_uncertainty_l": detection.volume_uncertainty_l,
-                    "length_mm": detection.footprint_length_mm,
-                    "width_mm": detection.footprint_width_mm,
-                    "height_mm": detection.physical_height_mm,
-                    "dimension_confidence": detection.dimension_confidence,
-                    "dimension_method": detection.dimension_method,
-                    "depth_coverage_percent": detection.depth_coverage_percent,
-                    "measurement_method": detection.measurement_method,
-                    "measurement_quality": detection.measurement_quality,
-                    "volume_rejection_reason": detection.volume_rejection_reason,
-                    "calibration_valid": self._calibration_valid,
-                },
-                self.MEASUREMENT_CSV_COLUMNS,
-            )
+        self._last_persist_result = {
+            "event_id": result.event_id,
+            "written": result.written,
+            "duplicate": result.duplicate,
+            "error": result.error,
+            "csv_path": None if result.path is None else str(result.path),
+        }
+        return self._last_persist_result
+
+    def _measurement_row(
+        self,
+        detection: Detection,
+        timestamp: float | None,
+        event_id: str,
+        status: str,
+        status_reason: str | None,
+    ) -> dict[str, Any]:
+        """The shared local/cloud schema, so both modes stay comparable."""
+        return {
+            "event_id": event_id,
+            "status": status,
+            "status_reason": status_reason,
+            "processing_mode": self.config.processing_mode,
+            # One accepted event is one bag: that is exactly what the
+            # deposit-isolation rule guarantees -- two touching bags are only
+            # accepted once each has been isolated against the committed scene,
+            # and a pair that cannot be separated is withheld rather than
+            # merged. A withheld event contributes no bag.
+            "bag_count": 1 if status == STATUS_ACCEPTED else 0,
+            "timestamp": timestamp,
+            "camera_id": self.camera_id,
+            "operating_mode": self.config.operating_mode,
+            "calibration_id": self._calibration_id,
+            "track_id": detection.track_id,
+            "label": detection.label,
+            "accepted_class": detection.accepted_class,
+            "color": detection.color,
+            "color_confidence": round(float(detection.color_confidence), 4),
+            "sorting_status": detection.sorting_status,
+            "material": detection.material,
+            "material_confidence": round(float(detection.material_confidence), 4),
+            "volume_l": detection.realsense_volume_l,
+            "added_volume_l": detection.added_volume_l,
+            "displaced_volume_l": detection.displaced_volume_l,
+            "volume_before_l": detection.volume_before_l,
+            "volume_after_l": detection.volume_after_l,
+            "volume_uncertainty_l": detection.volume_uncertainty_l,
+            "length_mm": detection.footprint_length_mm,
+            "width_mm": detection.footprint_width_mm,
+            "height_mm": detection.physical_height_mm,
+            "dimension_confidence": detection.dimension_confidence,
+            "dimension_method": detection.dimension_method,
+            "depth_coverage_percent": detection.depth_coverage_percent,
+            "measurement_method": detection.measurement_method,
+            "measurement_quality": detection.measurement_quality,
+            "volume_rejection_reason": detection.volume_rejection_reason,
+            "calibration_valid": self._calibration_valid,
+        }
 
     def _check_camera_placement(
         self,

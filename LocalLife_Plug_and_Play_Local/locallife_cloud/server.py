@@ -301,22 +301,62 @@ def create_app(
             station = manager.camera(camera_id)
         except ValueError as exc:
             return jsonify(error=str(exc)), 404
-        path = station.store.directory / "measurements.csv"
-        columns = list(station.MEASUREMENT_CSV_COLUMNS)
-        if path.is_file():
-            body = path.read_text(encoding="utf-8")
-        else:
-            output = io.StringIO()
-            csv.DictWriter(output, fieldnames=columns).writeheader()
-            body = output.getvalue()
+        # Served straight from the event log the pipeline writes through, so the
+        # route cannot drift onto a different path than the writer -- the defect
+        # class that made this download look broken when the real fault was
+        # upstream.
         return Response(
-            body,
-            mimetype="text/csv; charset=utf-8",
+            station.event_log.csv_text(),
+            # content_type, not mimetype: Flask appends its own charset to a
+            # mimetype, which produced the malformed
+            # "text/csv; charset=utf-8; charset=utf-8" this route used to send.
+            content_type="text/csv; charset=utf-8",
             headers={
                 "Content-Disposition":
                     f"attachment; filename={camera_id}_measurements.csv",
+                # Lets the operator page show where the file actually is without
+                # a second round trip.
+                "X-LocalLife-CSV-Path": str(station.event_log.path),
             },
         )
+
+    @app.post("/api/cameras/<camera_id>/measurements/retry")
+    @protected
+    def retry_measurement_persistence(camera_id: str = "realsense") -> Any:
+        """Re-attempt rows that failed to reach disk.
+
+        A persistence failure is shown on the operator page rather than
+        swallowed, so it needs somewhere to be retried from.
+        """
+        try:
+            station = manager.camera(camera_id)
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 404
+        return jsonify(ok=True, result=station.event_log.retry_failed(),
+                       status=station.event_log.status())
+
+    @app.post("/api/cameras/<camera_id>/measurements/ground-truth")
+    @protected
+    def set_measurement_ground_truth(camera_id: str = "realsense") -> Any:
+        """Attach an operator-entered true volume to an already-written event."""
+        try:
+            station = manager.camera(camera_id)
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 404
+        payload = request.get_json(silent=True) or {}
+        event_id = payload.get("event_id")
+        litres = payload.get("litres")
+        if not isinstance(event_id, str) or not event_id.strip():
+            return jsonify(error="Provide event_id as a string"), 400
+        try:
+            litres_value = float(litres)
+        except (TypeError, ValueError):
+            return jsonify(error="Provide litres as a number"), 400
+        if litres_value < 0:
+            return jsonify(error="Ground truth volume cannot be negative"), 400
+        if not station.event_log.set_ground_truth(event_id.strip(), litres_value):
+            return jsonify(error=f"No recorded event {event_id}"), 404
+        return jsonify(ok=True, event_id=event_id.strip(), litres=litres_value)
 
     @app.get("/api/comparison")
     def comparison() -> Any:
