@@ -26,6 +26,13 @@ from typing import Any, Callable
 from flask import Flask, jsonify, request
 
 from . import __version__
+from .cloud_startup import (
+    FAILURES,
+    STAGES,
+    CloudStartupMachine,
+    is_fully_ready,
+    readiness_checklist,
+)
 from .config import AppConfig
 from .launcher_page import WELCOME_PAGE
 
@@ -106,6 +113,18 @@ class LaunchController:
         self.state = LaunchState()
         self._lock = threading.Lock()
         self._runner = runner or self._run_launcher
+        # Structured cloud startup state, so the welcome page shows which stage
+        # is running and where it stopped instead of an unexplained spinner.
+        # Served from here, the local control service, so it stays visible
+        # before the tunnel or the cloud dashboard exists.
+        self.startup = CloudStartupMachine(timeouts={
+            "starting_vm": config.vm_start_timeout_seconds,
+            "verifying_ssh": config.ssh_verify_timeout_seconds,
+            "starting_backend": config.backend_ready_timeout_seconds,
+            "opening_tunnel": config.tunnel_ready_timeout_seconds,
+            "connecting_pi": config.pi_connect_timeout_seconds,
+            "waiting_for_frames": config.first_frame_timeout_seconds,
+        })
 
     # ---------------------------------------------------------------- probes
     def readiness(self) -> dict[str, Any]:
@@ -149,6 +168,24 @@ class LaunchController:
             "launcher_script": launcher_script,
             "launcher_script_error": launcher_error,
             "working_directory": str(Path.cwd()),
+            # Live cloud facts for the status page. Anything the control service
+            # cannot see from this machine stays None ("Unknown"), never a
+            # hopeful guess -- an IP is not an identity, and a running VM is not
+            # a working demonstration.
+            "cloud": {
+                "vm_name": self.config.cloud_vm_name or None,
+                "preferred_zone": self.config.cloud_zone or None,
+                "project": self.config.gcp_project or None,
+                "gcp_authenticated": gcloud,
+                "timeouts": {
+                    "vm_start_timeout_seconds": self.config.vm_start_timeout_seconds,
+                    "ssh_verify_timeout_seconds": self.config.ssh_verify_timeout_seconds,
+                    "backend_ready_timeout_seconds": self.config.backend_ready_timeout_seconds,
+                    "tunnel_ready_timeout_seconds": self.config.tunnel_ready_timeout_seconds,
+                    "pi_connect_timeout_seconds": self.config.pi_connect_timeout_seconds,
+                    "first_frame_timeout_seconds": self.config.first_frame_timeout_seconds,
+                },
+            },
         }
 
     # --------------------------------------------------------------- running
@@ -230,6 +267,14 @@ class LaunchController:
             self._note(f"Selected mode: {mode}")
 
             if mode in {"cloud", "auto"}:
+                # Start the structured feed before the first cloud step, so the
+                # page has a stage to show from the very first poll.
+                self.startup.begin()
+                self.startup.enter("resolving_zone")
+                self.startup.fact(
+                    selected_mode=mode, vm_name=self.config.cloud_vm_name,
+                    preferred_zone=self.config.cloud_zone or None,
+                )
                 ready = self.readiness()
                 if not ready["cloud_available"]:
                     reason = (
@@ -306,7 +351,53 @@ def create_launcher_app(
 
     @app.get("/api/launcher/status")
     def status() -> Any:
-        return jsonify(readiness=control.readiness(), launch=control.state.to_dict())
+        return jsonify(
+            readiness=control.readiness(),
+            launch=control.state.to_dict(),
+            # The structured startup feed the page polls: stage, elapsed time,
+            # per-stage timings, live facts and the failure's next steps. The
+            # page never scrapes console text for any of this.
+            startup=control.startup.state.to_dict(),
+            checklist=readiness_checklist(control.startup.state.facts),
+            fully_ready=is_fully_ready(control.startup.state.facts),
+        )
+
+    @app.get("/api/launcher/stages")
+    def stages() -> Any:
+        """The vocabulary the page renders: every stage and failure it can show."""
+        return jsonify(stages=list(STAGES), failures=list(FAILURES))
+
+    @app.post("/api/launcher/startup-event")
+    def startup_event() -> Any:
+        """Stage updates pushed by the PowerShell launcher.
+
+        The launcher is a separate process, so it reports progress here rather
+        than the page trying to read its console. Strictly validated: `stage`
+        and `failure` must be members of the known enums, and nothing from this
+        request ever reaches a shell.
+        """
+        payload = request.get_json(silent=True) or {}
+        stage = payload.get("stage")
+        failure = payload.get("failure")
+        facts = payload.get("facts")
+        if facts is not None:
+            if not isinstance(facts, dict):
+                return jsonify(error="facts must be an object"), 400
+            control.startup.fact(**{str(key): value for key, value in facts.items()})
+        if failure is not None:
+            if failure not in FAILURES:
+                return jsonify(error=f"Unknown failure: {failure}"), 400
+            return jsonify(ok=True, startup=control.startup.fail(
+                failure, str(payload.get("reason") or "")
+            ))
+        if stage is not None:
+            if stage not in STAGES:
+                return jsonify(error=f"Unknown stage: {stage}"), 400
+            control.startup.enter(stage, detail=payload.get("detail"))
+        message = payload.get("message")
+        if isinstance(message, str) and message.strip():
+            control.startup.note(message.strip())
+        return jsonify(ok=True, startup=control.startup.state.to_dict())
 
     @app.post("/api/launcher/start")
     def start() -> Any:

@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from locallife_cloud.config import AppConfig
 from locallife_cloud.launcher_service import (
@@ -53,21 +54,14 @@ class _Controller(LaunchController):
         self._cloud_ready = cloud_ready
 
     def readiness(self):
-        return {
-            "version": "test",
-            "internet": self._cloud_ready,
-            "gcloud_installed": self._cloud_ready,
-            "cloud_configured": self._cloud_ready,
-            "cloud_available": self._cloud_ready,
-            "pi_host": "locallife@pi.local",
-            "pi_reachable": None,
-            "realsense": None,
-            "logitech": None,
-            "dashboard_up": False,
-            "allow_local_fallback": self.config.allow_local_fallback,
-            "default_run_mode": self.config.default_run_mode,
-            "cloud_startup_timeout_seconds": self.config.cloud_startup_timeout_seconds,
-        }
+        # Built from the REAL readiness with only the network probes pinned, so
+        # this stub cannot silently drift out of step with the contract the
+        # welcome page depends on. (An earlier hand-written dict did exactly
+        # that and hid a missing key.)
+        with mock.patch("locallife_cloud.launcher_service._port_open", return_value=self._cloud_ready), \
+             mock.patch("locallife_cloud.launcher_service.shutil.which",
+                        return_value="/usr/bin/gcloud" if self._cloud_ready else None):
+            return super().readiness()
 
 
 def _controller(directory, *, runner=_ok, cloud_ready=True, **overrides):
@@ -330,6 +324,90 @@ class LauncherDiagnosticsTests(unittest.TestCase):
             readiness = control.readiness()
             self.assertIsNone(readiness["launcher_script"])
             self.assertIn("gone.ps1", readiness["launcher_script_error"])
+
+
+class LiveStartupStatusTests(unittest.TestCase):
+    """The welcome page's live cloud status, served by the local control service.
+
+    It has to work before the tunnel or the cloud dashboard exists, which is
+    exactly why it lives here rather than on the backend.
+    """
+
+    def setUp(self) -> None:
+        self._directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        self.control = _controller(self._directory.name)
+        self.client = create_launcher_app(
+            _config(self._directory.name), self.control,
+        ).test_client()
+
+    def test_status_carries_the_startup_feed_and_checklist(self) -> None:
+        payload = self.client.get("/api/launcher/status").get_json()
+        for key in ("readiness", "launch", "startup", "checklist", "fully_ready"):
+            self.assertIn(key, payload)
+        self.assertEqual(payload["startup"]["stage"], "idle")
+        self.assertFalse(payload["fully_ready"])
+        # Nothing observed yet is Unknown, not False.
+        self.assertIsNone(payload["checklist"]["camera_heartbeat"])
+
+    def test_readiness_reports_the_cloud_target_and_its_timeouts(self) -> None:
+        cloud = self.client.get("/api/launcher/status").get_json()["readiness"]["cloud"]
+        self.assertEqual(cloud["vm_name"], "depth-l4")
+        self.assertEqual(
+            cloud["timeouts"]["first_frame_timeout_seconds"],
+            AppConfig().first_frame_timeout_seconds,
+        )
+
+    def test_the_launcher_can_push_stage_updates(self) -> None:
+        response = self.client.post("/api/launcher/startup-event", json={
+            "stage": "verifying_ssh",
+            "facts": {"ssh_verified": True, "external_ip": "34.6.166.251"},
+            "message": "SSH identity verified",
+        })
+        self.assertEqual(response.status_code, 200)
+        startup = response.get_json()["startup"]
+        self.assertEqual(startup["stage"], "verifying_ssh")
+        self.assertTrue(startup["facts"]["ssh_verified"])
+        self.assertIn("SSH identity verified", startup["messages"])
+
+    def test_a_pushed_failure_carries_stage_reason_and_next_steps(self) -> None:
+        self.client.post("/api/launcher/startup-event", json={"stage": "verifying_ssh"})
+        startup = self.client.post("/api/launcher/startup-event", json={
+            "failure": "ssh_host_key_mismatch", "reason": "key is not the published one",
+        }).get_json()["startup"]
+        self.assertEqual(startup["failure"], "ssh_host_key_mismatch")
+        self.assertEqual(startup["stage"], "verifying_ssh")
+        self.assertEqual(
+            startup["actions"], ["retry_cloud", "run_locally", "open_diagnostics"]
+        )
+
+    def test_the_status_api_rejects_anything_outside_the_known_enums(self) -> None:
+        for payload in (
+            {"stage": "rm -rf /"},
+            {"failure": "; shutdown now"},
+            {"facts": "not-an-object"},
+        ):
+            with self.subTest(payload=payload):
+                self.assertEqual(
+                    self.client.post("/api/launcher/startup-event", json=payload).status_code,
+                    400,
+                )
+
+    def test_the_stage_vocabulary_is_published_for_the_page(self) -> None:
+        payload = self.client.get("/api/launcher/stages").get_json()
+        self.assertIn("verifying_ssh", payload["stages"])
+        self.assertIn("ssh_host_key_mismatch", payload["failures"])
+
+    def test_the_page_renders_the_structured_feed_not_console_text(self) -> None:
+        body = self.client.get("/").get_data(as_text=True)
+        self.assertIn("/api/launcher/status", body)
+        for marker in (
+            "SSH host key", "Deployment version", "Tunnel", "First frame",
+            "Retry cloud", "Run locally instead", "Open diagnostics",
+            "address, not identity",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, body)
 
 
 class CloudStartupBlockingTests(unittest.TestCase):

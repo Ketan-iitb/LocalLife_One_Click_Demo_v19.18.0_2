@@ -263,6 +263,19 @@ class AppConfig:
     default_run_mode: str = "ask"
     allow_local_fallback: bool = True
     cloud_startup_timeout_seconds: int = 90
+    # Per-stage budgets. Defaults come from measured startup, not from guesses:
+    # a real run brought the VM up in 79 s with capacity in the usual zone, so
+    # 300 s covers that with room for a slow boot while still failing long
+    # before an operator gives up. Host-key verification is two authenticated
+    # API calls, so it is quick or it is broken. The frame timeout is the one
+    # that catches a camera that never starts sending -- previously an
+    # indefinite wait on a screen that just said "starting".
+    vm_start_timeout_seconds: int = 300
+    ssh_verify_timeout_seconds: int = 60
+    backend_ready_timeout_seconds: int = 180
+    tunnel_ready_timeout_seconds: int = 60
+    pi_connect_timeout_seconds: int = 90
+    first_frame_timeout_seconds: int = 120
     cloud_request_timeout_seconds: int = 30
     bin_waste_stream: str = ""
     advance_reference_on_deposit: bool = False
@@ -507,6 +520,18 @@ class AppConfig:
             allow_local_fallback=_bool_env("ALLOW_LOCAL_FALLBACK", defaults.allow_local_fallback),
             cloud_startup_timeout_seconds=int(os.environ.get(
                 "CLOUD_STARTUP_TIMEOUT_SECONDS", defaults.cloud_startup_timeout_seconds)),
+            vm_start_timeout_seconds=int(os.environ.get(
+                "VM_START_TIMEOUT_SECONDS", defaults.vm_start_timeout_seconds)),
+            ssh_verify_timeout_seconds=int(os.environ.get(
+                "SSH_VERIFY_TIMEOUT_SECONDS", defaults.ssh_verify_timeout_seconds)),
+            backend_ready_timeout_seconds=int(os.environ.get(
+                "BACKEND_READY_TIMEOUT_SECONDS", defaults.backend_ready_timeout_seconds)),
+            tunnel_ready_timeout_seconds=int(os.environ.get(
+                "TUNNEL_READY_TIMEOUT_SECONDS", defaults.tunnel_ready_timeout_seconds)),
+            pi_connect_timeout_seconds=int(os.environ.get(
+                "PI_CONNECT_TIMEOUT_SECONDS", defaults.pi_connect_timeout_seconds)),
+            first_frame_timeout_seconds=int(os.environ.get(
+                "FIRST_FRAME_TIMEOUT_SECONDS", defaults.first_frame_timeout_seconds)),
             cloud_request_timeout_seconds=int(os.environ.get(
                 "CLOUD_REQUEST_TIMEOUT_SECONDS", defaults.cloud_request_timeout_seconds)),
             bin_waste_stream=os.environ.get("BIN_WASTE_STREAM", defaults.bin_waste_stream),
