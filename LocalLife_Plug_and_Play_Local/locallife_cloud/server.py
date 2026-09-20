@@ -358,6 +358,16 @@ def create_app(
             return jsonify(error=f"No recorded event {event_id}"), 404
         return jsonify(ok=True, event_id=event_id.strip(), litres=litres_value)
 
+    @app.post("/api/waste-ledger")
+    @protected
+    def set_waste_ledger() -> Any:
+        """The operator's enable/disable switch for the measurement history."""
+        payload = request.get_json(silent=True) or {}
+        enabled = payload.get("enabled")
+        if not isinstance(enabled, bool):
+            return jsonify(error="Provide enabled as true or false"), 400
+        return jsonify(ok=True, **manager.set_waste_ledger(enabled))
+
     @app.get("/api/benchmark")
     def benchmark_state() -> Any:
         """Local-versus-cloud comparison, or an explanation of what is missing."""

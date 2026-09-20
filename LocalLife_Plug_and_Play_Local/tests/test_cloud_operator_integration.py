@@ -238,3 +238,61 @@ class MeasurementCountTests(unittest.TestCase):
         body = client.get("/").get_data(as_text=True)
         self.assertIn("csv-note", body)
         self.assertIn("SETUP / RECALIBRATE", body)
+
+
+class WasteLedgerToggleTests(unittest.TestCase):
+    """One button for the measurement history.
+
+    The ledger only runs in `waste` mode, so a run left in `geometry_validation`
+    records no history and produces no CSV rows -- which is exactly what
+    happened in the field. This is the operator's switch for it.
+    """
+
+    def setUp(self) -> None:
+        self.app, self.client, self._directory = _app()
+        self.addCleanup(self._directory.cleanup)
+        self.manager = self.app.config["CAMERA_COORDINATOR"]
+
+    def test_the_default_mode_is_left_exactly_as_it_was(self) -> None:
+        # The working local setup must not change until the button is pressed.
+        self.assertEqual(AppConfig().operating_mode, "waste")
+        state = self.client.get("/api/state").get_json()
+        self.assertIn("waste_ledger_enabled", state["cameras"]["realsense"])
+
+    def test_the_toggle_switches_every_station_not_just_the_coordinator(self) -> None:
+        # Each station holds its own replace()d config copy.
+        self.client.post("/api/waste-ledger", json={"enabled": False})
+        self.assertEqual(self.manager.config.operating_mode, "geometry_validation")
+        for camera_id in ("realsense", "logitech"):
+            with self.subTest(camera=camera_id):
+                self.assertEqual(
+                    self.manager.camera(camera_id).config.operating_mode,
+                    "geometry_validation",
+                )
+
+    def test_enabling_turns_the_ledger_back_on(self) -> None:
+        self.client.post("/api/waste-ledger", json={"enabled": False})
+        response = self.client.post("/api/waste-ledger", json={"enabled": True})
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["waste_ledger_enabled"])
+        self.assertEqual(self.manager.camera("realsense").config.operating_mode, "waste")
+
+    def test_the_state_reports_the_switch_position(self) -> None:
+        self.client.post("/api/waste-ledger", json={"enabled": False})
+        camera = self.client.get("/api/state").get_json()["cameras"]["realsense"]
+        self.assertFalse(camera["waste_ledger_enabled"])
+        self.assertEqual(camera["operating_mode"], "geometry_validation")
+
+    def test_a_non_boolean_is_rejected(self) -> None:
+        for bad in ({"enabled": "yes"}, {"enabled": 1}, {}):
+            with self.subTest(bad=bad):
+                self.assertEqual(
+                    self.client.post("/api/waste-ledger", json=bad).status_code, 400
+                )
+
+    def test_the_page_carries_the_button_and_its_label(self) -> None:
+        body = self.client.get("/").get_data(as_text=True)
+        for marker in ("ledger-toggle", "toggleLedger", "ENABLE HISTORY",
+                       "DISABLE HISTORY", "/api/waste-ledger"):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, body)

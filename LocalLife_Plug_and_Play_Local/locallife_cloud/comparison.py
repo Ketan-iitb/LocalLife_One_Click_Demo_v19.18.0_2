@@ -187,6 +187,24 @@ class DualCameraCoordinator:
         self._recipe_cache_at: float = 0.0
         self._recipe_import_error: str | None = None
 
+    def set_waste_ledger(self, enabled: bool) -> dict[str, Any]:
+        """Turn the waste ledger (the recorded measurement history) on or off.
+
+        The ledger only runs in `waste` mode; `geometry_validation` deliberately
+        disables it, which is why a run left in that mode records no history and
+        so produces no CSV rows. This is the operator's switch for that, live,
+        without restarting the demonstration.
+
+        Each station holds its own `replace()`d copy of the config, so every one
+        has to be set -- changing only the coordinator's copy would leave the
+        pipelines running in the old mode.
+        """
+        mode = "waste" if enabled else "geometry_validation"
+        self.config.operating_mode = mode
+        for pipeline in self.pipelines.values():
+            pipeline.config.operating_mode = mode
+        return {"waste_ledger_enabled": enabled, "operating_mode": mode}
+
     def camera(self, camera_id: str) -> VisionPipeline:
         if camera_id not in self.pipelines:
             raise ValueError("Camera ID must be realsense or logitech")
