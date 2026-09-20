@@ -801,8 +801,14 @@ function Start-AppRole {
     # actually missing -- an existing VM's disk persists across `up`/`down`
     # restarts, so most runs skip this entirely.
     Write-Step 'Checking whether the project is installed on the cloud VM...'
-    $checkCommand = 'if [ -d ~/' + $ProjectDirectory + '/locallife_cloud ]; then echo LOCALLIFE_PROJECT_PRESENT; else echo LOCALLIFE_PROJECT_MISSING; fi'
-    $checkOutput = $script:PlinkHostKeyAutoAcceptLines | & $gcloudPath 'compute' 'ssh' 'depth-l4' ('--zone=' + $zone) `
+    # Print the home directory alongside the verdict: "not installed" with no
+    # sign of what was looked for, or of what is actually on the VM, is the
+    # hardest possible message to act on -- and the usual cause is SSHing into
+    # a different project's VM than the one the upload went to.
+    $checkCommand = 'echo "LOCALLIFE_HOME_CONTENTS:"; ls -1 ~ 2>/dev/null | head -20; ' +
+        'if [ -d ~/' + $ProjectDirectory + '/locallife_cloud ]; then echo LOCALLIFE_PROJECT_PRESENT; ' +
+        'else echo LOCALLIFE_PROJECT_MISSING; fi'
+    $checkOutput = $script:PlinkHostKeyAutoAcceptLines | & $gcloudPath 'compute' 'ssh' $VmName ('--zone=' + $zone) ('--project=' + $CloudProject) `
         '--strict-host-key-checking=no' ('--command=' + $checkCommand)
     if ($LASTEXITCODE -ne 0) {
         throw 'Could not check the cloud VM over SSH (see its output above). Run `python gpu.py ssh` to investigate.'
@@ -810,12 +816,23 @@ function Start-AppRole {
     if (($checkOutput -join "`n") -notmatch 'LOCALLIFE_PROJECT_PRESENT') {
         Write-Step 'Project not found on the cloud VM -- uploading it now (first time only; can take several minutes)...'
         $projectRoot = Find-ProjectRoot
-        Invoke-NativeTolerantly $gcloudPath -StdinLines $script:PlinkHostKeyAutoAcceptLines 'compute' 'scp' '--recurse' ('--zone=' + $zone) `
-            '--strict-host-key-checking=no' $projectRoot 'depth-l4:~/'
+        Invoke-NativeTolerantly $gcloudPath -StdinLines $script:PlinkHostKeyAutoAcceptLines 'compute' 'scp' '--recurse' ('--zone=' + $zone) ('--project=' + $CloudProject) `
+            '--strict-host-key-checking=no' $projectRoot ($VmName + ':~/')
         if ($LASTEXITCODE -ne 0) {
             throw 'Could not upload the project to the cloud VM (see its output above). Run `python gpu.py ssh` and check disk space, or copy it manually.'
         }
-        Write-Step 'Upload complete.'
+        # Verify rather than assume. A partial or wrong-target upload otherwise
+        # surfaces minutes later as an unexplained "project is not installed".
+        $verifyOutput = $script:PlinkHostKeyAutoAcceptLines | & $gcloudPath 'compute' 'ssh' $VmName ('--zone=' + $zone) ('--project=' + $CloudProject) `
+            '--strict-host-key-checking=no' ('--command=' + $checkCommand)
+        if (($verifyOutput -join "`n") -notmatch 'LOCALLIFE_PROJECT_PRESENT') {
+            throw ('The upload reported success but ~/' + $ProjectDirectory +
+                   '/locallife_cloud is still missing on ' + $VmName + ' in ' + $zone +
+                   ' (project ' + $CloudProject + '). The VM listing above shows what is ' +
+                   'actually there. Confirm the VM and project are the ones you expect: ' +
+                   'gcloud compute instances list --project=' + $CloudProject)
+        }
+        Write-Step 'Upload complete and verified.'
     }
 
     # --host 127.0.0.1: the VM server binds its OWN loopback only, never the
@@ -831,7 +848,10 @@ function Start-AppRole {
     # entirely instead of papering over it with a token.)
     $remoteCommand =
         'if [ ! -d ~/' + $ProjectDirectory + ' ]; then ' +
-        'echo "ERROR: The project is not installed on the cloud VM. See DEMONSTRATION_INSTRUCTIONS.md."; exit 1; fi; ' +
+        'echo "ERROR: ~/' + $ProjectDirectory + ' does not exist on this VM."; ' +
+        'echo "Home contains:"; ls -1 ~ 2>/dev/null | head -20; ' +
+        'echo "If this is not the VM you uploaded to, check the project and zone."; ' +
+        'exit 1; fi; ' +
         'cd ~/' + $ProjectDirectory + ' || exit 1; ' +
         'export LOCALLIFE_OPERATING_MODE=' + $OperatingMode + '; ' +
         "pkill -f '[l]ocallife_cloud.server' || true; " +
@@ -856,7 +876,7 @@ function Start-AppRole {
     # pinned key would otherwise have to be manually cleared on every zone
     # change anyway, and the connection is already gated by the user's own
     # gcloud/IAM auth, not by host-key trust.
-    Invoke-NativeTolerantly $gcloudPath -StdinLines $script:PlinkHostKeyAutoAcceptLines 'compute' 'ssh' 'depth-l4' ('--zone=' + $zone) `
+    Invoke-NativeTolerantly $gcloudPath -StdinLines $script:PlinkHostKeyAutoAcceptLines 'compute' 'ssh' $VmName ('--zone=' + $zone) ('--project=' + $CloudProject) `
         '--strict-host-key-checking=no' ('--command=' + $remoteBootstrap)
     if ($LASTEXITCODE -ne 0) {
         throw 'The cloud application stopped or could not start. Check `python gpu.py status` and `python gpu.py ssh`.'
@@ -990,7 +1010,7 @@ function Start-CloudTunnelRole {
 
     $gcloudPath = Assert-GcloudAvailable
     $forward = '127.0.0.1:' + $Port + ':127.0.0.1:' + $Port
-    Invoke-NativeTolerantly $gcloudPath -StdinLines $script:PlinkHostKeyAutoAcceptLines 'compute' 'ssh' 'depth-l4' ('--zone=' + $zone) `
+    Invoke-NativeTolerantly $gcloudPath -StdinLines $script:PlinkHostKeyAutoAcceptLines 'compute' 'ssh' $VmName ('--zone=' + $zone) ('--project=' + $CloudProject) `
         '--strict-host-key-checking=no' '--' '-N' '-L' $forward
     if ($LASTEXITCODE -ne 0) {
         throw 'The secure SSH tunnel stopped. Check cloud login and whether the laptop port is already occupied.'
@@ -1043,7 +1063,7 @@ function Initialize-PiCloudTunnel {
         'sudo chmod 600 /home/' + $script:PiTunnelUser + '/.ssh/authorized_keys && ' +
         'sudo chown ' + $script:PiTunnelUser + ':' + $script:PiTunnelUser + ' /home/' + $script:PiTunnelUser + '/.ssh/authorized_keys'
     $vmBootstrap = ConvertTo-RemoteBootstrap -Command $vmSetupCommand
-    $script:PlinkHostKeyAutoAcceptLines | & $gcloudPath 'compute' 'ssh' 'depth-l4' ('--zone=' + $zone) `
+    $script:PlinkHostKeyAutoAcceptLines | & $gcloudPath 'compute' 'ssh' $VmName ('--zone=' + $zone) ('--project=' + $CloudProject) `
         '--strict-host-key-checking=no' ('--command=' + $vmBootstrap)
     if ($LASTEXITCODE -ne 0) {
         throw 'Could not provision the cloud VM''s restricted tunnel user (see its output above). Run `python gpu.py ssh` to investigate.'
@@ -1079,7 +1099,7 @@ function Initialize-PiCloudTunnel {
         $cachedAddress = (Get-Content -LiteralPath $script:CloudVmAddressPath -Raw).Trim()
     }
     Write-Step 'Resolving the cloud VM''s external address...'
-    $ipOutput = & $gcloudPath 'compute' 'instances' 'describe' 'depth-l4' ('--zone=' + $zone) `
+    $ipOutput = & $gcloudPath 'compute' 'instances' 'describe' $VmName ('--zone=' + $zone) ('--project=' + $CloudProject) `
         '--format=value(networkInterfaces[0].accessConfigs[0].natIP)'
     $vmAddress = (@($ipOutput) -join '').Trim()
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($vmAddress)) {
