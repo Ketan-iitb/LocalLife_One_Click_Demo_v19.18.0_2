@@ -512,8 +512,11 @@ class CloudStartupBlockingTests(unittest.TestCase):
         self.assertIn("A normal start takes about 1-3 minutes.", self.script)
         long_wait = "image capture plus a fresh VM in a new region can take 15-30 minutes"
         self.assertIn(long_wait, self.script)
-        self.assertIn("if ($minutesWaited -lt 5)", self.script)
+        # The branch now also requires the VM to still be starting, so the
+        # long-wait wording cannot appear for a VM that is already up.
+        guard = "if ($minutesWaited -lt 5 -or -not $movingZones)"
+        self.assertIn(guard, self.script)
         # The long-wait wording must live on the far side of that branch.
         self.assertGreater(
-            self.script.index(long_wait), self.script.index("if ($minutesWaited -lt 5)")
+            self.script.index(long_wait), self.script.index(guard)
         )

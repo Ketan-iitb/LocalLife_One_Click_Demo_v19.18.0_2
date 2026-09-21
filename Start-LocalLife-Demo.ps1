@@ -272,6 +272,98 @@ $script:CloudSshUser = ''
 # mismatched one is refused outright. That logic lives in Python because it is
 # security-critical and therefore worth unit-testing; this is its caller.
 # --------------------------------------------------------------------- #
+function Test-CloudSshProbe {
+    <#
+        One bounded, authenticated `gcloud compute ssh` that runs `true` on the
+        VM. Returns @{ ok; code; message }, with the failure classified so the
+        operator is told which thing to fix rather than "cloud failed".
+    #>
+    param([Parameter(Mandatory = $true)][string]$Zone)
+    $gcloudPath = Assert-GcloudAvailable
+    $errorFile = Join-Path $script:SessionDirectory 'cloud-ssh-probe.txt'
+    if (-not (Test-Path -LiteralPath $script:SessionDirectory)) {
+        New-Item -ItemType Directory -Path $script:SessionDirectory -Force | Out-Null
+    }
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'SilentlyContinue'
+    try {
+        & $gcloudPath 'compute' 'ssh' $VmName ('--project=' + $CloudProject) ('--zone=' + $Zone) `
+            '--quiet' '--command=true' 2>$errorFile | Out-Null
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousPreference
+    }
+    $detail = ''
+    if (Test-Path -LiteralPath $errorFile) {
+        $detail = ((Get-Content -LiteralPath $errorFile -Raw -ErrorAction SilentlyContinue) + '').Trim()
+    }
+    if ($exitCode -eq 0) {
+        return @{ ok = $true; code = 'ok'; message = '' }
+    }
+    # Classify, so the message names the thing to fix.
+    $code = 'remote_probe_failed'
+    if ($detail -match 'not logged in|credentials|gcloud auth|Reauthentication') { $code = 'gcloud_authentication_required' }
+    elseif ($detail -match 'POTENTIAL SECURITY BREACH|host key.*not match|REMOTE HOST IDENTIFICATION') { $code = 'ssh_host_key_conflict' }
+    elseif ($detail -match 'Permission denied|publickey') { $code = 'ssh_permission_denied' }
+    elseif ($detail -match 'timed out|Connection timed out|Operation timed out') { $code = 'ssh_timeout' }
+    elseif ($detail -match 'ssh.*not found|plink.*not found|No such file') { $code = 'ssh_client_missing' }
+    elseif ($detail -match 'could not resolve|Network is unreachable|No route to host') { $code = 'vm_unreachable' }
+    $message = $detail
+    if ([string]::IsNullOrWhiteSpace($message)) { $message = 'gcloud compute ssh exited ' + $exitCode }
+    if ($code -eq 'ssh_host_key_conflict') {
+        $message = ('The saved SSH host key for ' + $VmName + ' does not match the one it now ' +
+                    'presents. If you recreated the VM this is expected; confirm the instance ' +
+                    'in the Google Cloud console, then remove only that host''s cached key. ' + $message)
+    }
+    return @{ ok = $false; code = $code; message = $message }
+}
+
+function Set-CloudStage {
+    <#
+        Shared cloud startup state, so Window 2 stops waiting the moment
+        Window 1 fails instead of counting to thirty minutes and blaming a
+        zone migration that never happened.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Stage,
+        [string]$Status = 'running',
+        [string]$Zone = '',
+        [string]$ErrorCode = '',
+        [string]$ErrorMessage = ''
+    )
+    if (-not (Test-Path -LiteralPath $script:SessionDirectory)) {
+        New-Item -ItemType Directory -Path $script:SessionDirectory -Force | Out-Null
+    }
+    $state = @{
+        session_id = $script:SessionId
+        stage = $Stage
+        status = $Status
+        zone = $Zone
+        updated_at = [int][double]::Parse((Get-Date -UFormat %s))
+        error_code = $ErrorCode
+        error_message = $ErrorMessage
+    }
+    try {
+        $state | ConvertTo-Json -Compress |
+            Set-Content -LiteralPath (Join-Path $script:SessionDirectory 'cloud-stage.json') -Encoding UTF8
+    }
+    catch {
+        # Status reporting must never be the thing that fails a startup.
+    }
+}
+
+function Get-CloudStage {
+    $path = Join-Path $script:SessionDirectory 'cloud-stage.json'
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    try {
+        return (Get-Content -LiteralPath $path -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json)
+    }
+    catch {
+        return $null
+    }
+}
+
 function Get-CloudKnownHostsPath {
     return (Join-Path $script:SessionDirectory 'cloud_known_hosts')
 }
@@ -291,6 +383,20 @@ function Assert-CloudSshIdentity {
     if (-not (Test-Path -LiteralPath $script:SessionDirectory)) {
         New-Item -ItemType Directory -Path $script:SessionDirectory -Force | Out-Null
     }
+    # An already-running VM that answers an authenticated `gcloud compute ssh`
+    # is reachable, full stop. The v3.2 reference deployment does exactly this
+    # and nothing more. Host-key pinning below is an ENHANCEMENT on top; it was
+    # wrongly a precondition, so a VM that had started perfectly -- DEPTH_READY,
+    # L4 detected, CUDA available -- was refused because Compute Engine had not
+    # published a host key through either channel.
+    Write-Step 'Probing the VM over authenticated gcloud SSH...'
+    $probe = Test-CloudSshProbe -Zone $Zone
+    if (-not $probe.ok) {
+        Set-CloudStage -Stage 'verifying_ssh' -Status 'failed' -Zone $Zone `
+            -ErrorCode $probe.code -ErrorMessage $probe.message
+        throw ('Cloud SSH probe failed (' + $probe.code + '): ' + $probe.message)
+    }
+    Write-Step ('Authenticated SSH to ' + $VmName + ' works.')
     Write-Step 'Verifying SSH host key...'
     # PYTHONPATH, not the current directory: this script lives at the repository
     # root while the package is one level down in $ProjectDirectory, so
@@ -365,7 +471,8 @@ function Assert-CloudSshIdentity {
             Write-Host ('  Zone: ' + $report.identity.zone + '  address ' + $report.identity.external_ip) -ForegroundColor Yellow
             $script:CloudSshHost = $report.identity.external_ip
         }
-        Write-Host '  Cloud mode will continue using gcloud compute ssh.' -ForegroundColor Yellow
+        Write-Host '  Authenticated gcloud SSH to this VM already succeeded, so cloud' -ForegroundColor Yellow
+        Write-Host '  mode continues over that same authenticated channel.' -ForegroundColor Yellow
         Write-Host '  If a host key prompt appears, check the VM in the Google Cloud console' -ForegroundColor Yellow
         Write-Host '  before answering y. This is the one prompt you must read.' -ForegroundColor Yellow
         Write-Host ''
@@ -1152,6 +1259,7 @@ function Start-AppRole {
         throw 'gpu.py reported success but the VM zone could not be determined from `python gpu.py status`. Run it manually to check.'
     }
     Write-Step ('GPU VM is running in zone ' + $zone)
+    Set-CloudStage -Stage 'verifying_ssh' -Status 'running' -Zone $zone
 
     $gcloudPath = Assert-GcloudAvailable
 
@@ -1162,6 +1270,7 @@ function Start-AppRole {
     # against an unpinned host.
     Assert-CloudSshIdentity -PythonExe $pythonExe -Zone $zone | Out-Null
 
+    Set-CloudStage -Stage 'checking_deployment' -Status 'running' -Zone $zone
     Write-Step 'Recording the zone for the tunnel window...'
     $zoneFile = Join-Path $script:SessionDirectory 'cloud-zone.txt'
     if (-not (Test-Path -LiteralPath $script:SessionDirectory)) {
@@ -1424,6 +1533,17 @@ function Wait-ForCloudZoneFile {
         if (Test-Path -LiteralPath $zoneFile) {
             return (Get-Content -LiteralPath $zoneFile -Raw).Trim()
         }
+        # Window 1 publishes its stage; a failure there ends this wait in
+        # seconds instead of counting to thirty minutes and blaming a zone
+        # migration that is not happening.
+        $stage = Get-CloudStage
+        if ($null -ne $stage -and $stage.status -eq 'failed') {
+            throw ('Cloud startup failed in Window 1 at stage "' + $stage.stage + '" (' +
+                   $stage.error_code + '): ' + $stage.error_message + ' -- ' +
+                   'Retry Cloud, or Run Locally with START_LOCAL_LIFE_DEMO.cmd. ' +
+                   'Diagnostics are in Window 1. The VM may still be running and ' +
+                   'billable: stop it with LocalLife_Stop.exe.')
+        }
         if ($null -ne $appProcessId -and (($attempt % 10) -eq 0)) {
             if ($null -eq (Get-Process -Id $appProcessId -ErrorAction SilentlyContinue)) {
                 throw 'Window 1 (cloud GPU) has already closed without ever bringing up the VM. Check its output for the actual gpu.py error.'
@@ -1438,7 +1558,11 @@ function Wait-ForCloudZoneFile {
             # on-schedule startup read as a hang. The long-wait wording now
             # appears only once the wait itself has gone past the point where a
             # zone move is the likely explanation.
-            if ($minutesWaited -lt 5) {
+            $stageNow = Get-CloudStage
+            # Only a VM that is genuinely still being brought up can be moving
+            # zones. Past that stage the long-wait wording would be a lie.
+            $movingZones = ($null -eq $stageNow -or $stageNow.stage -eq 'starting_vm')
+            if ($minutesWaited -lt 5 -or -not $movingZones) {
                 Write-Step ('Still waiting on Window 1 to bring up the cloud VM (' + $minutesWaited + ' min so far). A normal start takes about 1-3 minutes.')
             }
             else {

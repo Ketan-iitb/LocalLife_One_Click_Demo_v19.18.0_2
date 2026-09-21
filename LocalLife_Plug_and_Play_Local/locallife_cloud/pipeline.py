@@ -2531,6 +2531,11 @@ class VisionPipeline:
                 # Whether each finalised event actually reached disk, where the
                 # file is, and whether a failure is waiting to be retried.
                 "csv_persistence": self.event_log.status(),
+                # The canonical measurement history: finalised events, read
+                # back from the CSV the pipeline already wrote. A read-only
+                # view -- it observes what tracking produced and never feeds
+                # anything back into it.
+                "measurement_history": self.event_log.recent(limit=30),
                 "last_persisted_event": self._last_persist_result,
                 "measurement_method": (
                     "hardware-stereo-depth" if self.camera_id == "realsense"

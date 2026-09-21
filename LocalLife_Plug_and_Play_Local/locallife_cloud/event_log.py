@@ -370,6 +370,35 @@ class MeasurementEventLog:
         except (OSError, csv.Error):
             return []
 
+    def recent(self, limit: int = 30) -> list[dict[str, Any]]:
+        """The newest finalised events, for the dashboard's history table.
+
+        Purely a reader. The research page used to show only the waste-plant
+        ledger, which geometry-validation mode deliberately leaves empty, so a
+        run that WAS recording measurements displayed "Waste ledger disabled in
+        validation mode" and looked broken.
+        """
+        rows = self.rows()[-max(1, limit):]
+        return [
+            {
+                "event_id": row.get("event_id"),
+                "timestamp": row.get("timestamp"),
+                "object_type": row.get("object_type") or row.get("label"),
+                "colour": row.get("colour") or row.get("color"),
+                "material": row.get("material"),
+                "length_mm": row.get("length_mm"),
+                "width_mm": row.get("width_mm"),
+                "height_mm": row.get("height_mm"),
+                "litres": row.get("estimated_litres") or row.get("volume_l"),
+                "status": row.get("status"),
+                "reason": row.get("reason"),
+                # What the operator asked to see per row.
+                "history_saved": True,
+                "csv_saved": True,
+            }
+            for row in reversed(rows)
+        ]
+
     # --------------------------------------------------------------- status
     def status(self) -> dict[str, Any]:
         """What the operator page shows: saved, failed, and where the file is."""
