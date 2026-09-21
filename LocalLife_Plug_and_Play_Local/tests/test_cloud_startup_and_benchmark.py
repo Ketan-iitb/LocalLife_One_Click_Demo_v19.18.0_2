@@ -130,7 +130,7 @@ class HostKeyVerificationTests(unittest.TestCase):
         self.assertIn("instance_id", identity.to_dict())
 
     def test_pinning_writes_only_this_vm_s_published_keys(self) -> None:
-        result = self._verifier().pin(self.known_hosts)
+        result = self._verifier().pin(self.known_hosts, attempts=1, delay=0)
         self.assertTrue(result.verified)
         lines = self.known_hosts.read_text(encoding="utf-8").strip().splitlines()
         # One line per alias: external IP, internal IP, instance name.
@@ -146,7 +146,7 @@ class HostKeyVerificationTests(unittest.TestCase):
         unrelated = Path(self._directory.name) / "user_known_hosts"
         unrelated.write_text("github.com ssh-ed25519 AAAAsomething\n", encoding="utf-8")
 
-        self._verifier().pin(self.known_hosts)
+        self._verifier().pin(self.known_hosts, attempts=1, delay=0)
         # gpu.py recreates the VM: same name and IP, genuinely new key.
         rotated = CloudSshVerifier(
             "depth-l4", "europe-west4-a", "locallife-thesis-depth",
@@ -154,7 +154,7 @@ class HostKeyVerificationTests(unittest.TestCase):
                 hostkeys=json.dumps([{"key": "ssh-ed25519", "value": _OTHER_ED25519}]),
             ),
         )
-        result = rotated.pin(self.known_hosts)
+        result = rotated.pin(self.known_hosts, attempts=1, delay=0)
         self.assertTrue(result.verified)
         body = self.known_hosts.read_text(encoding="utf-8")
         self.assertIn(_OTHER_ED25519, body)
@@ -165,12 +165,12 @@ class HostKeyVerificationTests(unittest.TestCase):
         )
 
     def test_an_unchanged_vm_is_reported_as_unchanged(self) -> None:
-        self._verifier().pin(self.known_hosts)
-        self.assertTrue(self._verifier().pin(self.known_hosts).unchanged)
+        self._verifier().pin(self.known_hosts, attempts=1, delay=0)
+        self.assertTrue(self._verifier().pin(self.known_hosts, attempts=1, delay=0).unchanged)
 
     def test_missing_published_keys_stop_with_a_security_error(self) -> None:
         # Both trusted channels empty: no guest attributes, no serial key block.
-        result = self._verifier(hostkeys="[]", serial="boot noise only\n").pin(self.known_hosts)
+        result = self._verifier(hostkeys="[]", serial="boot noise only\n").pin(self.known_hosts, attempts=1, delay=0)
         self.assertFalse(result.verified)
         self.assertEqual(result.status, STATUS_VERIFYING)
         self.assertIn("published no SSH host key", result.error)
@@ -185,13 +185,13 @@ class HostKeyVerificationTests(unittest.TestCase):
         # this is the path almost every VM actually takes.
         result = self._verifier(
             hostkeys="[]", serial=_serial_output(_ED25519),
-        ).pin(self.known_hosts)
+        ).pin(self.known_hosts, attempts=1, delay=0)
         self.assertTrue(result.verified)
         self.assertEqual(result.source, "serial-console")
         self.assertIn(_ED25519, self.known_hosts.read_text(encoding="utf-8"))
 
     def test_guest_attributes_are_preferred_when_present(self) -> None:
-        result = self._verifier(serial=_serial_output(_OTHER_ED25519)).pin(self.known_hosts)
+        result = self._verifier(serial=_serial_output(_OTHER_ED25519)).pin(self.known_hosts, attempts=1, delay=0)
         self.assertTrue(result.verified)
         self.assertEqual(result.source, "guest-attributes")
         self.assertIn(_ED25519, self.known_hosts.read_text(encoding="utf-8"))
@@ -214,14 +214,14 @@ class HostKeyVerificationTests(unittest.TestCase):
         # A long-lived serial log carries every boot; pinning an old key would
         # fail the very connection this is meant to allow.
         serial = _serial_output(_ED25519) + _serial_output(_OTHER_ED25519)
-        result = self._verifier(hostkeys="[]", serial=serial).pin(self.known_hosts)
+        result = self._verifier(hostkeys="[]", serial=serial).pin(self.known_hosts, attempts=1, delay=0)
         body = self.known_hosts.read_text(encoding="utf-8")
         self.assertTrue(result.verified)
         self.assertIn(_OTHER_ED25519, body)
         self.assertNotIn(_ED25519, body)
 
     def test_an_unresolvable_instance_stops_before_connecting(self) -> None:
-        result = self._verifier(fail="describe").pin(self.known_hosts)
+        result = self._verifier(fail="describe").pin(self.known_hosts, attempts=1, delay=0)
         self.assertFalse(result.verified)
         self.assertEqual(result.status, STATUS_RESOLVING)
         self.assertFalse(self.known_hosts.exists())
@@ -236,10 +236,37 @@ class HostKeyVerificationTests(unittest.TestCase):
         for forbidden in ("StrictHostKeyChecking=no", "accept-new", "CheckHostIP=no"):
             self.assertNotIn(forbidden, joined)
 
+    def test_guest_attributes_are_enabled_when_they_are_off(self) -> None:
+        # They are off by default on Compute Engine, which is what blocked a
+        # real run. Enabling the trusted channel is the opposite of a bypass.
+        calls: list[str] = []
+
+        def runner(command):
+            joined = " ".join(command)
+            calls.append(joined)
+            if "add-metadata" in joined:
+                return subprocess.CompletedProcess(command, 0, "", "")
+            if "get-guest-attributes" in joined:
+                # Empty until the metadata is set, then published.
+                published = any("add-metadata" in item for item in calls)
+                return subprocess.CompletedProcess(
+                    command, 0,
+                    json.dumps([{"key": "ssh-ed25519", "value": _ED25519}]) if published else "[]",
+                    "",
+                )
+            if "get-serial-port-output" in joined:
+                return subprocess.CompletedProcess(command, 0, "", "")
+            return subprocess.CompletedProcess(command, 0, _DESCRIBE, "")
+
+        verifier = CloudSshVerifier("depth-l4", "europe-west4-a", "p", runner=runner)
+        result = verifier.pin(self.known_hosts, attempts=3, delay=0)
+        self.assertTrue(result.verified, result.error)
+        self.assertTrue(any("enable-guest-attributes=TRUE" in item for item in calls))
+
     def test_the_report_carries_fingerprints_not_key_material(self) -> None:
         report = verify_cloud_ssh(
             "depth-l4", "europe-west4-a", "p", self.known_hosts,
-            runner=_fake_gcloud(),
+            runner=_fake_gcloud(), attempts=1, delay=0,
         )
         self.assertTrue(report["verified"])
         self.assertEqual(report["status"], STATUS_VERIFIED)

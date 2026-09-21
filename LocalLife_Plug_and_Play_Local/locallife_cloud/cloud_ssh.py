@@ -329,40 +329,85 @@ class CloudSshVerifier:
             return []
         return parse_serial_host_keys(completed.stdout or "")
 
-    def published_host_keys(self) -> tuple[list[HostKey], str]:
-        """The VM's own host keys, and which trusted channel they came from."""
-        keys = self.guest_attribute_host_keys()
-        source = "guest-attributes"
-        if not keys:
+    def enable_guest_attributes(self) -> bool:
+        """Switch on the channel that publishes host keys.
+
+        Guest attributes are off by default on Compute Engine, which is why a
+        real run found them empty. Enabling them is not a security compromise --
+        it is the opposite: it turns on the authenticated channel that lets the
+        host key be verified at all, instead of falling back to trusting
+        whatever the connection offers.
+        """
+        completed = self._run([
+            self.gcloud, "compute", "instances", "add-metadata", self.vm_name,
+            f"--zone={self.zone}", f"--project={self.project}",
+            "--metadata=enable-guest-attributes=TRUE", "--quiet",
+        ])
+        return completed.returncode == 0
+
+    def published_host_keys(self, *, attempts: int = 6, delay: float = 10.0) -> tuple[list[HostKey], str]:
+        """The VM's own host keys, and which trusted channel they came from.
+
+        A VM that has just booted may not have published yet, through either
+        channel, so this retries rather than failing on the first empty read --
+        and enables guest attributes once along the way, since they are off by
+        default and were the missing piece on a real run.
+        """
+        import time as _time
+
+        enabled = False
+        for attempt in range(1, max(1, attempts) + 1):
+            keys = self.guest_attribute_host_keys()
+            if keys:
+                return self._best(keys), "guest-attributes"
             keys = self.serial_console_host_keys()
-            source = "serial-console"
+            if keys:
+                return self._best(keys), "serial-console"
+            if not enabled:
+                enabled = self.enable_guest_attributes()
+                LOGGER.info(
+                    "Guest attributes %s for %s; waiting for the guest agent to "
+                    "publish its host keys.",
+                    "enabled" if enabled else "could not be enabled", self.vm_name,
+                )
+            if attempt < attempts:
+                _time.sleep(delay)
+        keys: list[HostKey] = []
         if not keys:
             raise HostKeyVerificationError(
                 f"Google Cloud published no SSH host key for {self.vm_name}: guest "
                 "attributes are empty (they are off unless "
                 "enable-guest-attributes=TRUE) and the serial console shows no host "
-                "key block. A VM that has just booted may not have printed them "
-                "yet -- retry in a moment. If it persists, run `gcloud compute "
+                "key block, after enabling guest attributes and waiting for the "
+                "guest agent. Restarting the VM makes it republish. If it "
+                "persists, run `gcloud compute "
                 f"instances get-serial-port-output {self.vm_name} --zone={self.zone} "
                 "--port=1` and look for BEGIN SSH HOST KEY KEYS."
             )
-        # De-duplicate by key type, strongest first: the serial console can
-        # carry several boots' worth of output, and only the newest matters.
+        return self._best(keys), "none"
+
+    @staticmethod
+    def _best(keys: list[HostKey]) -> list[HostKey]:
+        """De-duplicate by key type, strongest first.
+
+        The serial console can carry several boots' worth of output, and only
+        the newest key of each type matters -- pinning an older one would fail
+        the very connection this is meant to allow.
+        """
         best: dict[str, HostKey] = {}
         for key in keys:
             best[key.key_type] = key
-        ordered = sorted(best.values(), key=lambda item: PUBLISHED_KEY_TYPES.index(item.key_type))
-        return ordered, source
+        return sorted(best.values(), key=lambda item: PUBLISHED_KEY_TYPES.index(item.key_type))
 
     # ---------------------------------------------------------------- pinning
-    def pin(self, known_hosts: Path) -> VerificationResult:
+    def pin(self, known_hosts: Path, *, attempts: int = 6, delay: float = 10.0) -> VerificationResult:
         """Resolve, fetch and pin. The single call the launcher makes."""
         try:
             identity = self.resolve_identity()
         except HostKeyVerificationError as exc:
             return VerificationResult(status=STATUS_RESOLVING, error=str(exc))
         try:
-            keys, source = self.published_host_keys()
+            keys, source = self.published_host_keys(attempts=attempts, delay=delay)
         except HostKeyVerificationError as exc:
             return VerificationResult(
                 status=STATUS_VERIFYING, identity=identity, error=str(exc),
@@ -422,10 +467,12 @@ def verify_cloud_ssh(
     *,
     gcloud: str = "gcloud",
     runner: Runner | None = None,
+    attempts: int = 6,
+    delay: float = 10.0,
 ) -> dict[str, Any]:
     """Entry point for the launcher: pin the VM's identity, return a status."""
     verifier = CloudSshVerifier(vm_name, zone, project, gcloud=gcloud, runner=runner)
-    result = verifier.pin(Path(known_hosts))
+    result = verifier.pin(Path(known_hosts), attempts=attempts, delay=delay)
     if result.verified:
         LOGGER.info(
             "SSH identity verified for %s (%s) in %s: %s",

@@ -9,13 +9,18 @@ param(
     [ValidateSet('Local', 'Cloud')]
     [string]$Mode = 'Local',
 
-    # Normal operation is the complete waste-measurement mode. It used to
-    # default to geometry_validation, which disabled the history ledger, so
-    # ordinary runs recorded nothing and the downloaded CSV came back empty.
-    # geometry_validation remains available for developers as an explicit
-    # diagnostic; it is not a normal run mode and no longer disables recording.
+    # geometry_validation is the normal run mode because it detects EVERY
+    # object. Waste mode runs a strict classifier that accepts only plastic
+    # bags, paper bags and cardboard boxes, and a real run showed it dropping
+    # the bag entirely (RealSense: bags seen 0, live tracks 0).
+    #
+    # The reason this was briefly switched to waste mode no longer applies:
+    # recording used to be tied to the mode, so validation runs produced an
+    # empty CSV. Recording is now unconditional (config.ledger_active), so this
+    # mode measures, tracks AND records. Use -OperatingMode waste only when the
+    # strict three-class waste classifier is actually wanted.
     [ValidateSet('waste', 'geometry_validation')]
-    [string]$OperatingMode = 'waste',
+    [string]$OperatingMode = 'geometry_validation',
 
     [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]*$')]
     [string]$ProjectDirectory = 'LocalLife_Plug_and_Play_Local',
