@@ -1,0 +1,38 @@
+# Known-box templates for template-mode volume matching -- see
+# box_templates.py and the "Revised Dual-Camera Volume Estimation" engineering
+# recipe (sections 5, 14, 16 item 10).
+#
+# These four rigid-object references come directly from the ruler dimensions
+# encoded by the tester in parameterised_objects/ filenames. `length` and
+# `width` are the two support-plane dimensions and `height` is perpendicular
+# to that plane. `nominal_volume_liters` is the external L*W*H cuboid volume,
+# not an assumption about the package's printed liquid capacity.
+#
+# Deformable plastic bags are deliberately absent. Their external bounding
+# dimensions do not reveal the actual filled volume and must not be converted
+# into a calibration factor without an independently known volume.
+boxes:
+  - id: cardboard_box_215x115x215
+    nominal_volume_liters: 5.315875
+    dimensions_mm: { length: 215, width: 115, height: 215 }
+    tolerance_mm: 10
+    measured: true
+    source_image: box_11.5_21.5_21.5_cm.jpg
+  - id: cardboard_box_410x330x140
+    nominal_volume_liters: 18.942
+    dimensions_mm: { length: 410, width: 330, height: 140 }
+    tolerance_mm: 12
+    measured: true
+    source_image: box_41_33_14_cm.jpg
+  - id: chocolate_milk_carton_70x70x230
+    nominal_volume_liters: 1.127
+    dimensions_mm: { length: 70, width: 70, height: 230 }
+    tolerance_mm: 8
+    measured: true
+    source_image: choclate_,milk_box_7_7_23_cm.jpg
+  - id: milk_carton_95x70x230
+    nominal_volume_liters: 1.5295
+    dimensions_mm: { length: 95, width: 70, height: 230 }
+    tolerance_mm: 8
+    measured: true
+    source_image: milk_box_7_9.5_23_cm.jpg
