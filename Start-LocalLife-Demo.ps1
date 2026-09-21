@@ -246,6 +246,11 @@ function Get-PythonPackageIdentity {
 # StrictHostKeyChecking=yes against a pinned known_hosts file.
 $script:CloudSshHost = ''
 $script:PiHostResolved = $false
+# Set when GCP could not publish the VM's host key, so this run falls back to
+# interactive `gcloud compute ssh` -- the v3.2 reference deployment's own
+# approach, where the operator sees the fingerprint and answers once.
+$script:CloudSshInteractive = $false
+$script:CloudZone = ''
 $script:CloudSshUser = ''
 
 # --------------------------------------------------------------------- #
@@ -345,10 +350,30 @@ function Assert-CloudSshIdentity {
                'This is a launcher problem, not a security failure. Details: ' + $detail)
     }
     if (-not $report.verified) {
-        throw ('SSH identity could not be established (' + $report.status + '): ' + $report.error +
-               ' Cloud mode will not connect to a host it cannot identify. Run locally, or check ' +
-               '`gcloud compute instances describe ' + $VmName + ' --zone=' + $Zone + '`.')
+        # Automatic verification was not possible -- Google had not published a
+        # host key for this VM through either trusted channel. That is not
+        # proof of an attack, and hard-failing here blocked cloud mode
+        # entirely. Fall back to what the v3.2 reference deployment does:
+        # plain `gcloud compute ssh`, where PuTTY shows the operator the
+        # fingerprint and they answer once. A HUMAN confirms the key; nothing
+        # is auto-accepted, and the key is never labelled as verified.
+        Write-Host ''
+        Write-Host 'SSH HOST KEY NOT AUTOMATICALLY VERIFIED' -ForegroundColor Yellow
+        Write-Host ('  Reason: ' + $report.error) -ForegroundColor Yellow
+        if ($null -ne $report.identity) {
+            Write-Host ('  VM: ' + $report.identity.vm_name + '  instance ' + $report.identity.instance_id) -ForegroundColor Yellow
+            Write-Host ('  Zone: ' + $report.identity.zone + '  address ' + $report.identity.external_ip) -ForegroundColor Yellow
+            $script:CloudSshHost = $report.identity.external_ip
+        }
+        Write-Host '  Cloud mode will continue using gcloud compute ssh.' -ForegroundColor Yellow
+        Write-Host '  If a host key prompt appears, check the VM in the Google Cloud console' -ForegroundColor Yellow
+        Write-Host '  before answering y. This is the one prompt you must read.' -ForegroundColor Yellow
+        Write-Host ''
+        $script:CloudSshInteractive = $true
+        $script:CloudZone = $Zone
+        return $report
     }
+    $script:CloudSshInteractive = $false
     # Logged without credentials: instance id, zone, IP and fingerprints are all
     # public facts about the machine, and they are what makes a later mismatch
     # diagnosable.
@@ -359,6 +384,7 @@ function Assert-CloudSshIdentity {
         Write-Step ('  host key ' + $item.key_type + ' ' + $item.fingerprint)
     }
     $script:CloudSshHost = $report.identity.external_ip
+    $script:CloudZone = $Zone
     return $report
 }
 
@@ -438,6 +464,21 @@ function Invoke-VerifiedCloudSsh {
         [string]$Command = '',
         [string[]]$ExtraOptions = @()
     )
+    if ($script:CloudSshInteractive) {
+        # Reference-deployment path: gcloud drives PuTTY, which asks the
+        # operator about the host key the first time and caches their answer.
+        $gcloudPath = Assert-GcloudAvailable
+        $arguments = @('compute', 'ssh', $VmName, ('--project=' + $CloudProject), ('--zone=' + $script:CloudZone))
+        if ($ExtraOptions.Count -gt 0) {
+            $arguments += '--'
+            $arguments += $ExtraOptions
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($Command)) {
+            $arguments += ('--command=' + $Command)
+        }
+        & $gcloudPath @arguments
+        return
+    }
     $target = (Resolve-CloudSshUser -HostAddress $script:CloudSshHost) + '@' + $script:CloudSshHost
     $options = (Get-CloudSshOptions) + $ExtraOptions
     $previousPreference = $ErrorActionPreference
@@ -462,6 +503,13 @@ function Invoke-VerifiedCloudScp {
         [Parameter(Mandatory = $true)][string]$LocalPath,
         [Parameter(Mandatory = $true)][string]$RemotePath
     )
+    if ($script:CloudSshInteractive) {
+        $gcloudPath = Assert-GcloudAvailable
+        Invoke-NativeTolerantly $gcloudPath 'compute' 'scp' '--recurse' `
+            ('--project=' + $CloudProject) ('--zone=' + $script:CloudZone) `
+            $LocalPath ($VmName + ':' + $RemotePath)
+        return
+    }
     $target = (Resolve-CloudSshUser -HostAddress $script:CloudSshHost) + '@' + $script:CloudSshHost
     $options = Get-CloudSshOptions
     Invoke-NativeTolerantly 'scp' @options '-r' $LocalPath ($target + ':' + $RemotePath)

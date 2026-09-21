@@ -42,6 +42,7 @@ from uuid import uuid4
 from .sorting_rules import classify_sorting, mis_sort_family
 from . import __version__
 from .stable_identity import Observation, StabilitySettings, StableObjectRegistry, observations_from
+from .footprint import DimensionSmoother
 from .event_log import MeasurementEventLog, STATUS_ACCEPTED, STATUS_REJECTED, resolve_event_id
 from .storage import ResultStore
 from .tracking import ObjectTracker
@@ -462,6 +463,9 @@ class VisionPipeline:
         # settled; mirrors the ledger's own settle rule so both modes finalise
         # on the same evidence.
         self._last_persist_result: dict[str, Any] | None = None
+        self._dimension_smoother = DimensionSmoother(
+            window=config.dimension_smoothing_frames,
+        )
         # Permanent measurement identity. The detector renumbers a stationary
         # object (a pillow went 10 -> 52, a can 54 -> 63), so its track id is
         # only an association hint here and never the event id.
@@ -1515,9 +1519,16 @@ class VisionPipeline:
                     min_points=min(60, self.config.min_component_pixels),
                 )
             if dimensions is not None:
-                detection.footprint_length_mm = round(dimensions.length_mm, 2)
-                detection.footprint_width_mm = round(dimensions.width_mm, 2)
-                detection.physical_height_mm = round(dimensions.height_mm, 2)
+                # Median over a short window, so one badly segmented frame
+                # cannot decide the reported size. This is what stops a 2 cm
+                # cream box reading 4 cm on the odd frame.
+                smoothed_length, smoothed_width, smoothed_height = self._dimension_smoother.update(
+                    detection.track_id,
+                    dimensions.length_mm, dimensions.width_mm, dimensions.height_mm,
+                )
+                detection.footprint_length_mm = smoothed_length
+                detection.footprint_width_mm = smoothed_width
+                detection.physical_height_mm = smoothed_height
                 detection.dimension_confidence = round(dimensions.confidence, 4)
                 extra_dimension_flags = (
                     ("live_fitted_support_plane",)

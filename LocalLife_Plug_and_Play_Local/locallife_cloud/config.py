@@ -379,6 +379,8 @@ class AppConfig:
     # Sized from the cameras in use, not from round numbers: at 848x480 a 40 px
     # centroid drift is ~5% of frame width, and 25 mm sits above the D435's own
     # depth noise at bin distance without accepting a lift.
+    # Frames of median smoothing for reported dimensions (footprint.py).
+    dimension_smoothing_frames: int = 9
     stability_window_frames: int = 12
     min_valid_stable_frames: int = 6
     max_centroid_shift_px: float = 40.0
@@ -549,6 +551,8 @@ class AppConfig:
             cloud_startup_timeout_seconds=int(os.environ.get(
                 "CLOUD_STARTUP_TIMEOUT_SECONDS", defaults.cloud_startup_timeout_seconds)),
             diagnostic_mode=_bool_env("LOCALLIFE_DIAGNOSTIC_MODE", defaults.diagnostic_mode),
+            dimension_smoothing_frames=int(os.environ.get(
+                "DIMENSION_SMOOTHING_FRAMES", defaults.dimension_smoothing_frames)),
             stability_window_frames=int(os.environ.get(
                 "STABILITY_WINDOW_FRAMES", defaults.stability_window_frames)),
             min_valid_stable_frames=int(os.environ.get(

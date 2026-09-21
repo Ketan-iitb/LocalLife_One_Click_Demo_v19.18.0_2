@@ -469,10 +469,14 @@ class CloudStartupBlockingTests(unittest.TestCase):
         self.assertIn("UserKnownHostsFile=", self.script)
         self.assertIn("function Get-CloudKnownHostsPath", self.script)
 
-    def test_an_unverified_identity_stops_rather_than_continues(self) -> None:
+    def test_an_unverified_identity_hands_the_decision_to_a_person(self) -> None:
+        # Hard-failing here blocked cloud mode entirely when Google had not
+        # published a host key. It now falls back to the reference
+        # deployment's interactive path -- a HUMAN confirms the fingerprint --
+        # rather than either stopping dead or auto-accepting.
         self.assertIn("if (-not $report.verified)", self.script)
-        self.assertIn("SSH identity could not be established", self.script)
-        self.assertIn("will not connect to a host it cannot identify", self.script)
+        self.assertIn("$script:CloudSshInteractive = $true", self.script)
+        self.assertIn("SSH HOST KEY NOT AUTOMATICALLY VERIFIED", self.script)
 
     def test_identity_is_pinned_before_the_other_windows_are_released(self) -> None:
         # Windows 2 and 3 start their own SSH sessions as soon as the zone file
@@ -481,14 +485,26 @@ class CloudStartupBlockingTests(unittest.TestCase):
         zone_file_written = self.script.index("Set-Content -LiteralPath $zoneFile")
         self.assertLess(pinned, zone_file_written)
 
-    def test_the_tunnel_and_command_paths_both_go_through_the_verified_helper(self) -> None:
-        # No raw `gcloud compute ssh` / `scp` calls may remain: they would route
-        # back through PuTTY and reintroduce the prompt.
-        for stale in ("'compute' 'ssh'", "'compute' 'scp'"):
-            with self.subTest(stale=stale):
-                self.assertNotIn(stale, self.script)
+    def test_the_tunnel_and_command_paths_both_go_through_one_helper(self) -> None:
         self.assertIn("function Invoke-VerifiedCloudSsh", self.script)
         self.assertIn("function Invoke-VerifiedCloudScp", self.script)
+
+    def test_the_gcloud_fallback_is_gated_on_verification_failing(self) -> None:
+        # gcloud compute ssh is allowed again -- it is the v3.2 reference
+        # deployment's path, where PuTTY shows the operator the fingerprint and
+        # they answer once. It must be reachable ONLY when automatic
+        # verification could not establish identity, never as the default.
+        self.assertIn("$script:CloudSshInteractive = $false", self.script)
+        for line_number, line in enumerate(self.script.splitlines(), 1):
+            if "'compute', 'ssh'" in line or "'compute' 'scp'" in line:
+                with self.subTest(line=line_number):
+                    # Every such call sits inside the interactive-fallback block.
+                    preceding = "\n".join(self.script.splitlines()[:line_number])
+                    self.assertIn("if ($script:CloudSshInteractive)", preceding)
+
+    def test_the_fallback_never_claims_the_key_was_verified(self) -> None:
+        self.assertIn("SSH HOST KEY NOT AUTOMATICALLY VERIFIED", self.script)
+        self.assertIn("before answering y", self.script)
 
     def test_the_wait_message_does_not_cry_wolf_after_one_minute(self) -> None:
         # Observed startup with capacity in the usual zone: ~79 seconds. The

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .geometry import roi_mask
+from .footprint import estimate_extents, small_object_warning
 from .types import (
     BoxVolumeMeasurement,
     CameraIntrinsics,
@@ -1033,21 +1034,23 @@ def estimate_object_dimensions(
 
     footprint = np.column_stack((points @ u_hat, points @ v_hat))
     footprint -= np.median(footprint, axis=0)
-    covariance = np.cov(footprint, rowvar=False)
-    if covariance.shape != (2, 2) or not np.all(np.isfinite(covariance)):
+    # Minimum-area rotated rectangle, with the occluded half of a round
+    # cross-section reconstructed. Principal axes used to be used here, and
+    # they reported an upright cylinder's visible half-disc as its width --
+    # 5 x 2 cm for a 5 x 5 cm object. See footprint.py for the geometry.
+    extents = estimate_extents(footprint)
+    if extents is None:
         return None
-    _, eigenvectors = np.linalg.eigh(covariance)
-    principal = footprint @ eigenvectors
-    low = np.percentile(principal, footprint_trim_percentile, axis=0)
-    high = np.percentile(principal, 100.0 - footprint_trim_percentile, axis=0)
-    dimensions_m = np.sort(np.maximum(0.0, high - low))[::-1]
+    dimensions_m = np.array([extents.length_m, extents.width_m], dtype=np.float64)
+    footprint_flags = list(extents.flags)
+    footprint_method = extents.method
     if dimensions_m.size != 2 or dimensions_m[1] <= 0:
         return None
 
     heights = height_map[elevated]
     height_m = float(np.percentile(heights, height_percentile))
     mask_clipped = _mask_touches_measurement_boundary(object_mask, measurement_mask)
-    flags: list[str] = ["single_view_visible_footprint"]
+    flags: list[str] = ["single_view_visible_footprint", *footprint_flags]
     if depth_valid_ratio < 0.70:
         flags.append("low_valid_depth")
     if valid_count / max(1, sensed_pixels) < 0.35:
@@ -1062,6 +1065,12 @@ def estimate_object_dimensions(
     confidence -= 0.15 if "low_elevated_fraction" in flags else 0.0
     confidence -= 0.15 if "high_plane_rmse" in flags else 0.0
     confidence -= 0.20 if mask_clipped else 0.0
+    small_warning = small_object_warning(
+        float(dimensions_m[0] * 1000.0), float(dimensions_m[1] * 1000.0), height_m * 1000.0,
+    )
+    if small_warning:
+        flags.append(small_warning)
+        confidence -= 0.15
     return ObjectDimensions(
         length_mm=float(dimensions_m[0] * 1000.0),
         width_mm=float(dimensions_m[1] * 1000.0),
