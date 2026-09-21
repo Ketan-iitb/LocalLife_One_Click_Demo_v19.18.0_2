@@ -482,16 +482,28 @@ function Resolve-PiHostOnce {
         return $script:PiHost
     }
     $projectRoot = Find-ProjectRoot
+    if (-not (Test-Path -LiteralPath $script:SessionDirectory)) {
+        New-Item -ItemType Directory -Path $script:SessionDirectory -Force | Out-Null
+    }
     $cache = Join-Path $script:SessionDirectory 'pi-address.json'
+    $errorFile = Join-Path $script:SessionDirectory 'pi-lookup-stderr.txt'
     $previousPythonPath = $env:PYTHONPATH
     $env:PYTHONPATH = $projectRoot
+    # stderr to a file, not the pipeline: under this script's own
+    # $ErrorActionPreference = 'Stop', native stderr can be promoted to a
+    # terminating error whose message is only its first line -- which is how a
+    # real run reported "DEMONSTRATION ERROR: Traceback (most recent call
+    # last):" and nothing else.
     try {
-        $raw = (& $PythonExe '-c' `
-            'import json,sys,pathlib;from locallife_cloud.pi_discovery import resolve_pi,unreachable_message;a=resolve_pi(sys.argv[1],cache_path=pathlib.Path(sys.argv[2]));print(json.dumps({"found":a is not None,"target":None if a is None else a.target,"host":None if a is None else a.host,"source":None if a is None else a.source,"hint":None if a is not None else unreachable_message(sys.argv[1],pathlib.Path(sys.argv[2]))}))' `
-            $PiHost $cache 2>&1 | Out-String)
+        $raw = (& $PythonExe '-m' 'locallife_cloud.pi_discovery' `
+            '--pi-host' $PiHost '--cache' $cache 2>$errorFile | Out-String)
     }
     finally {
         $env:PYTHONPATH = $previousPythonPath
+    }
+    $errorText = ''
+    if (Test-Path -LiteralPath $errorFile) {
+        $errorText = ((Get-Content -LiteralPath $errorFile -Raw -ErrorAction SilentlyContinue) + '').Trim()
     }
     $report = $null
     foreach ($line in ($raw -split "`n")) {
@@ -499,12 +511,24 @@ function Resolve-PiHostOnce {
         if ($trimmed.StartsWith('{')) { try { $report = $trimmed | ConvertFrom-Json } catch { } }
     }
     if ($null -eq $report) {
-        Write-Step ('Could not run the Raspberry Pi lookup; using ' + $PiHost + ' as configured. ' + $raw.Trim())
+        # The lookup could not run. That is not the same as the Pi being
+        # absent, so carry on with the configured name and let ssh report.
+        $detail = $errorText
+        if ([string]::IsNullOrWhiteSpace($detail)) { $detail = $raw.Trim() }
+        Write-Host '--- Raspberry Pi lookup output ---' -ForegroundColor Yellow
+        Write-Host $detail -ForegroundColor Yellow
+        Write-Step ('Could not run the Raspberry Pi lookup; trying ' + $PiHost + ' as configured.')
         $script:PiHostResolved = $true
         return $PiHost
     }
     if (-not $report.found) {
-        throw $report.hint
+        # Print the whole hint first: a multi-line message inside a thrown
+        # error shows only its first line.
+        Write-Host '' 
+        Write-Host $report.hint -ForegroundColor Yellow
+        Write-Host ''
+        throw ('The Raspberry Pi could not be reached at ' + $PiHost +
+               '. See the steps printed just above, then start again.')
     }
     if ($report.target -ne $PiHost) {
         Write-Step ('Raspberry Pi found at ' + $report.host + ' (' + $report.source +

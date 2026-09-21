@@ -154,3 +154,47 @@ def unreachable_message(pi_host: str, cache_path: Path | None = None) -> str:
         ".local names at all.\n"
         "Once it connects once, the address is remembered for later runs."
     )
+
+
+def main(argv: list[str] | None = None) -> int:  # pragma: no cover - CLI
+    """Called by Start-LocalLife-Demo.ps1; prints one JSON object on stdout.
+
+    Never raises and never prints a bare traceback: the caller parses one JSON
+    object, and a traceback on stderr tells the operator nothing (a real run
+    showed exactly that -- "DEMONSTRATION ERROR: Traceback (most recent call
+    last):" and no further detail).
+    """
+    import argparse
+    import traceback
+
+    parser = argparse.ArgumentParser(description="Locate the Raspberry Pi.")
+    parser.add_argument("--pi-host", required=True)
+    parser.add_argument("--cache", default="")
+    parser.add_argument("--timeout", type=float, default=1.5)
+    arguments = parser.parse_args(argv)
+    cache = Path(arguments.cache) if arguments.cache else None
+    try:
+        address = resolve_pi(arguments.pi_host, cache_path=cache, timeout=arguments.timeout)
+        report = {
+            "found": address is not None,
+            "target": None if address is None else address.target,
+            "host": None if address is None else address.host,
+            "source": None if address is None else address.source,
+            "hint": None if address is not None else unreachable_message(
+                arguments.pi_host, cache,
+            ),
+            "error": None,
+        }
+    except Exception as exc:  # noqa: BLE001
+        report = {
+            "found": False, "target": None, "host": None, "source": None,
+            "error": f"{type(exc).__name__}: {exc}",
+            "hint": unreachable_message(arguments.pi_host, cache),
+            "traceback": traceback.format_exc().strip().splitlines()[-3:],
+        }
+    print(json.dumps(report))
+    return 0 if report["found"] else 2
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
