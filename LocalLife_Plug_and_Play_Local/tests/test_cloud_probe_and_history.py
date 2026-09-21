@@ -204,3 +204,118 @@ class CloudProbeScriptTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SessionIdentityTests(unittest.TestCase):
+    """The crash after VM readiness: an undeclared script-scoped variable.
+
+    Set-StrictMode makes reading an undeclared variable a terminating error, so
+    Set-CloudStage -- which reported progress -- killed a run whose VM had
+    started perfectly in europe-west3-b.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.script = (
+            Path(__file__).resolve().parent.parent.parent / "Start-LocalLife-Demo.ps1"
+        ).read_text(encoding="utf-8", errors="replace")
+
+    def test_the_session_id_is_declared_before_any_status_write(self) -> None:
+        declared = self.script.index("$script:SessionId = ''")
+        first_use = self.script.index("session_id = (Get-RequiredSessionId)")
+        self.assertLess(declared, first_use)
+
+    def test_strict_mode_is_not_weakened(self) -> None:
+        self.assertIn("Set-StrictMode -Version Latest", self.script)
+
+    def test_status_writes_go_through_the_lifecycle_helper(self) -> None:
+        self.assertIn("function Get-RequiredSessionId", self.script)
+        # Set-CloudStage is the writer that crashed. It must resolve the id
+        # through the helper, never read the bare variable, because it can run
+        # in a child window that never assigned it.
+        body = self.script[self.script.index("function Set-CloudStage"):]
+        body = body[: body.index("function Get-CloudStage")]
+        self.assertIn("session_id = (Get-RequiredSessionId)", body)
+        self.assertNotIn("$script:SessionId", body)
+
+    def test_the_launcher_creates_and_saves_one_session_id(self) -> None:
+        # The launcher assigns the id and writes it into session.json, which is
+        # what every child window recovers it from.
+        created = self.script.index("$script:SessionId = [Guid]::NewGuid()")
+        saved = self.script.index("session_id = $script:SessionId")
+        self.assertLess(created, saved)
+
+    def test_child_windows_are_given_the_same_session_id(self) -> None:
+        self.assertIn("' -SessionId ' + (Quote-PowerShellLiteral -Value (Get-RequiredSessionId))",
+                      self.script)
+        self.assertIn("[string]$SessionId = ''", self.script)
+
+    def test_a_child_adopts_the_supplied_id_before_running(self) -> None:
+        adopt = self.script.index("Get-RequiredSessionId -SessionId $SessionId")
+        roles = self.script.index("elseif ($Role -eq 'RecipeApi')")
+        self.assertLess(adopt, roles)
+
+    def test_a_standalone_run_is_marked_as_such(self) -> None:
+        # Not a silent fake id: a hand-started role says so in the id itself.
+        self.assertIn("'standalone-'", self.script)
+
+    def test_a_cloud_failure_is_published_for_the_tunnel_window(self) -> None:
+        self.assertIn("-Status 'failed'", self.script)
+        self.assertIn("cloud_startup_failed", self.script)
+        published = self.script.index("cloud_startup_failed")
+        reported = self.script.index("'DEMONSTRATION ERROR: '")
+        self.assertLess(published, reported)
+
+    def test_the_resolved_zone_survives_into_the_failure_record(self) -> None:
+        self.assertIn("$failedZone", self.script)
+        self.assertIn("-Zone $failedZone", self.script)
+
+    def test_gpu_zone_hunting_was_not_touched(self) -> None:
+        # The migration that found europe-west3-b lives in gpu.py and must be
+        # untouched by a session-state fix.
+        gpu = (Path(__file__).resolve().parent.parent.parent / "gpu.py").read_text(
+            encoding="utf-8", errors="replace")
+        self.assertIn("stockout", gpu)
+        self.assertIn("hunt", gpu)
+
+
+class CsvSnapshotTests(unittest.TestCase):
+    """A downloaded CSV is a snapshot; the canonical file keeps growing."""
+
+    def setUp(self) -> None:
+        self.app, self.client, self._directory = _app()
+        self.addCleanup(self._directory.cleanup)
+        self.station = self.app.config["CAMERA_COORDINATOR"].camera("realsense")
+
+    def _download(self) -> list[dict]:
+        body = self.client.get("/api/cameras/realsense/measurements.csv").get_data()
+        return list(csv.DictReader(io.StringIO(body.decode("utf-8-sig"))))
+
+    def test_a_later_download_carries_rows_the_earlier_one_could_not(self) -> None:
+        self.station.event_log.record({"event_id": "first", "volume_l": 1.0})
+        first = self._download()
+        self.station.event_log.record({"event_id": "second", "volume_l": 2.0})
+        second = self._download()
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(second), 2)
+        # The first download is unchanged by the later write: it is a snapshot.
+        self.assertEqual([row["event_id"] for row in first], ["first"])
+
+    def test_the_canonical_file_grows_on_disk(self) -> None:
+        path = self.station.event_log.path
+        self.station.event_log.record({"event_id": "a", "volume_l": 1.0})
+        first_size = path.stat().st_size
+        self.station.event_log.record({"event_id": "b", "volume_l": 2.0})
+        self.assertGreater(path.stat().st_size, first_size)
+
+    def test_the_last_write_time_is_reported(self) -> None:
+        self.assertIsNone(self.station.event_log.status()["last_write_at"])
+        self.station.event_log.record({"event_id": "a", "volume_l": 1.0})
+        self.assertIsNotNone(self.station.event_log.status()["last_write_at"])
+
+    def test_the_page_shows_the_count_and_last_write(self) -> None:
+        from locallife_cloud.operator_dashboard import OPERATOR_DASHBOARD
+
+        self.assertIn("Recorded measurements: ", OPERATOR_DASHBOARD)
+        self.assertIn("Last CSV write: ", OPERATOR_DASHBOARD)
+        self.assertIn("DOWNLOAD LATEST CSV", OPERATOR_DASHBOARD)

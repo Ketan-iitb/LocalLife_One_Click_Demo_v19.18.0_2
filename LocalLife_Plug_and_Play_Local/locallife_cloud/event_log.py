@@ -35,6 +35,7 @@ import json
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -157,6 +158,7 @@ class MeasurementEventLog:
         self._failures: list[_Failure] = []
         self._persisted = 0
         self._last_error: str | None = None
+        self._last_write_at: float | None = None
         self._seen: set[str] = set()
         self._recover_existing_event_ids()
 
@@ -258,6 +260,7 @@ class MeasurementEventLog:
                 return PersistResult(event_id=event_id, written=False, error=reason, path=self.path)
             self._seen.add(event_id)
             self._persisted += 1
+            self._last_write_at = time.time()
             LOGGER.info("Persisted event %s to %s", event_id, self.path)
             return PersistResult(event_id=event_id, written=True, path=self.path)
 
@@ -406,6 +409,10 @@ class MeasurementEventLog:
             "csv_path": str(self.path),
             "session_id": self.session_id,
             "events_persisted": self._persisted,
+            # So the page can say when the canonical file last grew. A CSV
+            # already downloaded is a snapshot; it never updates in Excel, and
+            # the operator needs to see that the live file is still moving.
+            "last_write_at": self._last_write_at,
             "persistence_failures": len(self._failures),
             "last_error": self._last_error,
             "failed_event_ids": [item.event_id for item in self._failures],

@@ -28,6 +28,11 @@ param(
     [ValidatePattern('^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$')]
     [string]$PiHost = 'locallife@locallife.local',
 
+    # Passed to every child window so all three report against one session.
+    # Blank in a hand-started role, which then recovers it from session.json.
+    [ValidatePattern('^[A-Za-z0-9-]*$')]
+    [string]$SessionId = '',
+
     [ValidateRange(1024, 65535)]
     [int]$Port = 8000,
 
@@ -80,6 +85,11 @@ $ProgressPreference = 'SilentlyContinue'
 
 $script:SessionDirectory = Join-Path $env:LOCALAPPDATA 'LocalLifeDemo'
 $script:SessionPath = Join-Path $script:SessionDirectory 'session.json'
+# Declared, not invented: Set-StrictMode makes reading an undeclared script
+# variable a terminating error, and Set-CloudStage read this one before anything
+# had ever assigned it. The real id is created by the launcher and recovered
+# from session.json by every child window; this only guarantees the name exists.
+$script:SessionId = ''
 
 # -Mode Cloud only: a dedicated, port-forwarding-only Linux user provisioned
 # on the depth-l4 GPU VM so the Raspberry Pi can open its own direct SSH
@@ -336,7 +346,7 @@ function Set-CloudStage {
         New-Item -ItemType Directory -Path $script:SessionDirectory -Force | Out-Null
     }
     $state = @{
-        session_id = $script:SessionId
+        session_id = (Get-RequiredSessionId)
         stage = $Stage
         status = $Status
         zone = $Zone
@@ -898,6 +908,35 @@ function Find-ProjectRoot {
     throw ('Project ' + $ProjectDirectory + ' not found. Checked: ' + ($candidates -join ', '))
 }
 
+function Get-RequiredSessionId {
+    <#
+        The one session id for this run.
+
+        Order: an id already resolved in this process, then the one the launcher
+        saved in session.json, then -- only for a child role started by hand --
+        a clearly marked standalone id. Never a silent fake: a standalone id
+        says so in its own name, so a status file written by a detached
+        diagnostic run cannot be mistaken for the launcher's.
+    #>
+    param([string]$SessionId = '')
+    if (-not [string]::IsNullOrWhiteSpace($SessionId)) {
+        $script:SessionId = $SessionId
+        return $script:SessionId
+    }
+    if (-not [string]::IsNullOrWhiteSpace($script:SessionId)) {
+        return $script:SessionId
+    }
+    $saved = Get-Session
+    if ($null -ne $saved -and
+        $saved.PSObject.Properties.Name -contains 'session_id' -and
+        -not [string]::IsNullOrWhiteSpace($saved.session_id)) {
+        $script:SessionId = [string]$saved.session_id
+        return $script:SessionId
+    }
+    $script:SessionId = 'standalone-' + [Guid]::NewGuid().ToString('N').Substring(0, 8)
+    return $script:SessionId
+}
+
 function Get-Session {
     if (-not (Test-Path -LiteralPath $script:SessionPath)) {
         return $null
@@ -1011,6 +1050,7 @@ function Start-RoleWindow {
         ' -Role ' + (Quote-PowerShellLiteral -Value $ChildRole) +
         ' -Mode ' + (Quote-PowerShellLiteral -Value $Mode) +
         ' -OperatingMode ' + (Quote-PowerShellLiteral -Value $OperatingMode) +
+        ' -SessionId ' + (Quote-PowerShellLiteral -Value (Get-RequiredSessionId)) +
         ' -ProjectDirectory ' + (Quote-PowerShellLiteral -Value $ProjectDirectory) +
         ' -PiHost ' + (Quote-PowerShellLiteral -Value $PiHost) +
         ' -Port ' + $Port +
@@ -1945,7 +1985,9 @@ function Start-Demo {
         $ApiToken = [Guid]::NewGuid().ToString('N')
     }
 
+    $script:SessionId = [Guid]::NewGuid().ToString('N').Substring(0, 12)
     $session = @{
+        session_id = $script:SessionId
         started_at = (Get-Date).ToString('o')
         mode = $Mode
         operating_mode = $OperatingMode
@@ -2087,6 +2129,10 @@ try {
     elseif ($Role -eq 'Doctor') {
         Invoke-Doctor
     }
+    if (-not [string]::IsNullOrWhiteSpace($SessionId)) {
+        Get-RequiredSessionId -SessionId $SessionId | Out-Null
+    }
+    if ($false) { }
     elseif ($Role -eq 'RecipeApi') {
         Start-RecipeApiRole
     }
@@ -2105,6 +2151,21 @@ try {
     }
 }
 catch {
+    # Publish the failure before reporting it: Window 2 watches this file and
+    # would otherwise keep counting minutes at a VM that is already up.
+    if ($Role -eq 'App' -and $Mode -eq 'Cloud') {
+        $failedStage = 'session_initialisation'
+        $current = Get-CloudStage
+        if ($null -ne $current -and -not [string]::IsNullOrWhiteSpace($current.stage)) {
+            $failedStage = [string]$current.stage
+        }
+        $failedZone = ''
+        if ($null -ne $current -and -not [string]::IsNullOrWhiteSpace($current.zone)) {
+            $failedZone = [string]$current.zone
+        }
+        Set-CloudStage -Stage $failedStage -Status 'failed' -Zone $failedZone `
+            -ErrorCode 'cloud_startup_failed' -ErrorMessage $_.Exception.Message
+    }
     Write-Host ''
     Write-Host ('DEMONSTRATION ERROR: ' + $_.Exception.Message) -ForegroundColor Red
     Write-Host ''
