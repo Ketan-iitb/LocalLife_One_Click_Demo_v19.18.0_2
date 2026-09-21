@@ -367,17 +367,25 @@ class AppConfig:
     bin_polygon: tuple[tuple[float, float], ...] = ()
     color_waste_streams: dict[str, str] = field(default_factory=dict)
     auto_deposit: bool = True
-    # Whether the measurement history (waste ledger) records deposits.
-    #
-    # None means "follow operating_mode", which is the behaviour every earlier
-    # build had. The operator's enable/disable button sets it explicitly, and
-    # that matters: tying the ledger to operating_mode meant switching history
-    # on also switched the *classifier* to strict waste mode, where only
-    # plastic bags, paper bags and cardboard boxes are accepted -- so a
-    # backpack, a box, or anything else being measured simply stopped being
-    # detected. Recording history and restricting what counts as waste are two
-    # different decisions, so they are two different settings.
+    # Retained so existing callers and saved settings keep loading, but it no
+    # longer switches anything off: `ledger_active` is unconditionally True.
+    # See its docstring for why recording stopped being optional.
     ledger_enabled: bool | None = None
+    # Validation/geometry mode is a developer diagnostic, not a run mode. When
+    # set, rows are still persisted -- they are marked, so a diagnostic session
+    # can never be mistaken for a measurement one.
+    diagnostic_mode: bool = False
+    # Stability window before a measurement may be finalised (stable_identity.py).
+    # Sized from the cameras in use, not from round numbers: at 848x480 a 40 px
+    # centroid drift is ~5% of frame width, and 25 mm sits above the D435's own
+    # depth noise at bin distance without accepting a lift.
+    stability_window_frames: int = 12
+    min_valid_stable_frames: int = 6
+    max_centroid_shift_px: float = 40.0
+    min_mask_iou: float = 0.45
+    max_depth_change_mm: float = 25.0
+    max_volume_variation_percent: float = 12.0
+    finalisation_hold_seconds: float = 1.0
     settle_frames: int = 5
     settle_volume_tolerance: float = 0.12
     volume_stability_frames: int = 3
@@ -540,6 +548,20 @@ class AppConfig:
             allow_local_fallback=_bool_env("ALLOW_LOCAL_FALLBACK", defaults.allow_local_fallback),
             cloud_startup_timeout_seconds=int(os.environ.get(
                 "CLOUD_STARTUP_TIMEOUT_SECONDS", defaults.cloud_startup_timeout_seconds)),
+            diagnostic_mode=_bool_env("LOCALLIFE_DIAGNOSTIC_MODE", defaults.diagnostic_mode),
+            stability_window_frames=int(os.environ.get(
+                "STABILITY_WINDOW_FRAMES", defaults.stability_window_frames)),
+            min_valid_stable_frames=int(os.environ.get(
+                "MIN_VALID_STABLE_FRAMES", defaults.min_valid_stable_frames)),
+            max_centroid_shift_px=float(os.environ.get(
+                "MAX_CENTROID_SHIFT_PX", defaults.max_centroid_shift_px)),
+            min_mask_iou=float(os.environ.get("MIN_MASK_IOU", defaults.min_mask_iou)),
+            max_depth_change_mm=float(os.environ.get(
+                "MAX_DEPTH_CHANGE_MM", defaults.max_depth_change_mm)),
+            max_volume_variation_percent=float(os.environ.get(
+                "MAX_VOLUME_VARIATION_PERCENT", defaults.max_volume_variation_percent)),
+            finalisation_hold_seconds=float(os.environ.get(
+                "FINALISATION_HOLD_SECONDS", defaults.finalisation_hold_seconds)),
             benchmark_mode=_bool_env("LOCALLIFE_BENCHMARK_MODE", defaults.benchmark_mode),
             benchmark_input_id=os.environ.get(
                 "LOCALLIFE_BENCHMARK_INPUT_ID", defaults.benchmark_input_id),
@@ -686,15 +708,19 @@ class AppConfig:
 
     @property
     def ledger_active(self) -> bool:
-        """Is the measurement history recording right now?
+        """The measurement history is always on during normal operation.
 
-        Independent of `operating_mode`, so geometry-validation runs -- which
-        detect any object rather than only the three waste classes -- can still
-        record their deposits.
+        It used to follow `operating_mode`, and the launcher defaulted to
+        geometry validation, so ordinary runs recorded nothing and downloaded an
+        empty CSV. Recording is not a mode, a preference or a toggle: it is what
+        the system is for. Nothing in the operator UI can switch it off.
+
+        The one exception is an explicitly isolated developer diagnostic
+        (`diagnostic_mode`), and even that does not disable persistence -- it
+        only marks the rows it produces, so a diagnostic run can never be
+        mistaken for a measurement session.
         """
-        if self.ledger_enabled is None:
-            return self.operating_mode == "waste"
-        return self.ledger_enabled
+        return True
 
     @property
     def processing_mode(self) -> str:

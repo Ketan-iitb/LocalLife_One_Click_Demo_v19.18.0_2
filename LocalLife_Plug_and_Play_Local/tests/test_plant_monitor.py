@@ -123,7 +123,7 @@ class LedgerTests(unittest.TestCase):
 
 
 class AutomaticDepositTests(unittest.TestCase):
-    def test_geometry_validation_tracks_and_measures_without_writing_waste_ledger(self) -> None:
+    def test_geometry_validation_tracks_measures_and_records(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             detector = AdjustableDetector()
             config = AppConfig(
@@ -154,13 +154,29 @@ class AutomaticDepositTests(unittest.TestCase):
 
             state = pipeline.state()
             self.assertEqual(state["operating_mode"], "geometry_validation")
-            self.assertFalse(state["waste_ledger_enabled"])
+            # Recording is no longer tied to the mode. Validation runs used to
+            # disable the ledger, which is how ordinary runs ended up with an
+            # empty CSV; geometry validation now measures AND records, while
+            # still not auto-depositing into the waste plant ledger.
+            self.assertTrue(state["waste_ledger_enabled"])
             self.assertFalse(state["auto_deposit"])
             self.assertEqual(state["session_seen"]["total"], 1)
             self.assertEqual(analysis.detections[0].accepted_class, "measurement_object")
             self.assertIsNotNone(analysis.detections[0].footprint_length_mm)
+            # The waste-plant ledger stays untouched: depositing into the
+            # waste plant is a waste-mode concept and has not changed.
             self.assertEqual(state["plant"]["observed_count"], 0)
             self.assertEqual(state["plant"]["deposited_count"], 0)
+            # What DID change: the measurement record no longer depends on the
+            # mode, so this validation run has a persisted, downloadable row
+            # instead of the empty CSV it used to produce.
+            self.assertTrue(state["waste_ledger_enabled"])
+            self.assertEqual(state["csv_persistence"]["events_persisted"], 1)
+            self.assertTrue(state["csv_persistence"]["healthy"])
+            row = pipeline.event_log.rows()[0]
+            self.assertEqual(row["operating_mode"], "geometry_validation")
+            self.assertTrue(row["event_id"])
+            self.assertTrue(float(row["estimated_litres"]) > 0)
 
     def test_stable_bag_and_box_are_counted_once_and_color_is_recorded(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

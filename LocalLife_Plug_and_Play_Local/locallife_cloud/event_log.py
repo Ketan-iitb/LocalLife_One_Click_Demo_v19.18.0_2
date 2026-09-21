@@ -104,21 +104,41 @@ class MeasurementEventLog:
 
     COLUMNS = [
         # Identity and provenance -- first, so a spreadsheet opens on the keys.
-        "event_id", "session_id", "timestamp", "camera_id", "processing_mode",
-        "operating_mode", "calibration_id", "track_id", "status", "status_reason",
+        # `event_id` is the permanent measurement id from stable_identity.py,
+        # never the detector's track number, which is renumbered mid-object.
+        "session_id", "event_id", "track_id", "timestamp", "processing_mode",
+        "camera_source", "camera_id", "calibration_id", "operating_mode",
+        "diagnostic", "status", "reason",
         # Classification
-        "label", "accepted_class", "color", "color_confidence", "sorting_status",
-        "material", "material_confidence", "bag_count",
-        # Volume
-        "volume_l", "added_volume_l", "displaced_volume_l",
+        "object_type", "label", "accepted_class",
+        "colour", "color", "colour_confidence", "color_confidence",
+        "material", "material_confidence", "sorting_result", "sorting_status",
+        "bag_count",
+        # Dimensions and volume
+        "length_mm", "width_mm", "height_mm",
+        "estimated_litres", "volume_l", "added_volume_l", "displaced_volume_l",
         "volume_before_l", "volume_after_l", "volume_uncertainty_l",
-        # Dimensions and quality
-        "length_mm", "width_mm", "height_mm", "dimension_confidence",
-        "dimension_method", "depth_coverage_percent", "measurement_method",
-        "measurement_quality", "volume_rejection_reason", "calibration_valid",
+        "volume_confidence", "overall_confidence",
+        # Method and quality
+        "dimension_confidence", "dimension_method", "depth_coverage_percent",
+        "measurement_method", "measurement_quality", "volume_rejection_reason",
+        "calibration_valid", "stable_frames", "detector_track_ids",
+        "model_version", "pipeline_version",
         # Optional ground truth, filled in by the operator for benchmark runs.
         "ground_truth_litres", "absolute_error_litres", "percentage_error",
     ]
+
+    # British and American spellings of the same field are both written, with
+    # the same value. The spec names `colour`/`sorting_result`, the pipeline and
+    # every existing export use `color`/`sorting_status`, and silently dropping
+    # either would break one of them.
+    ALIASES = {
+        "colour": "color",
+        "colour_confidence": "color_confidence",
+        "sorting_result": "sorting_status",
+        "object_type": "label",
+        "estimated_litres": "volume_l",
+    }
 
     def __init__(
         self,
@@ -139,6 +159,33 @@ class MeasurementEventLog:
         self._last_error: str | None = None
         self._seen: set[str] = set()
         self._recover_existing_event_ids()
+
+    def assert_writable(self) -> None:
+        """Fail loudly at startup if the CSV cannot be written.
+
+        An unwritable results directory used to surface hours later as an empty
+        download. The operator should learn about it before the demonstration,
+        not after it.
+        """
+        try:
+            self.directory.mkdir(parents=True, exist_ok=True)
+            probe = self.directory / ".locallife_write_probe"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+        except OSError as exc:
+            raise RuntimeError(
+                f"Measurement CSV persistence cannot start: {self.path} is not "
+                f"writable ({exc}). Fix the results directory before running; "
+                "the system will not record measurements without it."
+            ) from exc
+
+    def startup_report(self, *, diagnostic: bool = False) -> list[str]:
+        """The three lines the operator must see before a run begins."""
+        return [
+            f"Measurement mode: {'diagnostic' if diagnostic else 'normal'}",
+            "History ledger: enabled",
+            f"CSV persistence: enabled ({self.path})",
+        ]
 
     # ------------------------------------------------------------- identity
     @property
@@ -199,6 +246,7 @@ class MeasurementEventLog:
             payload = dict(row)
             payload.setdefault("session_id", self.session_id)
             payload.setdefault("status", STATUS_ACCEPTED)
+            payload = self._with_aliases(payload)
             payload = self._with_ground_truth_error(payload)
             try:
                 self._append(payload)
@@ -232,11 +280,21 @@ class MeasurementEventLog:
             output.flush()
             os.fsync(output.fileno())
 
+    @classmethod
+    def _with_aliases(cls, row: dict[str, Any]) -> dict[str, Any]:
+        """Fill each spelling from whichever one the caller supplied."""
+        for alias, canonical in cls.ALIASES.items():
+            if row.get(alias) in (None, "") and row.get(canonical) not in (None, ""):
+                row[alias] = row[canonical]
+            elif row.get(canonical) in (None, "") and row.get(alias) not in (None, ""):
+                row[canonical] = row[alias]
+        return row
+
     @staticmethod
     def _with_ground_truth_error(row: dict[str, Any]) -> dict[str, Any]:
         """Fill in the error columns when a ground truth was supplied."""
         truth = row.get("ground_truth_litres")
-        estimate = row.get("volume_l")
+        estimate = row.get("volume_l") if row.get("volume_l") is not None else row.get("estimated_litres")
         if truth in (None, "") or estimate in (None, ""):
             return row
         try:

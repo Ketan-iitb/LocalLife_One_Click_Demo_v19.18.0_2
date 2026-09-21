@@ -366,7 +366,14 @@ def create_app(
         enabled = payload.get("enabled")
         if not isinstance(enabled, bool):
             return jsonify(error="Provide enabled as true or false"), 400
-        return jsonify(ok=True, **manager.set_waste_ledger(enabled))
+        if not enabled:
+            # Recording is what the system is for. Switching it off is how live
+            # runs ended up with an empty CSV, so the UI cannot do it any more.
+            return jsonify(
+                error="The measurement history is always on and cannot be disabled.",
+                waste_ledger_enabled=True,
+            ), 409
+        return jsonify(ok=True, **manager.set_waste_ledger(True))
 
     @app.get("/api/benchmark")
     def benchmark_state() -> Any:

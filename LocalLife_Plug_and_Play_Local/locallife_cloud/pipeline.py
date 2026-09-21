@@ -40,6 +40,8 @@ from .heightmap_volume import (
 from uuid import uuid4
 
 from .sorting_rules import classify_sorting, mis_sort_family
+from . import __version__
+from .stable_identity import Observation, StabilitySettings, StableObjectRegistry, observations_from
 from .event_log import MeasurementEventLog, STATUS_ACCEPTED, STATUS_REJECTED, resolve_event_id
 from .storage import ResultStore
 from .tracking import ObjectTracker
@@ -460,6 +462,23 @@ class VisionPipeline:
         # settled; mirrors the ledger's own settle rule so both modes finalise
         # on the same evidence.
         self._last_persist_result: dict[str, Any] | None = None
+        # Permanent measurement identity. The detector renumbers a stationary
+        # object (a pillow went 10 -> 52, a can 54 -> 63), so its track id is
+        # only an association hint here and never the event id.
+        # detector track id -> permanent event id, for the frames after the
+        # detector renumbers an object that is already committed.
+        self._permanent_event_ids: dict[int, int] = {}
+        self.identities = StableObjectRegistry(
+            StabilitySettings(
+                window_frames=config.stability_window_frames,
+                min_valid_stable_frames=config.min_valid_stable_frames,
+                max_centroid_shift_px=config.max_centroid_shift_px,
+                min_mask_iou=config.min_mask_iou,
+                max_depth_change_mm=config.max_depth_change_mm,
+                max_volume_variation_percent=config.max_volume_variation_percent,
+                finalisation_hold_seconds=config.finalisation_hold_seconds,
+            )
+        )
         # Support plane recorded at calibration, and whether the live camera
         # still matches it. An old plane must never be applied to a new pose.
         self._calibration_id: str | None = None
@@ -1799,7 +1818,7 @@ class VisionPipeline:
                 should_observe = should_observe and self._measurement_is_recordable(detection)
             # A track can become measurable several frames after it was born.
             # Check on every confirmed frame, not only when its ID is new.
-            if self.config.ledger_active:
+            if self.config.operating_mode == "waste":
                 if should_observe:
                     self.ledger.observe(detection, timestamp=timestamp)
                 # Preserve production behavior: an already-observed record
@@ -1808,7 +1827,7 @@ class VisionPipeline:
                 self.ledger.refresh(detection)
 
         newly_deposited: list[Detection] = []
-        if self.config.auto_deposit and self.config.ledger_active:
+        if self.config.auto_deposit and self.config.operating_mode == "waste":
             for detection in detections:
                 if detection.track_id is None or self.ledger.is_deposited(detection.track_id):
                     continue
@@ -2660,7 +2679,10 @@ class VisionPipeline:
         validation runs used to produce no spreadsheet at all -- so here a
         settled, non-phantom, measured track is the finalised event.
         """
-        if self.config.ledger_active and self.config.auto_deposit:
+        if self.config.operating_mode == "waste" and self.config.auto_deposit:
+            # Waste mode persists at the moment the deposit is accepted; this
+            # settle-based path is for every other mode, so that recording never
+            # depends on the mode. Exactly one of the two runs.
             return
         for detection in detections:
             if detection.track_id is None or detection.track_id in self._csv_logged:
@@ -2687,9 +2709,15 @@ class VisionPipeline:
         a repeated frame, a dashboard refresh, a retry or a cloud reconnection
         resolves to the same id and appends nothing the second time.
         """
+        # Keyed on the PERMANENT event id where one exists. Falling back to the
+        # detector's track id would reintroduce the renumbering bug, so that
+        # fallback only applies to objects that never reached stability (which
+        # are rejections, and are meant to be recorded once each).
+        permanent = self._permanent_event_ids.get(detection.track_id)
         event_id = resolve_event_id(
-            self.event_log.session_id, self.camera_id, detection.track_id,
-            suffix=status,
+            self.event_log.session_id, self.camera_id,
+            permanent if permanent is not None else detection.track_id,
+            suffix=status if permanent is None else f"{status}-permanent",
         )
         result = self.event_log.record(
             self._measurement_row(detection, timestamp, event_id, status, status_reason)
@@ -2717,8 +2745,12 @@ class VisionPipeline:
         return {
             "event_id": event_id,
             "status": status,
-            "status_reason": status_reason,
+            "reason": status_reason,
             "processing_mode": self.config.processing_mode,
+            "camera_source": self.camera_id,
+            "diagnostic": self.config.diagnostic_mode,
+            "model_version": self.config.detector_model,
+            "pipeline_version": __version__,
             # One accepted event is one bag: that is exactly what the
             # deposit-isolation rule guarantees -- two touching bags are only
             # accepted once each has been isolated against the committed scene,

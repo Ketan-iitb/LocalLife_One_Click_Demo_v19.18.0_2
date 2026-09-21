@@ -9,10 +9,13 @@ param(
     [ValidateSet('Local', 'Cloud')]
     [string]$Mode = 'Local',
 
-    # Temporary Phase 1B default. Use -OperatingMode waste to restore the
-    # strict plastic-bag/paper-bag/cardboard-box production classifier.
+    # Normal operation is the complete waste-measurement mode. It used to
+    # default to geometry_validation, which disabled the history ledger, so
+    # ordinary runs recorded nothing and the downloaded CSV came back empty.
+    # geometry_validation remains available for developers as an explicit
+    # diagnostic; it is not a normal run mode and no longer disables recording.
     [ValidateSet('waste', 'geometry_validation')]
-    [string]$OperatingMode = 'geometry_validation',
+    [string]$OperatingMode = 'waste',
 
     [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]*$')]
     [string]$ProjectDirectory = 'LocalLife_Plug_and_Play_Local',

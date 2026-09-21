@@ -103,11 +103,11 @@ class EventPersistenceTests(unittest.TestCase):
     def test_a_rejected_event_keeps_its_status_and_reason(self) -> None:
         self.log.record(_event(
             "withheld", status=STATUS_REJECTED,
-            status_reason="new_deposit_not_isolatable", bag_count=0,
+            reason="new_deposit_not_isolatable", bag_count=0,
         ))
         row = self.log.rows()[0]
         self.assertEqual(row["status"], STATUS_REJECTED)
-        self.assertEqual(row["status_reason"], "new_deposit_not_isolatable")
+        self.assertEqual(row["reason"], "new_deposit_not_isolatable")
         self.assertEqual(row["bag_count"], "0")
 
     # 11
@@ -240,7 +240,8 @@ class StationPersistenceTests(unittest.TestCase):
     def test_geometry_validation_mode_records_readings(self) -> None:
         # The mode that disables the waste ledger -- previously the mode that
         # produced no spreadsheet at all.
-        station, _ = self._station(operating_mode="geometry_validation")
+        # auto_deposit off, so this exercises the settle-based finalisation.
+        station, _ = self._station(operating_mode="geometry_validation", auto_deposit=False)
         detection = self._detection()
         station._volume_history[1] = [12.5] * station.config.settle_frames
         station._finalise_settled_measurements([detection], 1.0)
