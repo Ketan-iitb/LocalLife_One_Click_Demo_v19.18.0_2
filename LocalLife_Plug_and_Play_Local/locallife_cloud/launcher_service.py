@@ -35,6 +35,7 @@ from .cloud_startup import (
 )
 from .config import AppConfig
 from .launcher_page import WELCOME_PAGE
+from .pi_discovery import resolve_pi, unreachable_message
 
 RUN_MODES = ("local", "cloud", "auto")
 
@@ -140,7 +141,12 @@ class LaunchController:
             launcher_script = str(self.resolve_launcher_script())
         except FileNotFoundError as exc:
             launcher_error = str(exc)
-        pi_name, pi_port = _split_pi_host(self.config.pi_host)
+        # Resolve the Pi by reachability rather than by name: "locallife.local"
+        # is an mDNS name and Windows cannot resolve it on a network without
+        # multicast DNS, which showed up as "Not reachable" for a Pi that was
+        # powered on and fine.
+        pi_cache = self.config.results_dir / "pi-address.json"
+        pi = resolve_pi(self.config.pi_host, cache_path=pi_cache)
         internet = _port_open("8.8.8.8", 53, timeout=1.5)
         gcloud = shutil.which("gcloud") is not None
         return {
@@ -152,7 +158,13 @@ class LaunchController:
             ),
             "cloud_available": bool(internet and gcloud and self.config.gcp_project),
             "pi_host": self.config.pi_host or None,
-            "pi_reachable": _port_open(pi_name, pi_port, timeout=1.5) if pi_name else None,
+            "pi_reachable": pi is not None,
+            "pi_address": None if pi is None else pi.to_dict(),
+            # Actionable, because "Not reachable" on its own sent the operator
+            # to check the power supply when the name lookup was the problem.
+            "pi_hint": None if pi is not None else unreachable_message(
+                self.config.pi_host, pi_cache,
+            ),
             # The cameras hang off the Pi and are only visible once the backend
             # is up; the welcome page shows "unknown" until then rather than
             # claiming a state it cannot see.

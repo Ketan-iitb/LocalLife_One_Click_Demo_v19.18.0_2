@@ -240,6 +240,7 @@ function Get-PythonPackageIdentity {
 # (see the verified-cloud-SSH section) and connects with Windows OpenSSH under
 # StrictHostKeyChecking=yes against a pinned known_hosts file.
 $script:CloudSshHost = ''
+$script:PiHostResolved = $false
 $script:CloudSshUser = ''
 
 # --------------------------------------------------------------------- #
@@ -459,6 +460,62 @@ function Invoke-VerifiedCloudScp {
     $target = (Resolve-CloudSshUser -HostAddress $script:CloudSshHost) + '@' + $script:CloudSshHost
     $options = Get-CloudSshOptions
     Invoke-NativeTolerantly 'scp' @options '-r' $LocalPath ($target + ':' + $RemotePath)
+}
+
+function Resolve-PiHostOnce {
+    <#
+        Replace the configured Pi name with one that actually answers.
+
+        "locallife.local" is an mDNS name. Windows can only resolve it when
+        multicast DNS is available, so on a network without it ssh stops at
+        "Could not resolve hostname locallife.local: No such host is known"
+        while the Pi is powered on and perfectly reachable by address. The name
+        is the only broken part, so try the other ways of naming the same
+        machine and keep whichever answers on port 22.
+
+        The candidate list and the remembered address live in
+        locallife_cloud/pi_discovery.py, so the welcome page and this launcher
+        agree on what "reachable" means.
+    #>
+    param([Parameter(Mandatory = $true)][string]$PythonExe)
+    if ($script:PiHostResolved) {
+        return $script:PiHost
+    }
+    $projectRoot = Find-ProjectRoot
+    $cache = Join-Path $script:SessionDirectory 'pi-address.json'
+    $previousPythonPath = $env:PYTHONPATH
+    $env:PYTHONPATH = $projectRoot
+    try {
+        $raw = (& $PythonExe '-c' `
+            'import json,sys,pathlib;from locallife_cloud.pi_discovery import resolve_pi,unreachable_message;a=resolve_pi(sys.argv[1],cache_path=pathlib.Path(sys.argv[2]));print(json.dumps({"found":a is not None,"target":None if a is None else a.target,"host":None if a is None else a.host,"source":None if a is None else a.source,"hint":None if a is not None else unreachable_message(sys.argv[1],pathlib.Path(sys.argv[2]))}))' `
+            $PiHost $cache 2>&1 | Out-String)
+    }
+    finally {
+        $env:PYTHONPATH = $previousPythonPath
+    }
+    $report = $null
+    foreach ($line in ($raw -split "`n")) {
+        $trimmed = "$line".Trim()
+        if ($trimmed.StartsWith('{')) { try { $report = $trimmed | ConvertFrom-Json } catch { } }
+    }
+    if ($null -eq $report) {
+        Write-Step ('Could not run the Raspberry Pi lookup; using ' + $PiHost + ' as configured. ' + $raw.Trim())
+        $script:PiHostResolved = $true
+        return $PiHost
+    }
+    if (-not $report.found) {
+        throw $report.hint
+    }
+    if ($report.target -ne $PiHost) {
+        Write-Step ('Raspberry Pi found at ' + $report.host + ' (' + $report.source +
+                    '); the configured name ' + $PiHost + ' did not resolve.')
+        $script:PiHost = $report.target
+    }
+    else {
+        Write-Step ('Raspberry Pi reachable at ' + $report.host + '.')
+    }
+    $script:PiHostResolved = $true
+    return $script:PiHost
 }
 
 function Assert-SshAvailable {
@@ -1496,6 +1553,7 @@ function Start-PiRole {
         # happened on a real run and needed a manual `scp` + `pip3 install`
         # to recover from. A Pi that already has the project (the normal
         # case after the first run) skips this entirely.
+        $PiHost = Resolve-PiHostOnce -PythonExe (Assert-PythonAvailable)
         Write-Step 'Checking whether the project is installed on the Raspberry Pi...'
         $checkCommand = 'if [ -d ~/' + $ProjectDirectory + '/locallife_cloud ]; then echo LOCALLIFE_PROJECT_PRESENT; else echo LOCALLIFE_PROJECT_MISSING; fi'
         $checkOutput = & ssh '-o' 'StrictHostKeyChecking=accept-new' $PiHost $checkCommand

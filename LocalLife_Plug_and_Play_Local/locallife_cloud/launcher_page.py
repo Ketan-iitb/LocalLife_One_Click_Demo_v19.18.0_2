@@ -47,6 +47,7 @@ summary{cursor:pointer;font-weight:800}details pre{overflow:auto;font-size:12px;
 <section class="checks">
   <div class="checkrow"><span><span id="dot-version" class="dot green"></span>Version</span><strong id="txt-version">—</strong></div>
   <div class="checkrow"><span><span id="dot-pi" class="dot"></span>Raspberry Pi</span><strong id="txt-pi">Checking</strong></div>
+  <div id="pi-hint" class="callout warn" style="display:none;white-space:pre-line"></div>
   <div class="checkrow"><span><span id="dot-rs" class="dot"></span>RealSense D435</span><strong id="txt-rs">Unknown until started</strong></div>
   <div class="checkrow"><span><span id="dot-log" class="dot"></span>Logitech C920</span><strong id="txt-log">Unknown until started</strong></div>
   <div class="checkrow"><span><span id="dot-net" class="dot"></span>Internet</span><strong id="txt-net">Checking</strong></div>
@@ -119,7 +120,8 @@ async function api(url,payload){const r=await fetch(url,{method:payload===undefi
 function setRow(id,value,good,bad,unknown){const dot=$('dot-'+id),txt=$('txt-'+id);if(value===null||value===undefined){dot.className='dot amber';txt.textContent=unknown||'Unknown';return}dot.className='dot '+(value?'green':'red');txt.textContent=value?good:bad}
 function render(){if(!ready)return;
   $('txt-version').textContent=ready.version||'—';
-  setRow('pi',ready.pi_reachable,'Reachable','Not reachable','Not configured');
+  setRow('pi',ready.pi_reachable,'Reachable'+(ready.pi_address?' at '+ready.pi_address.host:''),'Not reachable','Not configured');
+  if(ready.pi_hint){$('txt-pi').title=ready.pi_hint;$('pi-hint').textContent=ready.pi_hint;$('pi-hint').style.display='block'}else{$('pi-hint').style.display='none'}
   setRow('net',ready.internet,'Connected','Offline');
   setRow('cloud',ready.cloud_available,'Ready','Not available');
   $('btn-cloud').disabled=!ready.cloud_available;
