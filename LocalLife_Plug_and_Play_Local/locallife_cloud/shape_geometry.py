@@ -58,9 +58,6 @@ GEOMETRY_METHODS = (CUBOID, CYLINDER, IRREGULAR_RIGID, FLEXIBLE_OR_UNKNOWN)
 _FLEXIBLE_WORDS = {"bag", "bags", "sack", "pillow", "cushion", "backpack", "textile", "cloth", "toy", "plush"}
 
 MIN_POINTS = 50
-# A visible shell whose chord (noise widens it) spans this range of the fitted
-# diameter is a plausibly half-seen cylinder; outside it the fit extrapolates.
-ARC_CHORD_TO_DIAMETER = (0.70, 1.15)
 MIN_DIMENSION_MM = 5.0
 MAX_DIMENSION_MM = 1500.0
 
@@ -71,6 +68,17 @@ MAX_CIRCLE_RESIDUAL = 0.07
 FLAT_TOP_MIN = 0.40
 # Edge-to-centre height ratio across the short side below which the top is curved.
 CURVED_PROFILE_MAX = 0.85
+# Robust cylinder acceptance: RMS radial residual / radius, arc coverage, and
+# the combined fit confidence below which a cylinder candidate stays pending.
+MAX_CYLINDER_RESIDUAL = 0.10
+CYLINDER_NOISE_FLOOR_M = 0.005
+MIN_ARC_COVERAGE_DEG = 110.0
+MIN_CYLINDER_FIT_CONFIDENCE = 0.35
+# Reasons a cylinder candidate is held pending instead of measured.
+CYLINDER_REJECTIONS = frozenset({
+    "cylinder_fit_residual_too_high", "insufficient_arc_coverage",
+    "cylinder_fit_low_confidence", "implausible_cylinder_diameter",
+})
 
 
 @dataclass(frozen=True)
@@ -89,6 +97,9 @@ class ShapeGeometry:
     cylinder_fit_residual: float | None = None
     cylinder_volume_litres: float | None = None
     cylinder_orientation: str | None = None
+    radius_mm: float | None = None
+    fit_confidence: float | None = None
+    rejection_reason: str | None = None
     points: int = 0
     frames: int = 1
     frozen: bool = False
@@ -114,6 +125,12 @@ class ShapeGeometry:
             "cylinder_fit_residual": _round(self.cylinder_fit_residual, 5),
             "cylinder_volume_litres": _round(self.cylinder_volume_litres, 6),
             "cylinder_orientation": self.cylinder_orientation,
+            # Flat aliases the dashboard, API and CSV read directly.
+            "diameter_mm": _round(self.cylinder_diameter_mm, 2),
+            "radius_mm": _round(self.radius_mm, 2),
+            "volume_liters": _round(self.selected_volume_litres, 6),
+            "fit_confidence": _round(self.fit_confidence, 4),
+            "rejection_reason": self.rejection_reason,
             "points": int(self.points),
             "frames": int(self.frames),
             "frozen": bool(self.frozen),
@@ -139,6 +156,17 @@ def _reject_outliers(footprint: np.ndarray, heights: np.ndarray) -> tuple[np.nda
     return footprint[keep], heights[keep]
 
 
+def _drop_sparse(footprint: np.ndarray, heights: np.ndarray, cell: float = 0.005,
+                 min_count: int = 3) -> tuple[np.ndarray, np.ndarray]:
+    """Remove isolated flying pixels: points in footprint cells with almost no neighbours."""
+    keys = np.floor(footprint / cell).astype(np.int64)
+    _, inverse, counts = np.unique(keys, axis=0, return_inverse=True, return_counts=True)
+    keep = counts[inverse.reshape(-1)] >= min_count
+    if int(keep.sum()) < MIN_POINTS:
+        return footprint, heights
+    return footprint[keep], heights[keep]
+
+
 def _circle_residual(points: np.ndarray) -> tuple[float, float, np.ndarray] | None:
     circle = _fit_circle(points)
     if circle is None:
@@ -148,6 +176,79 @@ def _circle_residual(points: np.ndarray) -> tuple[float, float, np.ndarray] | No
         return None
     distances = np.hypot(points[:, 0] - cx, points[:, 1] - cy)
     return radius, float(np.std(distances - radius) / radius), np.array((cx, cy))
+
+
+@dataclass(frozen=True)
+class CircleFit:
+    centre: np.ndarray
+    radius: float
+    residual: float  # RMS radial error of inliers / radius
+    inlier_ratio: float
+    coverage_deg: float  # angular span of inliers around the centre
+
+
+def robust_circle_fit(points: np.ndarray, *, samples: int = 256, seed: int = 0) -> CircleFit | None:
+    """RANSAC circle (3-point hypotheses) refined by least squares with MAD rejection.
+
+    Deterministic (fixed seed). Works on a full outline or on a partial arc --
+    the visible front shell of an upright bottle, or the top profile of a
+    lying one -- where an algebraic fit alone is dragged by outliers.
+    """
+    points = np.asarray(points, dtype=np.float64)
+    count = len(points)
+    if count < 12:
+        return None
+    rng = np.random.default_rng(seed)
+    triples = points[rng.integers(0, count, size=(samples, 3))]
+    a, b, c = triples[:, 0], triples[:, 1], triples[:, 2]
+    d = 2.0 * (a[:, 0] * (b[:, 1] - c[:, 1]) + b[:, 0] * (c[:, 1] - a[:, 1]) + c[:, 0] * (a[:, 1] - b[:, 1]))
+    valid = np.abs(d) > 1e-12
+    if not np.any(valid):
+        return None
+    a, b, c, d = a[valid], b[valid], c[valid], d[valid]
+    sa, sb, sc = (a ** 2).sum(1), (b ** 2).sum(1), (c ** 2).sum(1)
+    ux = (sa * (b[:, 1] - c[:, 1]) + sb * (c[:, 1] - a[:, 1]) + sc * (a[:, 1] - b[:, 1])) / d
+    uy = (sa * (c[:, 0] - b[:, 0]) + sb * (a[:, 0] - c[:, 0]) + sc * (b[:, 0] - a[:, 0])) / d
+    radii = np.hypot(a[:, 0] - ux, a[:, 1] - uy)
+    span = float(np.max(np.ptp(points, axis=0)))
+    plausible = (radii > 1e-3) & (radii < 2.0 * max(span, 1e-3))
+    if not np.any(plausible):
+        return None
+    ux, uy, radii = ux[plausible], uy[plausible], radii[plausible]
+    distances = np.abs(np.hypot(points[None, :, 0] - ux[:, None], points[None, :, 1] - uy[:, None]) - radii[:, None])
+    tolerance = np.maximum(0.002, 0.05 * radii)
+    scores = (distances <= tolerance[:, None]).sum(axis=1)
+    best = int(np.argmax(scores))
+    inliers = distances[best] <= tolerance[best]
+    for _ in range(3):
+        if int(inliers.sum()) < 12:
+            return None
+        fitted = _fit_circle(points[inliers])
+        if fitted is None:
+            return None
+        cx, cy, radius = fitted
+        radial = np.hypot(points[:, 0] - cx, points[:, 1] - cy) - radius
+        mad = 1.4826 * float(np.median(np.abs(radial[inliers] - np.median(radial[inliers]))))
+        inliers = np.abs(radial) <= max(3.5 * mad, 0.001)
+    kept = points[inliers]
+    radial = np.hypot(kept[:, 0] - cx, kept[:, 1] - cy) - radius
+    angles = np.sort(np.arctan2(kept[:, 1] - cy, kept[:, 0] - cx))
+    gaps = np.diff(np.r_[angles, angles[0] + 2 * math.pi])
+    coverage = 360.0 - math.degrees(float(gaps.max()))
+    return CircleFit(np.array((cx, cy)), float(radius), float(np.sqrt(np.mean(radial ** 2)) / radius),
+                     float(inliers.mean()), coverage)
+
+
+def _residual_limit_m(fit: CircleFit) -> float:
+    """Allowed RMS radial error: stereo depth noise (a few mm) or a fraction of the radius."""
+    return max(CYLINDER_NOISE_FLOOR_M, MAX_CYLINDER_RESIDUAL * fit.radius)
+
+
+def _fit_confidence(fit: CircleFit) -> float:
+    residual_term = 1.0 - min(1.0, fit.residual * fit.radius / _residual_limit_m(fit))
+    return float(np.clip(
+        fit.inlier_ratio * (0.4 + 0.6 * residual_term) * min(1.0, fit.coverage_deg / 150.0), 0.0, 1.0,
+    ))
 
 
 def _boundary_points(footprint: np.ndarray, bins: int = 72) -> np.ndarray:
@@ -225,6 +326,7 @@ def measure_shape(
     if len(footprint) < min_points:
         return _uncertain("insufficient_visible_surface", len(footprint))
     footprint, heights = _reject_outliers(footprint, heights)
+    footprint, heights = _drop_sparse(footprint, heights)
     points = len(footprint)
     if points < min_points:
         return _uncertain("insufficient_visible_surface", points)
@@ -257,11 +359,34 @@ def measure_shape(
     base = dict(length_mm=length_mm, width_mm=width_mm, height_mm=top_mm,
                 bounding_box_volume_litres=bbox_l, mesh_volume_litres=mesh, points=points, features=features)
 
-    def _cylinder(diameter_m: float, axis_m: float, fit_residual: float, orientation: str,
-                  confidence: float, flags: tuple[str, ...]) -> ShapeGeometry:
-        volume = _litres(math.pi * (diameter_m / 2.0) ** 2 * axis_m)
+    def _cylinder(fit: CircleFit, axis_m: float, orientation: str, flags: tuple[str, ...]) -> ShapeGeometry:
+        """A fitted cylinder, or a pending result when the fit is not trustworthy.
+
+        Never falls back to a box: a candidate that fails the fit reports no
+        litres and says why.
+        """
+        diameter_m = 2.0 * fit.radius
+        confidence = _fit_confidence(fit)
+        reason = None
+        if fit.residual * fit.radius > _residual_limit_m(fit):
+            reason = "cylinder_fit_residual_too_high"
+        elif fit.coverage_deg < MIN_ARC_COVERAGE_DEG:
+            reason = "insufficient_arc_coverage"
+        elif confidence < MIN_CYLINDER_FIT_CONFIDENCE:
+            reason = "cylinder_fit_low_confidence"
+        elif not MIN_DIMENSION_MM <= diameter_m * 1000.0 <= MAX_DIMENSION_MM:
+            reason = "implausible_cylinder_diameter"
+        if reason is not None:
+            return ShapeGeometry(
+                geometry_method=UNCERTAIN, geometry_confidence=min(confidence, 0.3),
+                length_mm=length_mm, width_mm=width_mm, height_mm=top_mm,
+                bounding_box_volume_litres=None, mesh_volume_litres=mesh, selected_volume_litres=None,
+                volume_meaning="unavailable", cylinder_fit_residual=fit.residual, fit_confidence=confidence,
+                rejection_reason=reason, points=points, features=features, flags=flags + (reason,),
+            )
+        volume = _litres(math.pi * fit.radius ** 2 * axis_m)
         if orientation == "upright":
-            dims = dict(length_mm=diameter_m * 1000.0, width_mm=diameter_m * 1000.0, height_mm=top_mm)
+            dims = dict(length_mm=diameter_m * 1000.0, width_mm=diameter_m * 1000.0, height_mm=axis_m * 1000.0)
         else:
             dims = dict(length_mm=axis_m * 1000.0, width_mm=diameter_m * 1000.0, height_mm=top_mm)
         dims_bbox = _litres(dims["length_mm"] * dims["width_mm"] * dims["height_mm"] / 1e9)
@@ -269,36 +394,45 @@ def measure_shape(
             geometry_method=CYLINDER, geometry_confidence=float(np.clip(confidence, 0.05, 0.95)),
             bounding_box_volume_litres=dims_bbox, mesh_volume_litres=mesh, selected_volume_litres=volume,
             volume_meaning="cylinder_volume_pi_r2_h", cylinder_diameter_mm=diameter_m * 1000.0,
-            cylinder_height_mm=axis_m * 1000.0, cylinder_fit_residual=fit_residual,
+            cylinder_height_mm=axis_m * 1000.0, cylinder_fit_residual=fit.residual,
             cylinder_volume_litres=volume, cylinder_orientation=orientation,
+            radius_mm=fit.radius * 1000.0, fit_confidence=confidence,
             points=points, features=features, flags=flags, **dims,
         )
 
-    # Upright cylinder seen from above: the footprint is a filled disc.
-    if (circle is not None and aspect >= 0.85 and DISC_FILL_RANGE[0] <= rect_fill <= DISC_FILL_RANGE[1]
-            and residual <= MAX_CIRCLE_RESIDUAL):
-        diameter = 2.0 * circle[0]
-        confidence = 0.9 - 4.0 * residual - 0.3 * max(0.0, 0.6 - flat_top)
-        return _cylinder(diameter, top_m, residual, "upright", confidence, ("disc_footprint",))
+    # Upright cylinder. From above the footprint is a disc; from an angle only
+    # the front shell is visible and projects to an arc (the 83 x 23 mm bottle:
+    # the 23 mm was the arc's bulge, not a width). The axis is the support-plane
+    # normal, so the circle is fitted in the footprint plane -- to the outline
+    # of a filled disc, or to every point of a thin shell -- and the height is
+    # measured along that axis.
+    disc = aspect >= 0.85 and DISC_FILL_RANGE[0] <= rect_fill <= DISC_FILL_RANGE[1] and residual is not None \
+        and residual <= MAX_CIRCLE_RESIDUAL
+    shell = column_fill < 0.55 and aspect < 0.85
+    # Height along the vertical axis: the near-top of the points, not the p95
+    # used for general objects (a side-seen shell is uniform in height).
+    axis_top_m = float(np.percentile(heights, 99.5)) if height_mm is None else top_m
+    if disc or shell:
+        # Arc coverage and residual (inside _cylinder) guard against an
+        # extrapolated fit; the rectangle's chord is not used, because a few
+        # stray points widen it without changing the circle.
+        fit = robust_circle_fit(outline if disc else footprint)
+        if fit is not None:
+            return _cylinder(fit, axis_top_m, "upright",
+                             ("disc_footprint",) if disc else ("arc_reconstructed_diameter",))
 
-    # Upright cylinder seen from the side: only the front shell is visible, a
-    # thin arc whose circle fit restores the hidden half (as footprint.py does
-    # for the reported extents).
-    arc = _circle_residual(footprint) if column_fill < 0.55 else None
-    if arc is not None and arc[1] <= MAX_CIRCLE_RESIDUAL:
-        diameter = 2.0 * arc[0]
-        if ARC_CHORD_TO_DIAMETER[0] <= length_m / diameter <= ARC_CHORD_TO_DIAMETER[1]:
-            confidence = 0.75 - 3.0 * arc[1]
-            return _cylinder(diameter, top_m, arc[1], "upright", confidence, ("arc_reconstructed_diameter",))
-
-    # Cylinder lying on its side: a filled rectangle whose cross-section is a
-    # half-circle -- as tall as it is wide, highest along the middle.
+    # Cylinder lying on its side: the axis is the footprint's principal
+    # direction (PCA); the cross-section across it is the visible upper half of
+    # the circle, fitted in (across-axis offset, height above the plane).
     if (rect_fill >= RECT_FILL_MIN and profile is not None and profile < CURVED_PROFILE_MAX
             and 0.75 <= top_m / max(width_m, 1e-9) <= 1.30):
-        diameter = 0.5 * (width_m + top_m)
-        fit_residual = abs(top_m - width_m) / diameter
-        confidence = 0.75 - 1.5 * fit_residual
-        return _cylinder(diameter, length_m, fit_residual, "lying", confidence, ("curved_cross_profile",))
+        centred = footprint - footprint.mean(axis=0)
+        _, _, axes = np.linalg.svd(centred[:: max(1, len(centred) // 5000)], full_matrices=False)
+        along, across = centred @ axes[0], centred @ axes[1]
+        fit = robust_circle_fit(np.column_stack((across, heights)))
+        if fit is not None:
+            axis_length = float(np.percentile(along, 99.5) - np.percentile(along, 0.5))
+            return _cylinder(fit, axis_length, "lying", ("curved_cross_profile",))
 
     # Cuboid: a filled rectangle with a flat top.
     if (rect_fill >= RECT_FILL_MIN and flat_top >= FLAT_TOP_MIN and column_fill >= 0.55
