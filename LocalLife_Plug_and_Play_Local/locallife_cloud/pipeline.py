@@ -1762,6 +1762,8 @@ class VisionPipeline:
                         min_height_m=self.config.logitech_min_object_height_m,
                         max_height_m=self.config.max_object_height_m,
                         min_pixels=min(25, self.config.logitech_min_object_pixels),
+                        cell_size_m=self.config.logitech_height_map_cell_m,
+                        camera_height_m=self.config.logitech_reference_distance_m or None,
                     )
                     individual_mono = result.measurement
                     self.last_logitech_volume_diagnostics = {
@@ -1769,6 +1771,16 @@ class VisionPipeline:
                     }
                     if result.reason is not None:
                         detection.volume_rejection_reason = result.reason
+                    elif result.diagnostics.get("length_mm"):
+                        # Logitech dimensions come from the same plane-projected
+                        # footprint the volume was integrated over.
+                        detection.footprint_length_mm = round(float(result.diagnostics["length_mm"]), 2)
+                        detection.footprint_width_mm = round(float(result.diagnostics["width_mm"]), 2)
+                        detection.physical_height_mm = round(
+                            float(result.diagnostics["height_p90_m"]) * 1000.0, 2)
+                        detection.dimension_method = "logitech_support_plane_footprint"
+                        detection.dimension_confidence = round(
+                            float(min(0.6, result.measurement.coverage_ratio)), 4)
                 else:
                     individual_mono = estimate_volume(
                     calibrated_prediction,

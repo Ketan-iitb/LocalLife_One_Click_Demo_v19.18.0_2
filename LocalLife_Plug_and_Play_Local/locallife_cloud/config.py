@@ -323,6 +323,8 @@ class AppConfig:
     logitech_detector_confidence: float = 0.24
     # Flat packets and thin cartons: the RealSense minimum (25 mm) hid them.
     logitech_min_object_height_m: float = 0.010
+    # Support-plane cell size for the Logitech height map (metres).
+    logitech_height_map_cell_m: float = 0.005
     # A confirmed object that has not settled after this many frames is
     # recorded once as rejected (unstable_volume / no_valid_measurement).
     finalise_max_frames: int = 45
@@ -646,6 +648,8 @@ class AppConfig:
             logitech_detector_confidence=float(os.environ.get(
                 "LOCALLIFE_LOGITECH_DETECTOR_CONFIDENCE",
                 os.environ.get("LOCALLIFE_DETECTOR_CONFIDENCE", defaults.logitech_detector_confidence))),
+            logitech_height_map_cell_m=float(os.environ.get(
+                "LOCALLIFE_LOGITECH_HEIGHT_MAP_CELL_M", defaults.logitech_height_map_cell_m)),
             logitech_min_object_height_m=float(os.environ.get(
                 "LOCALLIFE_LOGITECH_MIN_OBJECT_HEIGHT_M", defaults.logitech_min_object_height_m)),
             logitech_min_object_pixels=int(os.environ.get(

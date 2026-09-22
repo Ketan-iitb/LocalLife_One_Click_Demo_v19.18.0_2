@@ -9,10 +9,18 @@ fixed installation (camera intrinsics and one tape-measured camera height).
                                                 to a plane perpendicular to the
                                                 optical axis at that height.
 
-Object volume is then the masked integral of the filtered height above the
-fitted plane, with each pixel's own metric footprint:
+Object volume is then a support-plane height map, not an image-plane one.
+Every mask pixel is backprojected with its own depth and dropped onto the
+plane; the plane is celled, and each occupied cell contributes its own height:
 
-    V = sum( height(u,v) * Z(u,v)^2 / (fx * fy) )
+    V = sum over cells( cell_area * height(cell) )
+
+Integrating in the image plane instead (area = Z^2/(fx*fy) per pixel, times
+that pixel's height) is what made an obliquely seen bottle read four times too
+large: its silhouette -- the tall front face -- was being treated as floor
+footprint, so a 85 x 253 mm silhouette times 0.24 m of height gave ~5 L for a
+1.4 L bottle. The front face now falls into the few cells in front of the
+object, where it belongs, and the top surface sets each cell's height.
 
 Heights are clipped at zero, spike-filtered (median + MAD) and capped, because
 monocular depth is smooth but locally wrong, and a handful of spikes used to
@@ -30,6 +38,7 @@ from typing import Any
 
 import numpy as np
 
+from .footprint import estimate_extents
 from .types import CameraIntrinsics, DepthCalibration, VolumeMeasurement
 from .volume import ReferencePlane, _plane_perpendicular_height
 
@@ -39,6 +48,12 @@ MIN_PLANE_PIXELS = 200
 # Heights outside these bounds are sensor error, not objects.
 MIN_VALID_HEIGHT_M = 0.004
 MAX_HEIGHT_MAD = 6.0
+# Support-plane cell size for the height map. 5 mm resolves a small can's
+# footprint while staying far coarser than monocular depth's own noise.
+CELL_SIZE_M = 0.005
+# Per cell, the height that represents it: near-top, so a noisy pixel cannot
+# set a whole cell, and a thin top surface is not averaged away by its sides.
+CELL_HEIGHT_PERCENTILE = 90.0
 
 
 def ray_plane_distance(
@@ -109,6 +124,106 @@ def fit_plane_alignment(
     ), diagnostics
 
 
+def axis_aligned_plane(intrinsics: CameraIntrinsics, height_m: float) -> ReferencePlane:
+    """A plane perpendicular to the optical axis at `height_m`.
+
+    Used when no plane has been fitted from the scene yet: the fixed overhead
+    installation's own geometry is still known from the calibration.
+    """
+    return ReferencePlane(
+        tilt_degrees=0.0, residual_rmse_m=0.0, inlier_pixels=0,
+        normal=(0.0, 0.0, 1.0), coefficients=(0.0, 0.0, float(height_m)),
+    )
+
+
+def plane_basis(coefficients: tuple[float, float, float]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Unit normal and two in-plane axes for z = a*x + b*y + c."""
+    a, b, _ = coefficients
+    normal = np.array((a, b, -1.0), dtype=np.float64)
+    normal /= np.linalg.norm(normal)
+    seed = np.array((1.0, 0.0, 0.0)) if abs(normal[0]) < 0.9 else np.array((0.0, 1.0, 0.0))
+    u_hat = seed - float(np.dot(seed, normal)) * normal
+    u_hat /= np.linalg.norm(u_hat)
+    return normal, u_hat, np.cross(normal, u_hat)
+
+
+def project_to_plane(
+    depth: np.ndarray, intrinsics: CameraIntrinsics, mask: np.ndarray,
+    coefficients: tuple[float, float, float],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Mask pixels as (N, 2) support-plane coordinates and their heights (metres)."""
+    rows, columns = np.nonzero(mask)
+    z = depth[rows, columns]
+    x = (columns.astype(np.float64) - intrinsics.ppx) * z / intrinsics.fx
+    y = (rows.astype(np.float64) - intrinsics.ppy) * z / intrinsics.fy
+    points = np.column_stack((x, y, z))
+    normal, u_hat, v_hat = plane_basis(coefficients)
+    a, b, c = coefficients
+    # Perpendicular distance above z = a*x + b*y + c, in the same sense as
+    # volume._plane_perpendicular_height: positive when nearer than the plane.
+    heights = (a * points[:, 0] + b * points[:, 1] + c - points[:, 2]) / np.sqrt(a * a + b * b + 1.0)
+    return np.column_stack((points @ u_hat, points @ v_hat)), heights
+
+
+def cell_height_map(
+    footprint: np.ndarray, heights: np.ndarray, *, cell_size_m: float = CELL_SIZE_M,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Group plane points into cells; return each occupied cell's key and height."""
+    keys = np.floor(footprint / cell_size_m).astype(np.int64)
+    unique, inverse = np.unique(keys, axis=0, return_inverse=True)
+    order = np.lexsort((heights, inverse))
+    sorted_cells, sorted_heights = inverse[order], heights[order]
+    boundaries = np.flatnonzero(np.r_[True, sorted_cells[1:] != sorted_cells[:-1]])
+    counts = np.diff(np.r_[boundaries, sorted_cells.size])
+    # The percentile entry of each cell's own sorted heights.
+    picks = boundaries + np.floor(CELL_HEIGHT_PERCENTILE / 100.0 * (counts - 1)).astype(int)
+    return unique, sorted_heights[picks]
+
+
+def fill_occluded_cells(
+    cells: np.ndarray, heights: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Complete the footprint one camera cannot see all of.
+
+    An obliquely viewed object hides its far side: those support-plane cells
+    receive no points at all, and the volume reads low (a 60-degree view of a
+    bottle lost ~60 %). The occupied cells' convex hull is the footprint the
+    object actually stands on, so empty cells inside it take the height of the
+    nearest measured cell -- the same convex completion the RealSense
+    height-map path already performs.
+    """
+    import cv2
+
+    origin = cells.min(axis=0)
+    grid = cells - origin
+    shape = (int(grid[:, 1].max()) + 1, int(grid[:, 0].max()) + 1)
+    if min(shape) < 2 or shape[0] * shape[1] > 4_000_000:
+        return cells, heights, 0
+    occupancy = np.zeros(shape, np.uint8)
+    occupancy[grid[:, 1], grid[:, 0]] = 255
+    hull = cv2.convexHull(np.column_stack((grid[:, 0], grid[:, 1])).astype(np.int32))
+    inside = np.zeros(shape, np.uint8)
+    cv2.fillConvexPoly(inside, hull, 255)
+    missing = (inside > 0) & (occupancy == 0)
+    if not missing.any():
+        return cells, heights, 0
+    # Nearest measured cell for every hole, by distance transform labels.
+    _, labels = cv2.distanceTransformWithLabels(
+        (occupancy == 0).astype(np.uint8), cv2.DIST_L2, 3, labelType=cv2.DIST_LABEL_PIXEL,
+    )
+    # Each occupied cell is its own label seed; map label -> that cell's height,
+    # then read the nearest seed's label at every hole.
+    value_by_label = np.zeros(int(labels.max()) + 1, np.float64)
+    height_grid = np.zeros(shape, np.float64)
+    height_grid[grid[:, 1], grid[:, 0]] = heights
+    value_by_label[labels[occupancy > 0]] = height_grid[occupancy > 0]
+    filled_rows, filled_columns = np.nonzero(missing)
+    filled_heights = value_by_label[labels[filled_rows, filled_columns]]
+    keep = filled_heights > 0
+    added = np.column_stack((filled_columns[keep], filled_rows[keep])) + origin
+    return (np.vstack((cells, added)), np.r_[heights, filled_heights[keep]], int(keep.sum()))
+
+
 @dataclass
 class HeightMapResult:
     measurement: VolumeMeasurement | None
@@ -127,6 +242,9 @@ def metric_object_volume(
     min_height_m: float = 0.01,
     max_height_m: float = 0.80,
     min_pixels: int = 60,
+    cell_size_m: float = CELL_SIZE_M,
+    camera_height_m: float | None = None,
+    fill_occlusion: bool = True,
 ) -> HeightMapResult:
     """Masked height-map volume from calibrated monocular depth, with its statistics."""
     diagnostics: dict[str, Any] = {}
@@ -140,17 +258,21 @@ def metric_object_volume(
         return HeightMapResult(None, diagnostics, "mask_too_small")
 
     depth = depth_m.astype(np.float64, copy=False)
-    height_map = None
-    if reference_plane is not None and reference_plane.coefficients is not None:
-        height_map = _plane_perpendicular_height(depth, intrinsics, reference_plane.coefficients)
+    plane = reference_plane if reference_plane is not None and reference_plane.coefficients is not None else None
+    if plane is None and camera_height_m:
+        # No plane fitted yet: the fixed installation's own geometry still is.
+        plane = axis_aligned_plane(intrinsics, camera_height_m)
+        diagnostics["plane_source"] = "calibrated_camera_height"
+    else:
+        diagnostics["plane_source"] = "fitted_support_plane"
+    if plane is None:
+        return HeightMapResult(None, diagnostics, "no_support_plane")
+    plane_coefficients = plane.coefficients
+    height_map = _plane_perpendicular_height(depth, intrinsics, plane_coefficients)
     diagnostics["height_source"] = "fitted_support_plane"
     if height_map is None:
-        # No usable support plane: the empty-scene prediction is the reference.
-        if reference_depth_m is None or reference_depth_m.shape != depth.shape:
-            return HeightMapResult(None, diagnostics, "no_support_plane_or_empty_reference")
-        height_map = reference_depth_m.astype(np.float64) - depth
-        diagnostics["height_source"] = "empty_scene_reference"
-    elif reference_depth_m is not None and reference_depth_m.shape == depth.shape:
+        return HeightMapResult(None, diagnostics, "degenerate_support_plane")
+    if reference_depth_m is not None and reference_depth_m.shape == depth.shape:
         # The empty-scene prediction is the other, independent reference: used
         # when the fitted plane leaves this object with no measurable height
         # (a steeply mounted camera, or a plane fitted off the object's side).
@@ -182,35 +304,53 @@ def metric_object_volume(
     accepted = valid & (heights <= spike_limit)
     if int(np.count_nonzero(accepted)) < min_pixels:
         accepted = valid
-    values = heights[accepted]
-    areas = depth[accepted] ** 2 / (intrinsics.fx * intrinsics.fy)
-    litres = float(np.sum(values * areas) * 1000.0)
+
+    # Drop every accepted pixel onto the support plane with its own depth, so
+    # a vertical face lands in front of the object rather than under it.
+    footprint, plane_heights = project_to_plane(depth, intrinsics, accepted, plane_coefficients)
+    keep = plane_heights >= min_height_m
+    footprint, plane_heights = footprint[keep], plane_heights[keep]
+    if footprint.shape[0] < min_pixels:
+        return HeightMapResult(None, diagnostics, "no_measurable_height_above_plane")
+    cells, cell_heights = cell_height_map(footprint, plane_heights, cell_size_m=cell_size_m)
+    measured_cells = int(cells.shape[0])
+    if fill_occlusion:
+        cells, cell_heights, filled = fill_occluded_cells(cells, cell_heights)
+    else:
+        filled = 0
+    cell_area = cell_size_m * cell_size_m
+    litres = float(np.sum(cell_heights) * cell_area * 1000.0)
+    extents = estimate_extents(footprint - footprint.mean(axis=0))
     diagnostics.update({
         "height_median_m": median,
         "height_mad_m": mad,
-        "height_p90_m": float(np.percentile(values, 90)),
-        "height_max_m": float(values.max()),
+        "height_p90_m": float(np.percentile(plane_heights, 90)),
+        "height_max_m": float(plane_heights.max()),
         "spike_limit_m": float(spike_limit),
-        "integrated_pixels": int(values.size),
-        "rejected_spike_pixels": int(np.count_nonzero(valid) - values.size),
-        "metric_pixel_area_median_m2": float(np.median(areas)),
+        "integrated_pixels": int(plane_heights.size),
+        "rejected_spike_pixels": int(np.count_nonzero(valid) - int(np.count_nonzero(accepted))),
+        "footprint_cells": int(cells.shape[0]),
+        "measured_cells": measured_cells,
+        "occlusion_filled_cells": filled,
+        "footprint_area_m2": float(cells.shape[0] * cell_area),
+        "cell_size_m": cell_size_m,
         "object_depth_median_m": float(np.median(depth[accepted])),
+        "length_mm": None if extents is None else extents.length_mm,
+        "width_mm": None if extents is None else extents.width_mm,
         "raw_volume_l": litres,
     })
-    if not math.isfinite(litres) or litres <= 0:
-        return HeightMapResult(None, diagnostics, "non_finite_volume")
-    coverage = values.size / max(1, diagnostics["mask_pixels"])
+    coverage = plane_heights.size / max(1, diagnostics["mask_pixels"])
     measurement = VolumeMeasurement(
         liters=litres,
-        valid_pixels=int(values.size),
-        mean_height_m=float(values.mean()),
-        max_height_m=float(values.max()),
-        projected_area_m2=float(np.sum(areas)),
+        valid_pixels=int(plane_heights.size),
+        mean_height_m=float(cell_heights.mean()),
+        max_height_m=float(plane_heights.max()),
+        projected_area_m2=diagnostics["footprint_area_m2"],
         method="logitech-depth-anything-v2-height-map",
         candidate_pixels=diagnostics["mask_pixels"],
         coverage_ratio=coverage,
         uncertainty_l=litres * 0.35,
-        geometry_mode="calibrated-height-map",
+        geometry_mode="calibrated-support-plane-height-map",
         quality="monocular-calibrated",
         height_p90_m=diagnostics["height_p90_m"],
     )
