@@ -125,6 +125,10 @@ class Detection:
     dimension_confidence: float | None = None
     dimension_flags: tuple[str, ...] = ()
     dimension_method: str | None = None
+    # Shape-aware geometry (shape_geometry.ShapeGeometry): the method the
+    # object's points support, its dimensions and bounding-box / shape /
+    # mesh volumes. Frozen once the track's method is accepted.
+    shape_geometry: Any = None
 
     @property
     def area_pixels(self) -> int:
@@ -188,6 +192,7 @@ class Detection:
             "dimension_confidence": self.dimension_confidence,
             "dimension_flags": list(self.dimension_flags),
             "dimension_method": self.dimension_method,
+            "shape_geometry": None if self.shape_geometry is None else self.shape_geometry.to_dict(),
         }
 
 
@@ -350,9 +355,23 @@ class DepthCalibration:
     offset_m: float
     rmse_m: float
     sample_pixels: int
+    # Provenance (logitech_calibration.py): which fit produced this mapping,
+    # when, and from what reference. `inverse` means the model predicts
+    # inverse depth, so the fit maps to 1/Z rather than to Z.
+    method: str = ""
+    calibration_id: str = ""
+    calibrated_at: float | None = None
+    reference_distance_m: float | None = None
+    sample_count: int = 0
+    resolution: tuple[int, int] | None = None
+    inverse: bool = False
 
     def apply(self, prediction_m: np.ndarray) -> np.ndarray:
-        return prediction_m.astype(np.float32) * self.scale + self.offset_m
+        mapped = prediction_m.astype(np.float32) * self.scale + self.offset_m
+        if not self.inverse:
+            return mapped
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return np.where(mapped > 0, 1.0 / mapped, np.nan).astype(np.float32)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -360,7 +379,33 @@ class DepthCalibration:
             "offset_m": round(float(self.offset_m), 8),
             "rmse_m": round(float(self.rmse_m), 6),
             "sample_pixels": int(self.sample_pixels),
+            "method": self.method,
+            "calibration_id": self.calibration_id,
+            "calibrated_at": self.calibrated_at,
+            "reference_distance_m": self.reference_distance_m,
+            "sample_count": int(self.sample_count),
+            "resolution": None if self.resolution is None else list(self.resolution),
+            "inverse": bool(self.inverse),
         }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "DepthCalibration | None":
+        if not payload:
+            return None
+        resolution = payload.get("resolution")
+        return cls(
+            scale=float(payload["scale"]),
+            offset_m=float(payload["offset_m"]),
+            rmse_m=float(payload.get("rmse_m", 0.0)),
+            sample_pixels=int(payload.get("sample_pixels", 0)),
+            method=str(payload.get("method", "")),
+            calibration_id=str(payload.get("calibration_id", "")),
+            calibrated_at=payload.get("calibrated_at"),
+            reference_distance_m=payload.get("reference_distance_m"),
+            sample_count=int(payload.get("sample_count", 0)),
+            resolution=None if resolution is None else (int(resolution[0]), int(resolution[1])),
+            inverse=bool(payload.get("inverse", False)),
+        )
 
 
 @dataclass(slots=True)
