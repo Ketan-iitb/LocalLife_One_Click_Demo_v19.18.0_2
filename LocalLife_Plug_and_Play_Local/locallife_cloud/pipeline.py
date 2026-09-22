@@ -560,6 +560,8 @@ class VisionPipeline:
         self.last_logitech_volume_diagnostics: dict[str, Any] = {}
         # Why Depth Anything V2 is unavailable, when it is (shown on the dashboard).
         self.depth_load_error: str | None = None
+        # Why a stored calibration was refused (camera moved, ROI or resolution changed).
+        self.calibration_rejected_reason: str | None = None
         self._depth_cache: tuple[float, np.ndarray] | None = None
         # Frames each confirmed track has waited for finalisation (non-waste modes).
         self._unfinalised_frames: dict[int, int] = {}
@@ -1766,8 +1768,44 @@ class VisionPipeline:
                         camera_height_m=self.config.logitech_reference_distance_m or None,
                     )
                     individual_mono = result.measurement
+                    prediction_values = (
+                        predicted_depth[bin_region] if predicted_depth is not None else np.empty(0)
+                    )
+                    prediction_values = prediction_values[np.isfinite(prediction_values)]
                     self.last_logitech_volume_diagnostics = {
-                        **result.diagnostics, "reason": result.reason, "label": detection.label,
+                        **result.diagnostics,
+                        "reason": result.reason,
+                        "label": detection.label,
+                        "frame_resolution": [int(frame.shape[1]), int(frame.shape[0])],
+                        "calibration_resolution": (
+                            None if self.calibration is None or self.calibration.resolution is None
+                            else list(self.calibration.resolution)
+                        ),
+                        "inference_resolution": (
+                            None if predicted_depth is None
+                            else [int(predicted_depth.shape[1]), int(predicted_depth.shape[0])]
+                        ),
+                        "inference_to_frame_scale": (
+                            None if predicted_depth is None
+                            else round(frame.shape[1] / predicted_depth.shape[1], 6)
+                        ),
+                        "intrinsics": None if intrinsics is None else {
+                            "fx": intrinsics.fx, "fy": intrinsics.fy,
+                            "ppx": intrinsics.ppx, "ppy": intrinsics.ppy,
+                        },
+                        "camera_to_plane_m": self.config.logitech_reference_distance_m or None,
+                        "relative_depth_stats": None if not prediction_values.size else {
+                            "min": round(float(prediction_values.min()), 4),
+                            "median": round(float(np.median(prediction_values)), 4),
+                            "max": round(float(prediction_values.max()), 4),
+                            "inverse_model": depth_output_kind(self.config.depth_model) != "metric",
+                        },
+                        "calibration": None if self.calibration is None else {
+                            "scale": self.calibration.scale, "offset_m": self.calibration.offset_m,
+                            "method": self.calibration.method, "id": self.calibration.calibration_id,
+                        },
+                        "live_volume_l": None if result.measurement is None else round(result.measurement.liters, 6),
+                        "stable_volume_l": detection.stable_volume_l,
                     }
                     if result.reason is not None:
                         detection.volume_rejection_reason = result.reason
@@ -3298,6 +3336,8 @@ class VisionPipeline:
         if calibration is None:
             raise ValueError(f"Empty-plane calibration failed: {diagnostics.get('reason')}")
         calibration.roi = tuple(self.config.roi)
+        calibration.intrinsics = (intrinsics.fx, intrinsics.fy, intrinsics.ppx, intrinsics.ppy)
+        calibration.device = str(getattr(self, "camera_device", "") or self.camera_id)
         self.config.logitech_reference_distance_m = float(camera_height_m)
         sample = self.logitech_calibration.set_calibration(calibration, diagnostics)
         baseline = self.set_baseline()
@@ -3342,19 +3382,35 @@ class VisionPipeline:
             detection.volume_rejection_reason = shape.rejection_reason
 
     def _fitted_logitech_calibration(self, shape: tuple[int, ...]) -> DepthCalibration | None:
-        """The stored multi-distance fit, if it matches this resolution and model."""
+        """The stored fit, if it still describes this camera, crop and model."""
         store = self.logitech_calibration
         if store is None or store.calibration is None:
             return None
         calibration = store.calibration
+        self.calibration_rejected_reason = None
+        current = self.latest_intrinsics
+        if calibration.intrinsics is not None and current is not None:
+            fx, fy, ppx, ppy = calibration.intrinsics
+            moved = (
+                abs(fx - current.fx) > 0.01 * max(fx, 1.0)
+                or abs(fy - current.fy) > 0.01 * max(fy, 1.0)
+                or abs(ppx - current.ppx) > 2.0 or abs(ppy - current.ppy) > 2.0
+            )
+            if moved:
+                # New lens geometry: the plane fit and the empty reference both
+                # belong to the old one. Ask for a fresh empty-scene calibration.
+                self.calibration_rejected_reason = "camera_geometry_changed_recalibrate_empty_scene"
+                return None
         if calibration.resolution is not None and tuple(calibration.resolution) != (shape[1], shape[0]):
             # Depth predictions are resampled to the frame, so a fit made at a
             # different resolution does not describe this crop.
+            self.calibration_rejected_reason = "resolution_changed_recalibrate_empty_scene"
             return None
         if calibration.inverse != (depth_output_kind(self.config.depth_model) != "metric"):
             return None
         if calibration.roi is not None and tuple(calibration.roi) != tuple(self.config.roi):
             # The fit belongs to the region it was measured over.
+            self.calibration_rejected_reason = "roi_changed_recalibrate_empty_scene"
             return None
         return calibration
 
@@ -3537,6 +3593,7 @@ class VisionPipeline:
             "calibration_mode": self.calibration_mode,
             "active_calibration": None if active is None else active.to_dict(),
             "depth_output": depth_output_kind(self.config.depth_model),
+            "calibration_rejected_reason": self.calibration_rejected_reason,
             "stored": None if store is None else store.status(),
             "diagnostics": self.logitech_diagnostics() if self.camera_id == "logitech" else None,
             "lens": None if self.logitech_lens is None else {

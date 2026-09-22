@@ -378,6 +378,12 @@ class DepthCalibration:
     resolution: tuple[int, int] | None = None
     # The measurement ROI the fit was made for; moving it invalidates the fit.
     roi: tuple[float, float, float, float] | None = None
+    # The camera geometry the fit belongs to: fx, fy, ppx, ppy. A different
+    # lens, resolution or mounting produces different values, and the old fit
+    # must not be reused.
+    intrinsics: tuple[float, float, float, float] | None = None
+    device: str = ""
+    version: int = 1
     inverse: bool = False
 
     def apply(self, prediction_m: np.ndarray) -> np.ndarray:
@@ -400,6 +406,9 @@ class DepthCalibration:
             "sample_count": int(self.sample_count),
             "resolution": None if self.resolution is None else list(self.resolution),
             "roi": None if self.roi is None else list(self.roi),
+            "intrinsics": None if self.intrinsics is None else list(self.intrinsics),
+            "device": self.device,
+            "version": int(self.version),
             "inverse": bool(self.inverse),
         }
 
@@ -420,6 +429,10 @@ class DepthCalibration:
             sample_count=int(payload.get("sample_count", 0)),
             resolution=None if resolution is None else (int(resolution[0]), int(resolution[1])),
             roi=None if payload.get("roi") is None else tuple(float(value) for value in payload["roi"]),
+            intrinsics=None if payload.get("intrinsics") is None else tuple(
+                float(value) for value in payload["intrinsics"]),
+            device=str(payload.get("device", "")),
+            version=int(payload.get("version", 1)),
             inverse=bool(payload.get("inverse", False)),
         )
 
