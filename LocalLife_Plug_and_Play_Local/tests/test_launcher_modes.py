@@ -442,12 +442,14 @@ class CloudStartupBlockingTests(unittest.TestCase):
         self.assertIn("$env:PYTHONPATH = $projectRoot", self.script)
         self.assertIn("$env:PYTHONPATH = $previousPythonPath", self.script)
 
-    def test_a_check_that_could_not_run_is_not_called_a_mismatch(self) -> None:
-        # The empty result was reported as "SSH host key mismatch", sending the
-        # operator after a security incident that had not happened.
-        self.assertIn("The VM identity check could not run", self.script)
-        self.assertIn("ModuleNotFoundError|No module named", self.script)
+    def test_a_check_that_could_not_run_is_neither_a_mismatch_nor_fatal(self) -> None:
+        # It was reported as "SSH host key mismatch" (a security incident that
+        # had not happened), and later still ended startup -- on a VM whose
+        # authenticated gcloud SSH probe had already succeeded.
+        self.assertIn("The optional check produced no verdict", self.script)
+        self.assertIn("startup continues", self.script)
         self.assertNotIn("SSH host key mismatch: the VM identity check", self.script)
+        self.assertNotIn("The VM identity check could not run", self.script)
 
     def test_the_verifier_s_stderr_is_captured_rather_than_swallowed(self) -> None:
         self.assertIn("ssh-verify-stderr.txt", self.script)

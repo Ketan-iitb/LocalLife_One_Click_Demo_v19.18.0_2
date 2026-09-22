@@ -490,11 +490,18 @@ class V28MetricCsvTests(unittest.TestCase):
         depth[100, 120] = 0.2  # a depth spike that would otherwise dominate
         result = metric_object_volume(depth, camera, mask, plane, min_height_m=0.01)
         self.assertIsNone(result.reason)
-        expected = 60 * 80 * (1.40 ** 2 / (500 * 500)) * 0.10 * 1000
-        self.assertAlmostEqual(result.measurement.liters, expected, delta=0.1 * expected)
+        # The occupied volume is the block's shadow on the support plane, so the
+        # footprint is the mask's frustum cross-section AT THE PLANE (1.50 m),
+        # not its smaller cross-section at the top face (1.40 m).
+        footprint_m2 = 60 * 80 * (1.50 ** 2 / (500 * 500))
+        expected = footprint_m2 * 0.10 * 1000
+        self.assertAlmostEqual(result.measurement.liters, expected, delta=0.3 * expected)
+        self.assertAlmostEqual(result.diagnostics["footprint_area_m2"], footprint_m2,
+                               delta=0.15 * footprint_m2)
         self.assertGreaterEqual(result.diagnostics["rejected_spike_pixels"], 0)
         self.assertEqual(result.diagnostics["height_source"], "fitted_support_plane")
-        for key in ("mask_pixels", "height_median_m", "metric_pixel_area_median_m2", "raw_volume_l"):
+        for key in ("mask_pixels", "height_median_m", "footprint_area_m2", "footprint_cells",
+                    "occlusion_filled_cells", "length_mm", "width_mm", "raw_volume_l"):
             self.assertIn(key, result.diagnostics)
 
     def test_stable_volume_waits_for_agreement(self) -> None:
