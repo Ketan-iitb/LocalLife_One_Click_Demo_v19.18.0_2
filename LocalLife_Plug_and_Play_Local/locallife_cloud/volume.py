@@ -1083,6 +1083,67 @@ def estimate_object_dimensions(
     )
 
 
+def object_plane_points(
+    depth_m: np.ndarray | None,
+    intrinsics: CameraIntrinsics | None,
+    object_mask: np.ndarray | None,
+    reference_plane: ReferencePlane | None,
+    *,
+    measurement_mask: np.ndarray | None = None,
+    min_height_m: float = 0.015,
+    max_height_m: float = 0.80,
+    erode_px: int = 0,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """The object's elevated points in support-plane coordinates.
+
+    Returns ((N, 2) footprint metres, (N,) height above the plane), selected
+    exactly as `estimate_object_dimensions` selects them, for the shape router
+    in `shape_geometry.py`. `erode_px` trims uncertain mask boundaries, which
+    matters for monocular depth whose edges bleed into the background.
+    """
+    if depth_m is None or intrinsics is None or object_mask is None or reference_plane is None:
+        return None
+    if reference_plane.coefficients is None:
+        return None
+    candidate = object_mask.astype(bool)
+    if erode_px > 0:
+        import cv2
+
+        candidate = cv2.erode(candidate.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=erode_px) > 0
+    if measurement_mask is not None:
+        candidate = candidate & measurement_mask.astype(bool)
+    depth = depth_m.astype(np.float64, copy=False)
+    depth_ok = np.isfinite(depth) & (depth > 0.10) & (depth < 20.0)
+    height_map = _plane_perpendicular_height(depth, intrinsics, reference_plane.coefficients)
+    if height_map is None:
+        return None
+    elevated = (
+        candidate & depth_ok & np.isfinite(height_map)
+        & (height_map >= min_height_m) & (height_map <= max_height_m)
+    )
+    elevated = _largest_connected_region(elevated)
+    if not np.any(elevated):
+        return None
+    rows, columns = np.nonzero(elevated)
+    z = depth[rows, columns]
+    x = (columns.astype(np.float64) - intrinsics.ppx) * z / intrinsics.fx
+    y = (rows.astype(np.float64) - intrinsics.ppy) * z / intrinsics.fy
+    points = np.column_stack((x, y, z))
+    a, b, _ = reference_plane.coefficients
+    normal = np.array((a, b, -1.0), dtype=np.float64)
+    normal_norm = float(np.linalg.norm(normal))
+    if not np.isfinite(normal_norm) or normal_norm < 1e-9:
+        return None
+    normal /= normal_norm
+    seed = np.array((1.0, 0.0, 0.0)) if abs(normal[0]) < 0.9 else np.array((0.0, 1.0, 0.0))
+    u_hat = seed - float(np.dot(seed, normal)) * normal
+    u_hat /= np.linalg.norm(u_hat)
+    v_hat = np.cross(normal, u_hat)
+    footprint = np.column_stack((points @ u_hat, points @ v_hat))
+    footprint -= np.median(footprint, axis=0)
+    return footprint, height_map[elevated].astype(np.float64)
+
+
 def estimate_box_volume_cuboid(
     depth_m: np.ndarray | None,
     intrinsics: CameraIntrinsics | None,
