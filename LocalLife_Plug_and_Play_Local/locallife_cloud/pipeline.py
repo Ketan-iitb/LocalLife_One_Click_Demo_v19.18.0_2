@@ -49,7 +49,9 @@ from .storage import ResultStore
 from .tracking import ObjectTracker
 from .box_templates import load_box_templates, match_box_template
 from .logitech_calibration import RELATIVE_ONLY_MESSAGE, LogitechCalibrationStore, LogitechLens, depth_output_kind
+from .logitech_factor import LogitechVolumeFactors, geometry_group
 from .logitech_volume import fit_plane_alignment, metric_object_volume, stable_volume
+from .vocabulary import object_type as canonical_object_type
 from .shape_geometry import CYLINDER, CYLINDER_REJECTIONS, UNCERTAIN, GeometryLock, ShapeGeometry, measure_shape
 from .types import BoxVolumeMeasurement, CameraIntrinsics, DepthCalibration, Detection, FrameAnalysis
 from .volume import (
@@ -554,6 +556,14 @@ class VisionPipeline:
         # tracks -> DA-V2 -> finalised), shown on the research dashboard.
         self.stage_counters: Counter = Counter()
         self.last_stage_rejections: dict[str, int] = {}
+        # Frozen empirical correction for Logitech volumes (logitech_factor.py).
+        self.volume_factors = (
+            LogitechVolumeFactors(
+                config.results_dir / "calibration" / "logitech_volume_factors.json",
+                camera_setup=f"{camera_id}:{config.depth_model}",
+            )
+            if camera_id == "logitech" else None
+        )
         # Live Logitech volumes per track, and the trimmed-median stable value.
         self._logitech_volume_samples: dict[int, deque[float]] = defaultdict(lambda: deque(maxlen=9))
         self._logitech_volume_spread: dict[int, float] = {}
@@ -1757,8 +1767,20 @@ class VisionPipeline:
                 and detection.source != DETECTOR_ONLY_SOURCE
             ):
                 if self.camera_id == "logitech":
+                    volume_mask = instance_mask
+                    if self.config.logitech_volume_erode_px > 0:
+                        # Classification keeps the full mask; volume uses the
+                        # core, because the rim pixel is floor at object depth.
+                        import cv2
+
+                        eroded = cv2.erode(
+                            volume_mask.astype(np.uint8), np.ones((3, 3), np.uint8),
+                            iterations=self.config.logitech_volume_erode_px,
+                        ) > 0
+                        if int(np.count_nonzero(eroded)) >= self.config.logitech_min_object_pixels:
+                            volume_mask = eroded
                     result = metric_object_volume(
-                        calibrated_prediction, intrinsics, instance_mask, measurement_plane,
+                        calibrated_prediction, intrinsics, volume_mask, measurement_plane,
                         reference_depth_m=self.reference_monocular,
                         measurement_mask=bin_region,
                         min_height_m=self.config.logitech_min_object_height_m,
@@ -1954,6 +1976,20 @@ class VisionPipeline:
                 detection.track_id, pending_shapes.get(id(detection)),
             )
             self._apply_cylinder_geometry(detection)
+            detection.canonical_type = canonical_object_type(detection.label, detection.confidence)
+            if self.camera_id == "logitech" and self.volume_factors is not None:
+                # Raw geometry first, then the frozen factor -- both kept.
+                raw = detection.raw_volume_l = detection.monocular_volume_l
+                group = geometry_group(
+                    None if detection.shape_geometry is None else detection.shape_geometry.geometry_method,
+                    detection.canonical_type or detection.label,
+                )
+                corrected, applied = self.volume_factors.correct(raw, group)
+                detection.monocular_volume_l = corrected
+                self.last_logitech_volume_diagnostics = {
+                    **self.last_logitech_volume_diagnostics,
+                    "calibration_group": group, "empirical_factor": applied,
+                }
             if self.camera_id == "logitech" and detection.track_id is not None:
                 live = detection.monocular_volume_l
                 if live is not None:
@@ -3087,6 +3123,7 @@ class VisionPipeline:
             "calibration_id": self._calibration_id,
             "track_id": detection.track_id,
             "label": detection.label,
+            "object_type": detection.canonical_type or detection.label,
             "accepted_class": detection.accepted_class,
             "color": detection.color,
             "color_confidence": round(float(detection.color_confidence), 4),
@@ -3115,6 +3152,7 @@ class VisionPipeline:
             # Read by the paired comparison log (paired_events.py); the
             # per-camera CSV keeps its established columns.
             "shape_geometry": None if shape is None else shape.to_dict(),
+            "raw_volume_l": detection.raw_volume_l,
             "geometry_method": None if shape is None else shape.geometry_method,
             "calibration_method": None if self.calibration is None else self.calibration.method,
             "processing_time_ms": None if analysis is None else round(float(analysis.inference_ms), 2),
@@ -3583,6 +3621,20 @@ class VisionPipeline:
                 output = (0.55 * output + 0.45 * tinted).astype(np.uint8)
         return output
 
+    def latest_raw_volume(self) -> tuple[float | None, str | None, str | None]:
+        """The newest raw Logitech volume, its object name and calibration group."""
+        analysis = self.latest_analysis
+        if analysis is None:
+            return None, None, None
+        for detection in sorted(analysis.detections, key=lambda item: item.area_pixels, reverse=True):
+            if detection.raw_volume_l:
+                group = geometry_group(
+                    None if detection.shape_geometry is None else detection.shape_geometry.geometry_method,
+                    detection.canonical_type or detection.label,
+                )
+                return float(detection.raw_volume_l), detection.canonical_type or detection.label, group
+        return None, None, None
+
     def logitech_calibration_status(self) -> dict[str, Any]:
         store = self.logitech_calibration
         active = self.calibration if self.camera_id == "logitech" else None
@@ -3594,6 +3646,7 @@ class VisionPipeline:
             "active_calibration": None if active is None else active.to_dict(),
             "depth_output": depth_output_kind(self.config.depth_model),
             "calibration_rejected_reason": self.calibration_rejected_reason,
+            "volume_factors": None if self.volume_factors is None else self.volume_factors.status(),
             "stored": None if store is None else store.status(),
             "diagnostics": self.logitech_diagnostics() if self.camera_id == "logitech" else None,
             "lens": None if self.logitech_lens is None else {

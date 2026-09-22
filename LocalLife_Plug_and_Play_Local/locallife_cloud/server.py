@@ -528,6 +528,43 @@ def create_app(
     def logitech_calibration() -> Any:
         return jsonify(manager.camera("logitech").logitech_calibration_status())
 
+    @app.get("/api/logitech/volume-factor")
+    def logitech_volume_factor() -> Any:
+        """Frozen empirical correction: samples, factors and whether it is applied."""
+        return jsonify(manager.camera("logitech").volume_factors.status())
+
+    @app.post("/api/logitech/volume-factor/sample")
+    @protected
+    def logitech_volume_factor_sample() -> Any:
+        """Record one calibration object: its known volume against this camera's raw one."""
+        payload = request.get_json(silent=True) or {}
+        station = manager.camera("logitech")
+        raw, name, group = station.latest_raw_volume()
+        raw = float(payload.get("raw_litres") or (raw or 0.0))
+        try:
+            status = station.volume_factors.add_sample(
+                str(payload.get("object_name") or name or ""),
+                str(payload.get("group") or group or "irregular"),
+                float(payload["reference_litres"]), raw,
+                reference_source=str(payload.get("reference_source", "manual")),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            return jsonify(error=str(exc)), 400
+        return jsonify(ok=True, **status)
+
+    @app.post("/api/logitech/volume-factor/freeze")
+    @protected
+    def logitech_volume_factor_freeze() -> Any:
+        try:
+            return jsonify(ok=True, **manager.camera("logitech").volume_factors.freeze())
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+
+    @app.post("/api/logitech/volume-factor/unfreeze")
+    @protected
+    def logitech_volume_factor_unfreeze() -> Any:
+        return jsonify(ok=True, **manager.camera("logitech").volume_factors.unfreeze())
+
     @app.post("/api/logitech/calibrate-empty")
     @protected
     def logitech_calibrate_empty() -> Any:
