@@ -204,3 +204,26 @@ Run it after one controlled object has been measured. Repeat with a box, a can
 (which should report the cylinder method and diameter) and an irregular object
 (which should report the height-map method). The script creates no data, so a
 PASS requires real cameras.
+
+## V27 fixes (hardware feedback)
+
+* **Cylinders.** Cylinders are fitted with a robust RANSAC circle and MAD
+  rejection. Upright cylinders are fitted in the footprint plane, and lying ones
+  across their PCA axis. The fitted diameter × diameter × height and π r² h now
+  replace the footprint box in the overlay, the API and the CSV. A poor fit
+  stays pending with a `rejection_reason` and is never given a box volume.
+* **Logitech mask.** The final object mask is detector mask ∩ foreground change
+  against the empty reference ∩ ROI, with shadows removed. Only the largest
+  connected component is kept, and masks that span the ROI border are rejected.
+  Without an empty reference there is no mask. The overlay is at
+  `/api/cameras/logitech/mask-debug.jpg`, and the yes/no status chain is on
+  `/research`. Without calibration the dashboard shows "CALIBRATION REQUIRED —
+  metric volume unavailable".
+* **CSV.** An object that never settles is recorded once as `rejected`
+  (`unstable_volume` / `no_valid_measurement`). A failed write is queued once
+  and finalises its track. The operator download is the canonical
+  `comparison_measurements.csv` and is sent with `no-store`. A file with an
+  older schema is kept beside the new one.
+* **Hardware diagnostic mode.** Set `LOCALLIFE_HARDWARE_DIAGNOSTIC=1` to get
+  per-measurement and 5-second scene bundles in
+  `<results>/<camera>/hardware_diagnostics/<camera>/`.
