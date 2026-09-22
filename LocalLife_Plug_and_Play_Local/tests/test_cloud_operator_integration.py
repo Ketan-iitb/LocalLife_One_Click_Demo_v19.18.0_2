@@ -61,7 +61,7 @@ class OperatorPageTests(unittest.TestCase):
             "OBJECT ID", "TYPE", "COLOR", "MATERIAL", "SORTING", "VOLUME",
             "SIZE L×W×H", "HEIGHT", "CONFIDENCE",
             "ACCEPTED DROPS", "OPERATIONAL VOLUME", "Totals by bag color",
-            "DOWNLOAD LATEST CSV", "RESEARCH / ADVANCED MODE",
+            "DOWNLOAD SIMPLE EXCEL", "DOWNLOAD DETAILED RAW CSV", "RESEARCH / ADVANCED MODE",
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, body)

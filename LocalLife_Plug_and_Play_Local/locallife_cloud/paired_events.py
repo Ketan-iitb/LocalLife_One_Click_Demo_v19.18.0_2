@@ -76,10 +76,6 @@ def _object_family(label: Any) -> str:
     return text.strip() or "unknown"
 
 
-def _compatible(left: str, right: str) -> bool:
-    return "unknown" in (left, right) or left == right
-
-
 @dataclass
 class _OpenEvent:
     comparison_event_id: str
@@ -174,6 +170,8 @@ class PairedComparisonLog:
         self.path = self.directory / CSV_NAME
         self.ground_truth_path = self.directory / GROUND_TRUTH_NAME
         self.window_seconds = float(window_seconds)
+        # How long after an event opened a late camera result may still fill it.
+        self.late_factor = 3.0
         # Research mode: both cameras (paired) or one camera alone. Only an
         # expected camera can be reported missing.
         self.expected_cameras = tuple(expected_cameras)
@@ -228,13 +226,16 @@ class PairedComparisonLog:
             if measurement_id in self._seen:
                 return {"written": False, "duplicate": True, "measurement_id": measurement_id}
             family = _object_family(measurement.get("object_type") or measurement.get("label"))
+            # Paired by time only: the two cameras' detectors need not agree on
+            # the label ("bag" vs "clothing") for it to be the same deposit.
             candidates = [
                 event for event in self._open
-                if camera not in event.cameras and _compatible(event.object_family, family)
-                and now - event.opened_at <= self.window_seconds
+                if camera not in event.cameras and now - event.opened_at <= self.window_seconds
             ]
             if candidates:
                 event = min(candidates, key=lambda item: now - item.opened_at)
+            elif (late := self._replace_late_missing(measurement, camera, now)) is not None:
+                return late
             else:
                 event = _OpenEvent(f"cmp-{uuid4().hex[:12]}", now, family)
                 self._open.append(event)
@@ -247,6 +248,39 @@ class PairedComparisonLog:
                 self._open.remove(event)
             return {"written": written, "comparison_event_id": event.comparison_event_id,
                     "measurement_id": measurement_id}
+
+    def _replace_late_missing(self, measurement: dict[str, Any], camera: str, now: float) -> dict[str, Any] | None:
+        """A camera that finalises shortly after its pair timed out fills that pair.
+
+        The explicit `missing` row is replaced by the real measurement, so a
+        slow Logitech result updates the pair instead of starting a new event.
+        Only within `late_factor` windows of the event opening.
+        """
+        rows = self.rows()
+        for index in range(len(rows) - 1, -1, -1):
+            row = rows[index]
+            if row.get("camera_source") != camera or row.get("status") != STATUS_MISSING:
+                continue
+            try:
+                opened_at = float(row.get("timestamp") or 0) - self.window_seconds
+            except ValueError:
+                continue
+            if now - opened_at > self.window_seconds * self.late_factor:
+                return None
+            replacement = _with_aliases(_with_errors({
+                **comparison_row(measurement, row["comparison_event_id"], self.session_id),
+                **self._truth_columns(row["comparison_event_id"]),
+            }))
+            rows[index] = replacement
+            self._rewrite(rows)
+            self._seen.discard(str(row.get("measurement_id")))
+            self._seen.add(str(replacement["measurement_id"]))
+            self._last_write_at = time.time()
+            LOGGER.info("Late %s measurement %s filled comparison event %s", camera,
+                        replacement["measurement_id"], row["comparison_event_id"])
+            return {"written": True, "comparison_event_id": row["comparison_event_id"],
+                    "measurement_id": replacement["measurement_id"], "replaced_missing": True}
+        return None
 
     def flush_expired(self, *, now: float | None = None) -> int:
         """Close events whose window passed, writing one `missing` row per absent camera."""

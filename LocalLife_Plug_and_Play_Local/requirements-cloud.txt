@@ -2,6 +2,8 @@
 # provides CUDA-enabled versions; setup_cloud.sh exposes them to the venv.
 Flask>=3.0,<4
 waitress>=3.0,<4
+# LocalLife_Measurements.xlsx (simple operator export)
+openpyxl>=3.1,<4
 numpy>=1.26,<3
 opencv-python-headless>=4.9
 Pillow>=10
