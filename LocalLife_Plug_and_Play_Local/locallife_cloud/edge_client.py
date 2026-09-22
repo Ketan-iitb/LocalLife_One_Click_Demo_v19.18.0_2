@@ -210,13 +210,30 @@ def iter_realsense(
         pipeline.stop()
 
 
+# A C920's sensor is 16:9. Its 70.42 deg horizontal field of view only holds
+# in a 16:9 mode; a 4:3 mode (640x480, 800x600, 1600x1200) crops the sensor
+# horizontally and keeps the vertical field of view, so deriving fx from the
+# horizontal figure there underestimates it by about a third -- and a focal
+# length that is too short makes every back-projected footprint too large.
+NATIVE_ASPECT = 16.0 / 9.0
+DEFAULT_VERTICAL_FOV_DEG = 43.3
+
+
 def camera_intrinsics_from_fov(
     width: int, height: int, *, horizontal_fov_deg: float = 70.42,
+    vertical_fov_deg: float = DEFAULT_VERTICAL_FOV_DEG,
     fx: float | None = None, fy: float | None = None,
 ) -> dict[str, Any]:
     if width < 1 or height < 1 or not 1 < horizontal_fov_deg < 179:
         raise ValueError("Camera dimensions and horizontal field of view must be valid")
-    estimated_fx = width / (2.0 * math.tan(math.radians(horizontal_fov_deg) / 2.0))
+    if not 1 < vertical_fov_deg < 179:
+        raise ValueError("Camera vertical field of view must be valid")
+    if abs(width / height - NATIVE_ASPECT) <= 0.02:
+        estimated_fx = width / (2.0 * math.tan(math.radians(horizontal_fov_deg) / 2.0))
+    else:
+        # Square pixels: fx == fy, and the vertical field of view survives a
+        # horizontal crop, so it is the reliable one outside 16:9.
+        estimated_fx = height / (2.0 * math.tan(math.radians(vertical_fov_deg) / 2.0))
     actual_fx = estimated_fx if fx is None else float(fx)
     actual_fy = actual_fx if fy is None else float(fy)
     if not math.isfinite(actual_fx) or not math.isfinite(actual_fy) or min(actual_fx, actual_fy) <= 0:
@@ -252,6 +269,7 @@ def iter_video(
     import cv2
 
     capture = cv2.VideoCapture(source)
+    announced = False
     if not capture.isOpened():
         raise RuntimeError(f"Unable to open camera/video source: {source}")
     if isinstance(source, int):
@@ -265,11 +283,20 @@ def iter_video(
                     return
                 raise RuntimeError("USB camera stopped returning frames")
             real_height, real_width = image.shape[:2]
+            intrinsics = camera_intrinsics_from_fov(
+                real_width, real_height, horizontal_fov_deg=horizontal_fov_deg, fx=fx, fy=fy
+            )
+            if not announced:
+                LOGGER.info(
+                    "Logitech capture %dx%d, intrinsics fx=%.1f fy=%.1f ppx=%.1f ppy=%.1f (%s)",
+                    real_width, real_height, intrinsics["fx"], intrinsics["fy"],
+                    intrinsics["ppx"], intrinsics["ppy"],
+                    "measured lens calibration" if fx is not None else "field-of-view estimate",
+                )
+                announced = True
             yield CapturedFrame(
                 image=image, depth_m=None,
-                intrinsics=camera_intrinsics_from_fov(
-                    real_width, real_height, horizontal_fov_deg=horizontal_fov_deg, fx=fx, fy=fy
-                ),
+                intrinsics=intrinsics,
                 source=f"logitech-video:{source}", camera_id="logitech",
                 intrinsics_origin="measured-lens-calibration" if fx is not None else "estimated-horizontal-fov",
             )

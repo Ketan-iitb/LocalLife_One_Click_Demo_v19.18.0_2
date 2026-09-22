@@ -283,6 +283,9 @@ class YoloSegmenter:
         results = self.model.predict(**predict_kwargs)
         return [self._parse_result(frame, result) for frame, result in zip(frames, results, strict=True)]
 
+    def _minimum_mask_pixels(self) -> int:
+        return max(1, min(self.config.min_component_pixels, self.config.logitech_min_object_pixels))
+
     def _parse_result(self, frame: np.ndarray, result: Any) -> list[Detection]:
         if result.boxes is None or len(result.boxes) == 0:
             return []
@@ -308,7 +311,11 @@ class YoloSegmenter:
                 mask = np.zeros(frame.shape[:2], dtype=bool)
                 mask[y1:y2, x1:x2] = True
 
-            if np.count_nonzero(mask) < self.config.min_component_pixels:
+            # The smallest mask any camera on this rig accepts. Using the
+            # RealSense minimum here deleted cans, chargers and ear cups from
+            # the shared detector's output before the Logitech station could
+            # apply its own (smaller) threshold; each station still filters.
+            if np.count_nonzero(mask) < self._minimum_mask_pixels():
                 continue
             names = result.names
             label = names.get(int(class_id), str(class_id)) if isinstance(names, dict) else names[int(class_id)]
