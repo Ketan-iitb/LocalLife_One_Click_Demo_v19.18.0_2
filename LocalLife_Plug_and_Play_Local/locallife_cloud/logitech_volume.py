@@ -180,6 +180,43 @@ def cell_height_map(
     return unique, sorted_heights[picks]
 
 
+def object_plane_component(
+    cells: np.ndarray, heights: np.ndarray, *, bridge_cells: int = 1,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Keep the footprint the tracked object stands on, drop detached patches.
+
+    Mask leakage -- floor beyond a bag, a foot beside a backpack -- lands as
+    separate islands once the points are on the support plane, where the
+    object itself is one connected footprint. The island holding the tallest
+    cell is the object (leakage lies near the plane, which is why it leaked),
+    so the others are dropped before the volume is integrated. A one-cell
+    closing keeps a genuine footprint whole across a missing row of points.
+    """
+    import cv2
+
+    origin = cells.min(axis=0)
+    grid = cells - origin
+    shape = (int(grid[:, 1].max()) + 1, int(grid[:, 0].max()) + 1)
+    if min(shape) < 3 or shape[0] * shape[1] > 4_000_000:
+        return cells, heights, 0
+    occupancy = np.zeros(shape, np.uint8)
+    occupancy[grid[:, 1], grid[:, 0]] = 1
+    joined = cv2.morphologyEx(
+        occupancy, cv2.MORPH_CLOSE, np.ones((2 * bridge_cells + 1, 2 * bridge_cells + 1), np.uint8),
+    )
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(joined, connectivity=8)
+    if count <= 2:
+        return cells, heights, 0
+    tallest = int(np.argmax(heights))
+    keep_label = int(labels[grid[tallest, 1], grid[tallest, 0]])
+    if keep_label == 0:
+        keep_label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    keep = labels[grid[:, 1], grid[:, 0]] == keep_label
+    if int(keep.sum()) < 4:
+        return cells, heights, 0
+    return cells[keep], heights[keep], int((~keep).sum())
+
+
 def fill_occluded_cells(
     cells: np.ndarray, heights: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, int]:
@@ -297,44 +334,54 @@ def metric_object_volume(
     if diagnostics["above_plane_pixels"] < min_pixels:
         return HeightMapResult(None, diagnostics, "no_measurable_height_above_plane")
 
-    values = heights[valid]
-    median = float(np.median(values))
-    mad = 1.4826 * float(np.median(np.abs(values - median)))
-    spike_limit = median + MAX_HEIGHT_MAD * max(mad, 0.004)
-    accepted = valid & (heights <= spike_limit)
-    if int(np.count_nonzero(accepted)) < min_pixels:
-        accepted = valid
-
-    # Drop every accepted pixel onto the support plane with its own depth, so
-    # a vertical face lands in front of the object rather than under it.
-    footprint, plane_heights = project_to_plane(depth, intrinsics, accepted, plane_coefficients)
+    # Drop every valid pixel onto the support plane with its own depth, so a
+    # vertical face lands in front of the object rather than under it. The
+    # object's own footprint is isolated BEFORE any robust statistic is taken:
+    # leaked floor outnumbers a small object, and a median over both once
+    # rejected the object itself as the outlier.
+    footprint, plane_heights = project_to_plane(depth, intrinsics, valid, plane_coefficients)
     keep = plane_heights >= min_height_m
     footprint, plane_heights = footprint[keep], plane_heights[keep]
     if footprint.shape[0] < min_pixels:
         return HeightMapResult(None, diagnostics, "no_measurable_height_above_plane")
     cells, cell_heights = cell_height_map(footprint, plane_heights, cell_size_m=cell_size_m)
     measured_cells = int(cells.shape[0])
+    cells, cell_heights, dropped_cells = object_plane_component(cells, cell_heights)
+    # Now that only the object's own cells remain, a median/MAD gate removes
+    # the monocular depth spikes that used to dominate the integral.
+    median = float(np.median(cell_heights))
+    mad = 1.4826 * float(np.median(np.abs(cell_heights - median)))
+    spike_limit = median + MAX_HEIGHT_MAD * max(mad, 0.004)
+    within = cell_heights <= spike_limit
+    spike_cells = int((~within).sum())
+    if int(within.sum()) >= 4:
+        cells, cell_heights = cells[within], cell_heights[within]
     if fill_occlusion:
         cells, cell_heights, filled = fill_occluded_cells(cells, cell_heights)
     else:
         filled = 0
     cell_area = cell_size_m * cell_size_m
     litres = float(np.sum(cell_heights) * cell_area * 1000.0)
-    extents = estimate_extents(footprint - footprint.mean(axis=0))
+    # Dimensions come from the same cells the volume did: the object's own
+    # footprint on the plane, after leakage and spikes were removed.
+    cell_centres = (cells.astype(np.float64) + 0.5) * cell_size_m
+    extents = estimate_extents(cell_centres - cell_centres.mean(axis=0))
     diagnostics.update({
         "height_median_m": median,
         "height_mad_m": mad,
-        "height_p90_m": float(np.percentile(plane_heights, 90)),
-        "height_max_m": float(plane_heights.max()),
+        "height_p90_m": float(np.percentile(cell_heights, 90)),
+        "height_max_m": float(cell_heights.max()),
         "spike_limit_m": float(spike_limit),
         "integrated_pixels": int(plane_heights.size),
-        "rejected_spike_pixels": int(np.count_nonzero(valid) - int(np.count_nonzero(accepted))),
+        "rejected_spike_cells": spike_cells,
+        "rejected_spike_pixels": spike_cells,
         "footprint_cells": int(cells.shape[0]),
         "measured_cells": measured_cells,
+        "background_cells_dropped": dropped_cells,
         "occlusion_filled_cells": filled,
         "footprint_area_m2": float(cells.shape[0] * cell_area),
         "cell_size_m": cell_size_m,
-        "object_depth_median_m": float(np.median(depth[accepted])),
+        "object_depth_median_m": float(np.median(depth[valid])),
         "length_mm": None if extents is None else extents.length_mm,
         "width_mm": None if extents is None else extents.width_mm,
         "raw_volume_l": litres,
