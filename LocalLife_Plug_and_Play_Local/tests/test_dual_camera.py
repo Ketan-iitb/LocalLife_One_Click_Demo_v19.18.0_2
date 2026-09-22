@@ -653,11 +653,18 @@ class LogitechIntrinsicsTests(unittest.TestCase):
 
         return camera_intrinsics_from_fov
 
-    def test_logitech_focal_length_is_derived_from_horizontal_field_of_view(self) -> None:
-        camera = self.intrinsics_function()(640, 480, horizontal_fov_deg=70.42)
-        self.assertAlmostEqual(camera["fx"], 453.461, places=2)
-        self.assertEqual(camera["fy"], camera["fx"])
-        self.assertEqual(camera["ppx"], 319.5)
+    def test_logitech_focal_length_follows_the_capture_aspect_ratio(self) -> None:
+        # 16:9 is the C920's native mode, where the 70.42 deg horizontal figure
+        # holds. A 4:3 mode crops the sensor horizontally and keeps the vertical
+        # field of view, so fx comes from that instead -- deriving it from the
+        # horizontal figure there made fx a third too short, and every
+        # back-projected footprint correspondingly too large.
+        wide = self.intrinsics_function()(1280, 720, horizontal_fov_deg=70.42)
+        self.assertAlmostEqual(wide["fx"], 906.92, places=2)
+        cropped = self.intrinsics_function()(640, 480, horizontal_fov_deg=70.42)
+        self.assertAlmostEqual(cropped["fx"], 604.63, places=2)
+        self.assertEqual(cropped["fy"], cropped["fx"])
+        self.assertEqual(cropped["ppx"], 319.5)
 
     def test_checkerboard_calibrated_focal_lengths_override_estimated_values(self) -> None:
         camera = self.intrinsics_function()(640, 480, fx=920.0, fy=918.0)

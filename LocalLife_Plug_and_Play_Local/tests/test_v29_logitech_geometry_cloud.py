@@ -174,3 +174,123 @@ class MaskLeakageTests(unittest.TestCase):
                     "object_depth_median_m", "plane_source", "raw_volume_l"):
             with self.subTest(key=key):
                 self.assertIn(key, result.diagnostics)
+
+
+class VocabularyTests(unittest.TestCase):
+    def test_synonyms_collapse_and_weak_labels_fall_back_to_a_parent(self) -> None:
+        from locallife_cloud.vocabulary import canonical_name, object_type
+
+        for label, expected in (
+            ("headset", "headphones"), ("Earphones", "headphones"),
+            ("power drill", "electric drill"), ("LED bulb", "light bulb"),
+            ("rucksack", "backpack"), ("milk carton", "carton"), ("drink can", "can"),
+            ("framed artwork", "painting or picture frame"),
+        ):
+            with self.subTest(label=label):
+                self.assertEqual(canonical_name(label), expected)
+        # Confident enough: keep the specific name. Unsure: say the family.
+        self.assertEqual(object_type("headset", 0.8), "headphones")
+        self.assertEqual(object_type("headset", 0.2), "electronic item")
+        self.assertEqual(object_type("cardboard box", 0.2), "packaging object")
+        self.assertEqual(object_type("something odd", 0.1), "unknown deposited object")
+
+    def test_the_prompt_bank_covers_the_missing_categories(self) -> None:
+        from locallife_cloud.config import BACKGROUND_PROMPTS, DEFAULT_GEOMETRY_VALIDATION_PROMPTS
+
+        for prompt in ("headphones", "charger", "light bulb", "electric drill", "painting",
+                       "cosmetic bottle", "milk carton", "aluminium can", "packet",
+                       "electronic item", "unknown deposited object"):
+            self.assertIn(prompt, DEFAULT_GEOMETRY_VALIDATION_PROMPTS)
+        for prompt in ("floor", "sofa", "foot", "hand", "shadow"):
+            self.assertIn(prompt, BACKGROUND_PROMPTS)
+
+    def test_an_electronics_label_is_no_longer_rejected_as_background(self) -> None:
+        from locallife_cloud.pipeline import accepted_object_class
+
+        for label in ("headphones", "charger", "charging cable", "light bulb", "electric drill"):
+            with self.subTest(label=label):
+                self.assertEqual(accepted_object_class(label, "geometry_validation"), "measurement_object")
+        for label in ("floor", "sofa", "person", "shadow"):
+            with self.subTest(label=label):
+                self.assertIsNone(accepted_object_class(label, "geometry_validation"))
+
+
+class SmallObjectDetectionTests(unittest.TestCase):
+    def test_the_shared_detector_keeps_masks_the_logitech_station_can_use(self) -> None:
+        from locallife_cloud.config import AppConfig
+        from locallife_cloud.inference import YoloSegmenter
+
+        config = AppConfig(min_component_pixels=700, logitech_min_object_pixels=150)
+        self.assertEqual(YoloSegmenter(config)._minimum_mask_pixels(), 150)
+        # RealSense still applies its own 700 px floor downstream.
+        self.assertEqual(config.min_component_pixels, 700)
+
+
+class VolumeFactorTests(unittest.TestCase):
+    def _store(self, directory: str):
+        from locallife_cloud.logitech_factor import LogitechVolumeFactors
+
+        return LogitechVolumeFactors(Path(directory) / "factors.json", camera_setup="c920:test")
+
+    def test_raw_volumes_are_untouched_until_the_factors_are_frozen(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            corrected, applied = store.correct(4.0, "rigid_box")
+            self.assertEqual((corrected, applied["factor"], applied["source"]), (4.0, 1.0, "uncalibrated_raw"))
+            for index, (reference, raw) in enumerate(((1.0, 2.0), (2.0, 4.1), (3.0, 5.9))):
+                store.add_sample(f"object-{index}", "rigid_box", reference, raw)
+            self.assertFalse(store.status()["frozen"])
+            corrected, applied = store.correct(4.0, "rigid_box")
+            self.assertEqual(corrected, 4.0)
+            self.assertEqual(applied["source"], "uncalibrated_raw")
+
+    def test_freezing_uses_a_robust_median_and_then_corrects(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            for index, (reference, raw) in enumerate(((1.0, 2.0), (2.0, 4.0), (3.0, 6.0), (1.0, 20.0))):
+                store.add_sample(f"object-{index}", "irregular", reference, raw)
+            status = store.freeze()
+            self.assertTrue(status["frozen"])
+            self.assertAlmostEqual(status["global_factor"], 0.5, places=6)  # the 0.05 outlier does not move it
+            corrected, applied = store.correct(4.0, "irregular")
+            self.assertAlmostEqual(corrected, 2.0, places=6)
+            # Four samples in this group, so it earns its own factor.
+            self.assertEqual(applied["source"], "group:irregular")
+            self.assertEqual(applied["raw_litres"], 4.0)
+            self.assertEqual(store.correct(4.0, "flat_object")[1]["source"], "global")
+            # Frozen means frozen: no sample may be added without unfreezing.
+            with self.assertRaises(ValueError):
+                store.add_sample("late", "irregular", 1.0, 2.0)
+            reopened = self._store(directory)
+            self.assertTrue(reopened.status()["frozen"])
+            self.assertAlmostEqual(reopened.correct(4.0, "irregular")[0], 2.0, places=6)
+
+    def test_a_group_factor_needs_its_own_samples(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            for index in range(4):
+                store.add_sample(f"box-{index}", "rigid_box", 1.0, 4.0)
+            for index in range(2):
+                store.add_sample(f"can-{index}", "cylinder", 1.0, 2.0)
+            store.freeze()
+            self.assertIn("rigid_box", store.group_factors)
+            self.assertNotIn("cylinder", store.group_factors)   # only two samples
+            self.assertEqual(store.factor_for("cylinder")[1], "global")
+            self.assertEqual(store.factor_for("rigid_box")[1], "group:rigid_box")
+            self.assertEqual(store.calibration_objects(), {f"box-{i}" for i in range(4)} | {f"can-{i}" for i in range(2)})
+
+    def test_groups_follow_geometry_then_name(self) -> None:
+        from locallife_cloud.logitech_factor import geometry_group
+
+        self.assertEqual(geometry_group("cylinder", "can"), "cylinder")
+        self.assertEqual(geometry_group("cuboid", "shoe box"), "rigid_box")
+        self.assertEqual(geometry_group("irregular_rigid", "filled waste bag"), "flexible_bag")
+        self.assertEqual(geometry_group("irregular_rigid", "headphones"), "electronics")
+        self.assertEqual(geometry_group(None, "book"), "flat_object")
+        self.assertEqual(geometry_group(None, "unknown deposited object"), "irregular")
