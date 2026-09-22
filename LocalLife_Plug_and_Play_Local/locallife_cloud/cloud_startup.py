@@ -33,6 +33,9 @@ STAGES = (
     "resolving_zone",
     "starting_vm",
     "verifying_ssh",
+    # Optional published-host-key pinning: never a startup gate, but it is its
+    # own stage so a failure there is not reported as a deployment failure.
+    "pinning_host_key",
     "checking_deployment",
     "uploading_bundle",
     "installing_dependencies",
@@ -91,6 +94,7 @@ STAGE_TIMING_KEY = {
     "resolving_zone": "vm_resolution_seconds",
     "starting_vm": "vm_start_seconds",
     "verifying_ssh": "ssh_verification_seconds",
+    "pinning_host_key": "ssh_verification_seconds",
     "uploading_bundle": "deployment_seconds",
     "installing_dependencies": "deployment_seconds",
     "checking_deployment": "deployment_seconds",

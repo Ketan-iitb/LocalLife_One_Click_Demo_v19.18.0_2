@@ -412,7 +412,7 @@ function Assert-CloudSshIdentity {
     # an optional diagnostic, and it used to spend the whole verifying_ssh
     # budget (6 x 10 s) waiting for guest attributes, so a healthy VM was
     # reported "SSH identity NOT verified" and startup failed.
-    Set-CloudStage -Stage 'checking_deployment' -Status 'running' -Zone $Zone
+    Set-CloudStage -Stage 'pinning_host_key' -Status 'running' -Zone $Zone
     Write-Step 'Checking for a Google-published SSH host key (optional)...'
     # PYTHONPATH, not the current directory: this script lives at the repository
     # root while the package is one level down in $ProjectDirectory, so
@@ -425,6 +425,8 @@ function Assert-CloudSshIdentity {
     $errorFile = Join-Path $script:SessionDirectory 'ssh-verify-stderr.txt'
     $previousPythonPath = $env:PYTHONPATH
     $env:PYTHONPATH = $projectRoot
+    $raw = ''
+    $verifyExitCode = -1
     try {
         # Hand over the gcloud path this script already resolved: on Windows
         # gcloud is a .cmd, which Python's subprocess does not find from the
@@ -434,6 +436,11 @@ function Assert-CloudSshIdentity {
             '--gcloud' (Assert-GcloudAvailable) `
             '--known-hosts' $knownHosts '--attempts' '1' '--delay' '0' 2>$errorFile | Out-String)
         $verifyExitCode = $LASTEXITCODE
+    }
+    catch {
+        # The optional check itself failed to run. That is not a connection
+        # failure and must not stop a VM that already answered authenticated SSH.
+        Write-Host ('Optional host-key check could not run: ' + $_.Exception.Message) -ForegroundColor DarkYellow
     }
     finally {
         $env:PYTHONPATH = $previousPythonPath
@@ -450,9 +457,9 @@ function Assert-CloudSshIdentity {
         }
     }
     if ($null -eq $report) {
-        # NOT a mismatch. The check never produced a verdict, which is a
-        # different problem with a different fix, and calling it a mismatch sent
-        # the last run looking for a security incident that had not happened.
+        # NOT a mismatch, and NOT a reason to fail: the check never produced a
+        # verdict, while the authenticated gcloud SSH probe above already
+        # succeeded. Startup continues over that same authenticated channel.
         $detail = $errorText
         if ([string]::IsNullOrWhiteSpace($detail)) { $detail = $raw.Trim() }
         if ([string]::IsNullOrWhiteSpace($detail)) { $detail = '(no output; exit code ' + $verifyExitCode + ')' }
@@ -464,12 +471,14 @@ function Assert-CloudSshIdentity {
         Write-Host $detail -ForegroundColor Yellow
         Write-Host ('--- (also saved to ' + $errorFile + ') ---') -ForegroundColor Yellow
         $detail = (($detail -split "`r?`n" | Where-Object { $_.Trim() -ne '' } | Select-Object -Last 1) + '')
-        if ($detail -match 'ModuleNotFoundError|No module named') {
-            throw ('The VM identity check could not run: Python could not import locallife_cloud from ' +
-                   $projectRoot + '. Confirm that folder contains locallife_cloud\. Details: ' + $detail)
-        }
-        throw ('The VM identity check could not run (no verdict was produced). ' +
-               'This is a launcher problem, not a security failure. Details: ' + $detail)
+        Write-Host 'SSH HOST KEY NOT AUTOMATICALLY VERIFIED (optional diagnostic only; startup continues).' -ForegroundColor Yellow
+        Write-Host ('  The optional check produced no verdict: ' + $detail) -ForegroundColor DarkYellow
+        Write-Host '  Authenticated gcloud SSH to this VM already succeeded, so cloud mode' -ForegroundColor Yellow
+        Write-Host '  continues over that same authenticated channel.' -ForegroundColor Yellow
+        $script:CloudSshInteractive = $true
+        $script:CloudZone = $Zone
+        Set-CloudStage -Stage 'checking_deployment' -Status 'running' -Zone $Zone
+        return $null
     }
     if (-not $report.verified) {
         # Automatic verification was not possible -- Google had not published a
@@ -494,9 +503,11 @@ function Assert-CloudSshIdentity {
         Write-Host ''
         $script:CloudSshInteractive = $true
         $script:CloudZone = $Zone
+        Set-CloudStage -Stage 'checking_deployment' -Status 'running' -Zone $Zone
         return $report
     }
     $script:CloudSshInteractive = $false
+    Set-CloudStage -Stage 'checking_deployment' -Status 'running' -Zone $Zone
     # Logged without credentials: instance id, zone, IP and fingerprints are all
     # public facts about the machine, and they are what makes a later mismatch
     # diagnosable.
