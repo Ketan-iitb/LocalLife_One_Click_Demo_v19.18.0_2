@@ -208,6 +208,7 @@ class LogitechCalibrationStore:
         self.samples: list[CalibrationSample] = []
         self.calibration: DepthCalibration | None = None
         self.reason: str | None = "no_calibration_samples"
+        self.diagnostics: dict[str, Any] = {}
         self._load()
 
     def _load(self) -> None:
@@ -226,6 +227,7 @@ class LogitechCalibrationStore:
         ]
         self.calibration = DepthCalibration.from_dict(payload.get("calibration"))
         self.reason = payload.get("reason")
+        self.diagnostics = payload.get("diagnostics") or {}
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -234,6 +236,7 @@ class LogitechCalibrationStore:
             "samples": [sample.to_dict() for sample in self.samples],
             "calibration": None if self.calibration is None else self.calibration.to_dict(),
             "reason": self.reason,
+            "diagnostics": self.diagnostics,
         }
         temporary = self.path.with_suffix(".tmp")
         temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -259,6 +262,15 @@ class LogitechCalibrationStore:
         self._save()
         return self.status()
 
+    def set_calibration(self, calibration: DepthCalibration, diagnostics: dict[str, Any]) -> dict[str, Any]:
+        """Store a plane-alignment fit (not a sample list) and persist it."""
+        self.samples = []
+        self.calibration = calibration
+        self.reason = None
+        self.diagnostics = diagnostics
+        self._save()
+        return self.status()
+
     def clear(self) -> dict[str, Any]:
         self.samples = []
         self.calibration = None
@@ -273,4 +285,5 @@ class LogitechCalibrationStore:
             "reason": self.reason,
             "samples": [sample.to_dict() for sample in self.samples],
             "calibration": None if self.calibration is None else self.calibration.to_dict(),
+            "diagnostics": self.diagnostics,
         }

@@ -89,6 +89,15 @@ class Detection:
     # camera_moved_recalibration_required, possible_existing_object_movement,
     # new_deposit_not_isolatable, measurement_timeout).
     volume_rejection_reason: str | None = None
+    # Logitech: the live per-frame volume stays in monocular_volume_l; this is
+    # the trimmed median once several frames agree (logitech_volume.py).
+    stable_volume_l: float | None = None
+    # Set when the detector's class and the material classifier disagree (a
+    # folded cloth called "cardboard box"): reported, and geometry is not forced.
+    classification_note: str | None = None
+    # Set when the detector's class and the material classifier disagree (a
+    # folded cloth called "cardboard box"): reported, and geometry is not forced.
+    classification_note: str | None = None
     depth_coverage_percent: float | None = None
     volume_uncertainty_l: float | None = None
     measurement_method: str | None = None
@@ -162,6 +171,9 @@ class Detection:
             "added_volume_l": self.added_volume_l,
             "displaced_volume_l": self.displaced_volume_l,
             "volume_rejection_reason": self.volume_rejection_reason,
+            "stable_volume_l": self.stable_volume_l,
+            "classification_note": self.classification_note,
+            "classification_note": self.classification_note,
             "depth_coverage_percent": self.depth_coverage_percent,
             "volume_uncertainty_l": self.volume_uncertainty_l,
             "measurement_method": self.measurement_method,
@@ -364,6 +376,8 @@ class DepthCalibration:
     reference_distance_m: float | None = None
     sample_count: int = 0
     resolution: tuple[int, int] | None = None
+    # The measurement ROI the fit was made for; moving it invalidates the fit.
+    roi: tuple[float, float, float, float] | None = None
     inverse: bool = False
 
     def apply(self, prediction_m: np.ndarray) -> np.ndarray:
@@ -385,6 +399,7 @@ class DepthCalibration:
             "reference_distance_m": self.reference_distance_m,
             "sample_count": int(self.sample_count),
             "resolution": None if self.resolution is None else list(self.resolution),
+            "roi": None if self.roi is None else list(self.roi),
             "inverse": bool(self.inverse),
         }
 
@@ -404,6 +419,7 @@ class DepthCalibration:
             reference_distance_m=payload.get("reference_distance_m"),
             sample_count=int(payload.get("sample_count", 0)),
             resolution=None if resolution is None else (int(resolution[0]), int(resolution[1])),
+            roi=None if payload.get("roi") is None else tuple(float(value) for value in payload["roi"]),
             inverse=bool(payload.get("inverse", False)),
         )
 
