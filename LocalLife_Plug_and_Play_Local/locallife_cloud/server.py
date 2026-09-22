@@ -167,6 +167,7 @@ def create_app(
     elif isinstance(pipeline, VisionPipeline):
         manager = DualCameraCoordinator(settings, detector=pipeline.detector, depth_estimator=pipeline.depth_estimator)
         manager.pipelines["realsense"] = pipeline
+        manager.attach_paired_listeners()
     else:
         manager = DualCameraCoordinator(settings)
     vision = manager.camera("realsense")
@@ -417,6 +418,60 @@ def create_app(
             return jsonify(ok=True, trial=record, comparison=manager.comparison())
         except (KeyError, TypeError, ValueError) as exc:
             return jsonify(error=str(exc)), 400
+
+    @app.get("/api/comparison/events")
+    def paired_events() -> Any:
+        """RealSense and Logitech results side by side, per physical object."""
+        return jsonify(manager.paired_comparison(int(request.args.get("limit", 20))))
+
+    @app.get("/api/comparison/measurements.csv")
+    def paired_measurements_csv() -> Response:
+        """The canonical long-format comparison CSV -- the file the writer appends to."""
+        return Response(
+            manager.paired_log.csv_text(),
+            content_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": "attachment; filename=comparison_measurements.csv",
+                "Cache-Control": "no-store",
+            },
+        )
+
+    @app.post("/api/comparison/ground-truth")
+    @protected
+    def paired_ground_truth() -> Any:
+        payload = request.get_json(silent=True) or {}
+        try:
+            result = manager.paired_log.set_ground_truth(str(payload["comparison_event_id"]), payload)
+        except KeyError as exc:
+            return jsonify(error=f"Unknown or missing comparison event: {exc}"), 404
+        except (TypeError, ValueError) as exc:
+            return jsonify(error=str(exc)), 400
+        return jsonify(ok=True, **result)
+
+    @app.post("/api/comparison/retry")
+    @protected
+    def paired_retry() -> Any:
+        return jsonify(ok=True, **manager.paired_log.retry_failed())
+
+    @app.get("/api/logitech/calibration")
+    def logitech_calibration() -> Any:
+        return jsonify(manager.camera("logitech").logitech_calibration_status())
+
+    @app.post("/api/logitech/calibration/sample")
+    @protected
+    def logitech_calibration_sample() -> Any:
+        payload = request.get_json(silent=True) or {}
+        try:
+            status = manager.camera("logitech").add_logitech_calibration_sample(float(payload["known_distance_m"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            return jsonify(error=str(exc)), 400
+        return jsonify(ok=True, **status)
+
+    @app.post("/api/logitech/calibration/clear")
+    @protected
+    def logitech_calibration_clear() -> Any:
+        store = manager.camera("logitech").logitech_calibration
+        return jsonify(ok=True, **store.clear())
 
     @app.post("/api/ingest")
     @app.post("/api/cameras/<camera_id>/ingest")

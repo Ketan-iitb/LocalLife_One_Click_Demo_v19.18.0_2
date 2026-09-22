@@ -305,6 +305,11 @@ class AppConfig:
     depth_noise_sigma: float = 3.0
     reject_depth_outliers: bool = True
     logitech_reference_distance_m: float = 0.0
+    # Thesis research mode: "paired" (RealSense and Logitech side by side),
+    # "realsense_only" or "logitech_only". Fusion is never implied by any.
+    research_mode: str = "paired"
+    # Two finalised camera measurements this close in time are one physical object.
+    comparison_pair_window_s: float = 20.0
     logitech_horizontal_fov_deg: float = 70.42
     logitech_roi: tuple[float, float, float, float] | None = None
     logitech_max_scene_fraction: float = 0.45
@@ -604,6 +609,8 @@ class AppConfig:
             depth_noise_sigma=float(os.environ.get("LOCALLIFE_DEPTH_NOISE_SIGMA", defaults.depth_noise_sigma)),
             reject_depth_outliers=_bool_env("LOCALLIFE_REJECT_DEPTH_OUTLIERS", True),
             logitech_reference_distance_m=float(os.environ.get("LOCALLIFE_LOGITECH_REFERENCE_DISTANCE_M", defaults.logitech_reference_distance_m)),
+            research_mode=os.environ.get("LOCALLIFE_RESEARCH_MODE", defaults.research_mode).strip().lower(),
+            comparison_pair_window_s=float(os.environ.get("LOCALLIFE_COMPARISON_PAIR_WINDOW_S", defaults.comparison_pair_window_s)),
             logitech_horizontal_fov_deg=float(os.environ.get("LOCALLIFE_LOGITECH_HORIZONTAL_FOV_DEG", defaults.logitech_horizontal_fov_deg)),
             logitech_roi=logitech_roi,
             logitech_max_scene_fraction=float(os.environ.get("LOCALLIFE_LOGITECH_MAX_SCENE_FRACTION", defaults.logitech_max_scene_fraction)),
@@ -793,6 +800,10 @@ class AppConfig:
             raise ValueError("Volume calibration factor must be finite and positive")
         if not 0 <= self.systematic_error_fraction <= 1 or self.depth_noise_sigma < 0:
             raise ValueError("Systematic error must be within [0, 1] and noise sigma cannot be negative")
+        if self.research_mode not in ("paired", "realsense_only", "logitech_only"):
+            raise ValueError("LOCALLIFE_RESEARCH_MODE must be paired, realsense_only or logitech_only")
+        if self.comparison_pair_window_s <= 0:
+            raise ValueError("LOCALLIFE_COMPARISON_PAIR_WINDOW_S must be positive")
         if self.logitech_reference_distance_m < 0 or not 1 < self.logitech_horizontal_fov_deg < 179:
             raise ValueError("Logitech reference distance cannot be negative and its field of view must be valid")
         if not 0 <= self.logitech_provisional_systematic_error_fraction <= 1:

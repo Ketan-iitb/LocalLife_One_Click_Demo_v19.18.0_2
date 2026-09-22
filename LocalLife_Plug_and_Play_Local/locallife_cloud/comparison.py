@@ -22,6 +22,7 @@ from .config import AppConfig
 from .geometry import fixed_bin_mask, is_phantom_source
 from .inference import MetricDepthEstimator, create_segmenter
 from .ledger import waste_object_type
+from .paired_events import PairedComparisonLog
 from .pipeline import VisionPipeline, filter_waste_detections
 from .storage import ResultStore
 
@@ -174,6 +175,19 @@ class DualCameraCoordinator:
         self._recent_semantic_presence: dict[str, float] = {}
         self._recent_semantic_box_presence: dict[str, float] = {}
         self.store = ResultStore(config.results_dir / "comparison")
+        expected = {
+            "paired": ("realsense", "logitech"),
+            "realsense_only": ("realsense",),
+            "logitech_only": ("logitech",),
+        }[config.research_mode]
+        # Canonical long-format comparison CSV: one row per finalised camera
+        # measurement, grouped by physical object (paired_events.py).
+        self.paired_log = PairedComparisonLog(
+            config.results_dir / "comparison",
+            window_seconds=config.comparison_pair_window_s,
+            expected_cameras=expected,
+        )
+        self.attach_paired_listeners()
         # Recipe pipeline (pointcloud_volume.py / recipe_*.py): a separate,
         # additive result -- see config.recipe_enabled's own comment for why
         # it defaults off and why it is loaded/cached lazily rather than
@@ -209,6 +223,26 @@ class DualCameraCoordinator:
             "operating_mode": self.config.operating_mode,
         }
 
+    def attach_paired_listeners(self) -> None:
+        """Route each expected camera's persisted rows into the paired log.
+
+        Called again whenever a station is swapped in after construction.
+        """
+        for camera_id in self.paired_log.expected_cameras:
+            self.pipelines[camera_id].measurement_listener = self._record_paired_measurement
+
+    def paired_comparison(self, limit: int = 20) -> dict[str, Any]:
+        return {
+            "research_mode": self.config.research_mode,
+            "events": self.paired_log.events(limit),
+            "status": self.paired_log.status(),
+            "logitech_calibration": self.camera("logitech").logitech_calibration_status(),
+        }
+
+    def _record_paired_measurement(self, row: dict[str, Any]) -> None:
+        self.paired_log.session_id = self.pipelines["realsense"].event_log.session_id
+        self.paired_log.record_measurement(row)
+
     def camera(self, camera_id: str) -> VisionPipeline:
         if camera_id not in self.pipelines:
             raise ValueError("Camera ID must be realsense or logitech")
@@ -238,6 +272,12 @@ class DualCameraCoordinator:
         camera_ids = [camera_id for camera_id in CAMERA_IDS if camera_id in packets]
         if not camera_ids:
             return {}
+        packets = dict(packets)
+        for camera_id in camera_ids:
+            frame, intrinsics = self.camera(camera_id).prepare_input(
+                packets[camera_id]["frame"], packets[camera_id].get("intrinsics"),
+            )
+            packets[camera_id] = {**packets[camera_id], "frame": frame, "intrinsics": intrinsics}
         frames = [packets[camera_id]["frame"] for camera_id in camera_ids]
         started = time.perf_counter()
         hardware = self.camera("realsense")

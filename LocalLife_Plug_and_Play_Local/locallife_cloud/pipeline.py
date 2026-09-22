@@ -8,7 +8,7 @@ import threading
 import time
 from collections import Counter, defaultdict, deque
 from dataclasses import replace
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -47,6 +47,8 @@ from .event_log import MeasurementEventLog, STATUS_ACCEPTED, STATUS_REJECTED, re
 from .storage import ResultStore
 from .tracking import ObjectTracker
 from .box_templates import load_box_templates, match_box_template
+from .logitech_calibration import RELATIVE_ONLY_MESSAGE, LogitechCalibrationStore, LogitechLens, depth_output_kind
+from .shape_geometry import GeometryLock, ShapeGeometry, measure_shape
 from .types import BoxVolumeMeasurement, CameraIntrinsics, DepthCalibration, Detection, FrameAnalysis
 from .volume import (
     ReferencePlane,
@@ -57,12 +59,17 @@ from .volume import (
     estimate_volume,
     fit_reference_plane,
     fit_support_plane_from_background,
+    object_plane_points,
     reference_plane_is_usable,
     recover_elevated_object_mask,
     synthesize_plane_depth,
 )
 
 LOGGER = logging.getLogger(__name__)
+
+# Pixels trimmed from a Logitech object mask before shape geometry: Depth
+# Anything V2 smooths depth across object boundaries, so the rim is background.
+LOGITECH_MASK_ERODE_PX = 2
 
 
 # Compound labels that contain "bag" as a sub-word but name furniture or an
@@ -502,6 +509,26 @@ class VisionPipeline:
             lambda: deque(maxlen=config.box_aggregation_window_frames)
         )
         self._box_frames_considered: dict[int, int] = defaultdict(int)
+        # Shape method voting and freeze per track (shape_geometry.py).
+        self._geometry_lock = GeometryLock(required_frames=max(3, config.settle_frames))
+        # Called with each persisted measurement row (DualCameraCoordinator
+        # pairs the two cameras through it).
+        self.measurement_listener: Callable[[dict[str, Any]], None] | None = None
+        # Logitech metric-depth calibration samples and fit, kept apart from
+        # evaluation data (logitech_calibration.py).
+        self.logitech_calibration = (
+            LogitechCalibrationStore(config.results_dir / "calibration" / "logitech_depth.json")
+            if camera_id == "logitech" else None
+        )
+        # Checkerboard lens profile, applied to every Logitech frame before
+        # detection, depth inference and geometry.
+        self.logitech_lens = (
+            LogitechLens(
+                config.results_dir / "calibration" / "logitech_lens.json",
+                config.results_dir.parent / "dual_camera_calibration.json",
+            )
+            if camera_id == "logitech" else None
+        )
         self._color_history: dict[int, deque[str]] = defaultdict(
             lambda: deque(maxlen=max(3, config.volume_window_frames))
         )
@@ -622,19 +649,32 @@ class VisionPipeline:
                 with self.inference_lock:
                     predicted = self.depth_estimator.estimate_batch([image])[0]
                 if self.camera_id == "logitech":
-                    if self.config.logitech_reference_distance_m > 0:
+                    fitted = self._fitted_logitech_calibration(predicted.shape)
+                    if fitted is not None:
+                        # Scale and shift fitted from several tape-measured
+                        # reference distances (calibration data only).
+                        self.calibration = fitted
+                        self.calibration_mode = "independent-measured-distance"
+                    elif self.config.logitech_reference_distance_m > 0:
                         region = fixed_bin_mask(image.shape, self.config.roi, self.config.bin_polygon)
                         values = predicted[region & np.isfinite(predicted) & (predicted > 0.10)]
                         if not values.size:
                             raise ValueError("The Logitech depth model returned no valid baseline pixels")
                         scale = self.config.logitech_reference_distance_m / float(np.median(values))
                         self.calibration = DepthCalibration(
-                            scale=scale, offset_m=0.0, rmse_m=0.0, sample_pixels=int(values.size)
+                            scale=scale, offset_m=0.0, rmse_m=0.0, sample_pixels=int(values.size),
+                            method="reference-distance-scale",
+                            calibration_id=uuid4().hex[:12],
+                            calibrated_at=time.time(),
+                            reference_distance_m=float(self.config.logitech_reference_distance_m),
+                            sample_count=1,
+                            resolution=(int(predicted.shape[1]), int(predicted.shape[0])),
                         )
                         self.calibration_mode = "independent-measured-distance"
                     else:
                         self.calibration = DepthCalibration(
-                            scale=1.0, offset_m=0.0, rmse_m=0.0, sample_pixels=int(predicted.size)
+                            scale=1.0, offset_m=0.0, rmse_m=0.0, sample_pixels=int(predicted.size),
+                            method="model-metric-unverified",
                         )
                         self.calibration_mode = "model-metric-unverified"
                 elif reference is not None:
@@ -678,6 +718,7 @@ class VisionPipeline:
             self._volume_history.clear()
             self._box_measurement_history.clear()
             self._box_frames_considered.clear()
+            self._geometry_lock.clear()
             self._color_history.clear()
             self._material_history.clear()
             self._material_frame_counts.clear()
@@ -793,6 +834,9 @@ class VisionPipeline:
         if any(len(values) != total for values in (depths, intrinsics, sources, timestamps)):
             raise ValueError("Frame, depth, intrinsics, source, and timestamp batches must have equal lengths")
 
+        prepared = [self.prepare_input(frame, camera) for frame, camera in zip(frames, intrinsics)]
+        frames = [item[0] for item in prepared]
+        intrinsics = [item[1] for item in prepared]
         started = time.perf_counter()
         with self.inference_lock:
             detections_batch = self.detector.detect_batch(frames)
@@ -942,6 +986,9 @@ class VisionPipeline:
         # cuboid measurement has already been computed.
         pending_box_attempted: set[int] = set()
         pending_box_measurements: dict[int, "BoxVolumeMeasurement"] = {}
+        # Per-frame shape-router result, keyed like the cuboid stash above and
+        # folded into the track's `GeometryLock` once tracking has run.
+        pending_shapes: dict[int, ShapeGeometry] = {}
         if depth_m is not None and depth_m.shape != frame.shape[:2]:
             warnings.append("RealSense depth is not aligned to the RGB frame; hardware volume was skipped")
             depth_m = None
@@ -1541,6 +1588,22 @@ class VisionPipeline:
                 # Use the same plane-relative, elevated-point height shown in
                 # the dimension triplet, not a camera-Z mask median.
                 detection.height_above_baseline_cm = round(dimensions.height_mm / 10.0, 1)
+            if dimensions is not None:
+                plane_points = object_plane_points(
+                    depth_m, intrinsics, instance_mask, measurement_plane,
+                    measurement_mask=bin_region,
+                    min_height_m=minimum_height_m,
+                    max_height_m=self.config.max_object_height_m,
+                )
+                if plane_points is not None:
+                    # Mesh volume is the height-map integral set just above,
+                    # before any cuboid override below replaces it.
+                    pending_shapes[id(detection)] = measure_shape(
+                        *plane_points,
+                        mesh_volume_l=detection.realsense_volume_l,
+                        height_mm=dimensions.height_mm,
+                        label=detection.label,
+                    )
             # Table-relative cuboid measurement for box-family detections
             # (Revised Dual-Camera Volume Estimation recipe). RealSense only
             # -- Logitech never supplies metric geometry (PDF hard
@@ -1639,6 +1702,29 @@ class VisionPipeline:
                             detection.height_above_baseline_cm = round(
                                 individual_mono.height_p90_m * 100.0, 1
                             )
+            if (
+                self.camera_id == "logitech"
+                and detection.monocular_volume_l is not None
+                and self.calibration is not None
+                and logitech_ready
+                and logitech_height_coherent
+            ):
+                # Same router, fed by calibrated Depth Anything V2 depth over
+                # the eroded mask: monocular depth bleeds across object edges,
+                # so the outermost pixels are not trusted for geometry.
+                plane_points = object_plane_points(
+                    calibrated_prediction, intrinsics, instance_mask, measurement_plane,
+                    measurement_mask=bin_region,
+                    min_height_m=minimum_height_m,
+                    max_height_m=self.config.max_object_height_m,
+                    erode_px=LOGITECH_MASK_ERODE_PX,
+                )
+                if plane_points is not None:
+                    pending_shapes[id(detection)] = measure_shape(
+                        *plane_points,
+                        mesh_volume_l=detection.monocular_volume_l,
+                        label=detection.label,
+                    )
 
         if self.camera_id == "logitech":
             rejected = []
@@ -1700,6 +1786,10 @@ class VisionPipeline:
         # already applied above. A track with fewer accepted frames than
         # `box_aggregation_min_frames` keeps its current single-frame
         # result, so early frames are never hidden.
+        for detection in detections:
+            detection.shape_geometry = self._geometry_lock.update(
+                detection.track_id, pending_shapes.get(id(detection)),
+            )
         for detection in detections:
             if detection.track_id is None or id(detection) not in pending_box_attempted:
                 continue
@@ -1976,6 +2066,7 @@ class VisionPipeline:
             self._volume_history.clear()
             self._box_measurement_history.clear()
             self._box_frames_considered.clear()
+            self._geometry_lock.clear()
             self._color_history.clear()
             self._material_history.clear()
             self._material_frame_counts.clear()
@@ -2028,6 +2119,7 @@ class VisionPipeline:
             self._volume_history.clear()
             self._box_measurement_history.clear()
             self._box_frames_considered.clear()
+            self._geometry_lock.clear()
             self._color_history.clear()
             self._material_history.clear()
             self._material_frame_counts.clear()
@@ -2061,6 +2153,7 @@ class VisionPipeline:
             self._volume_history.clear()
             self._box_measurement_history.clear()
             self._box_frames_considered.clear()
+            self._geometry_lock.clear()
             self._color_history.clear()
             self._material_history.clear()
             self._material_frame_counts.clear()
@@ -2294,12 +2387,7 @@ class VisionPipeline:
             calibration_payload = metadata.get("calibration")
             calibration = None
             if calibration_payload:
-                calibration = DepthCalibration(
-                    scale=float(calibration_payload["scale"]),
-                    offset_m=float(calibration_payload["offset_m"]),
-                    rmse_m=float(calibration_payload["rmse_m"]),
-                    sample_pixels=int(calibration_payload["sample_pixels"]),
-                )
+                calibration = DepthCalibration.from_dict(calibration_payload)
             self.baseline_rgb = rgb.astype(np.uint8, copy=False)
             self.reference_rgb = reference_rgb.astype(np.uint8, copy=False)
             self.baseline_realsense = realsense
@@ -2512,6 +2600,7 @@ class VisionPipeline:
             self._volume_history.clear()
             self._box_measurement_history.clear()
             self._box_frames_considered.clear()
+            self._geometry_lock.clear()
             return record
 
     def state(self) -> dict[str, Any]:
@@ -2735,11 +2824,17 @@ class VisionPipeline:
             permanent if permanent is not None else detection.track_id,
             suffix=status if permanent is None else f"{status}-permanent",
         )
-        result = self.event_log.record(
-            self._measurement_row(detection, timestamp, event_id, status, status_reason)
-        )
+        row = self._measurement_row(detection, timestamp, event_id, status, status_reason)
+        result = self.event_log.record(row)
         if detection.track_id is not None and result.ok:
             self._csv_logged.add(detection.track_id)
+        if result.ok and self.measurement_listener is not None:
+            # Paired comparison is a passive downstream consumer: whatever it
+            # does, it must never interrupt this camera's own tracking.
+            try:
+                self.measurement_listener(row)
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Comparison listener failed for %s", result.event_id)
         self._last_persist_result = {
             "event_id": result.event_id,
             "written": result.written,
@@ -2758,6 +2853,8 @@ class VisionPipeline:
         status_reason: str | None,
     ) -> dict[str, Any]:
         """The shared local/cloud schema, so both modes stay comparable."""
+        shape = detection.shape_geometry
+        analysis = self.latest_analysis
         return {
             "event_id": event_id,
             "status": status,
@@ -2791,9 +2888,9 @@ class VisionPipeline:
             "volume_before_l": detection.volume_before_l,
             "volume_after_l": detection.volume_after_l,
             "volume_uncertainty_l": detection.volume_uncertainty_l,
-            "length_mm": detection.footprint_length_mm,
-            "width_mm": detection.footprint_width_mm,
-            "height_mm": detection.physical_height_mm,
+            "length_mm": detection.footprint_length_mm if shape is None else shape.length_mm,
+            "width_mm": detection.footprint_width_mm if shape is None else shape.width_mm,
+            "height_mm": detection.physical_height_mm if shape is None else shape.height_mm,
             "dimension_confidence": detection.dimension_confidence,
             "dimension_method": detection.dimension_method,
             "depth_coverage_percent": detection.depth_coverage_percent,
@@ -2801,6 +2898,12 @@ class VisionPipeline:
             "measurement_quality": detection.measurement_quality,
             "volume_rejection_reason": detection.volume_rejection_reason,
             "calibration_valid": self._calibration_valid,
+            # Read by the paired comparison log (paired_events.py); the
+            # per-camera CSV keeps its established columns.
+            "shape_geometry": None if shape is None else shape.to_dict(),
+            "geometry_method": None if shape is None else shape.geometry_method,
+            "calibration_method": None if self.calibration is None else self.calibration.method,
+            "processing_time_ms": None if analysis is None else round(float(analysis.inference_ms), 2),
         }
 
     def _check_camera_placement(
@@ -2868,6 +2971,7 @@ class VisionPipeline:
             self._volume_history.pop(track_id, None)
             self._box_measurement_history.pop(track_id, None)
             self._box_frames_considered.pop(track_id, None)
+            self._geometry_lock.forget(track_id)
             self._color_history.pop(track_id, None)
             self._material_history.pop(track_id, None)
             self._material_frame_counts.pop(track_id, None)
@@ -2948,6 +3052,65 @@ class VisionPipeline:
         span = max(1e-6, high - low)
         return self.config.logitech_max_tilt_uncertainty_fraction * min(1.0, (tilt - low) / span)
 
+    def prepare_input(
+        self, frame: np.ndarray, intrinsics: CameraIntrinsics | None,
+    ) -> tuple[np.ndarray, CameraIntrinsics | None]:
+        """Lens-undistort a Logitech frame; every other camera passes through."""
+        if self.logitech_lens is None:
+            return frame, intrinsics
+        return self.logitech_lens.prepare(frame, intrinsics)
+
+    def _fitted_logitech_calibration(self, shape: tuple[int, ...]) -> DepthCalibration | None:
+        """The stored multi-distance fit, if it matches this resolution and model."""
+        store = self.logitech_calibration
+        if store is None or store.calibration is None:
+            return None
+        calibration = store.calibration
+        if calibration.resolution is not None and tuple(calibration.resolution) != (shape[1], shape[0]):
+            # Depth predictions are resampled to the frame, so a fit made at a
+            # different resolution does not describe this crop.
+            return None
+        if calibration.inverse != (depth_output_kind(self.config.depth_model) != "metric"):
+            return None
+        return calibration
+
+    def add_logitech_calibration_sample(self, known_distance_m: float) -> dict[str, Any]:
+        """Record one flat reference at a tape-measured distance (calibration data only).
+
+        The reference must fill the fixed bin region: the empty bin floor, or a
+        flat board placed in it. Evaluation objects must never be used here.
+        """
+        if self.camera_id != "logitech" or self.logitech_calibration is None:
+            raise ValueError("Metric depth calibration samples apply to the Logitech camera only")
+        with self.lock:
+            if not self._recent_monocular_frames or self.latest_frame is None:
+                raise ValueError("No Logitech Depth Anything V2 prediction has been received yet")
+            latest_shape = self._recent_monocular_frames[-1].shape
+            frames = [item for item in self._recent_monocular_frames if item.shape == latest_shape]
+            predicted = np.median(np.stack(frames), axis=0).astype(np.float32)
+            region = fixed_bin_mask(self.latest_frame.shape, self.config.roi, self.config.bin_polygon)
+            status = self.logitech_calibration.add_sample(
+                predicted, region, float(known_distance_m), depth_output_kind(self.config.depth_model),
+            )
+        status["apply"] = "Capture the empty baseline again to apply this calibration"
+        return status
+
+    def logitech_calibration_status(self) -> dict[str, Any]:
+        store = self.logitech_calibration
+        active = self.calibration if self.camera_id == "logitech" else None
+        ready = self._logitech_measurement_ready()
+        return {
+            "metric_ready": bool(ready and active is not None),
+            "message": None if ready and active is not None else RELATIVE_ONLY_MESSAGE,
+            "calibration_mode": self.calibration_mode,
+            "active_calibration": None if active is None else active.to_dict(),
+            "depth_output": depth_output_kind(self.config.depth_model),
+            "stored": None if store is None else store.status(),
+            "lens": None if self.logitech_lens is None else {
+                "status": self.logitech_lens.status, "profile": self.logitech_lens.source,
+            },
+        }
+
     def _logitech_measurement_ready(self) -> bool:
         if self.camera_id != "logitech":
             return True
@@ -2983,7 +3146,7 @@ class VisionPipeline:
                 return {
                     "ready": False,
                     "code": "missing_reference_distance",
-                    "message": "Waiting for an automatically learned metric reference; Logitech liters remain withheld",
+                    "message": RELATIVE_ONLY_MESSAGE + " (add a measured reference distance to calibrate)",
                 }
             if self._logitech_tilt_invalid():
                 return {
