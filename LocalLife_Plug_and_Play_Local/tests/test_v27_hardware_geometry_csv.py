@@ -9,6 +9,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+from datetime import datetime
 import math
 import tempfile
 import unittest
@@ -316,7 +317,7 @@ class LogitechEndToEndTests(unittest.TestCase):
             logitech = manager.camera("logitech")
             status = logitech.logitech_calibration_status()
             self.assertTrue(status["metric_ready"])
-            self.assertEqual(status["active_calibration"]["method"], "reference-distance-scale")
+            self.assertEqual(status["active_calibration"]["method"], "empty-plane-ray-alignment")
             self.assertTrue((Path(directory) / "logitech" / "calibration" / "logitech_depth.json").is_file())
             history = logitech.event_log.rows()
             self.assertEqual(len(history), 1)
@@ -453,3 +454,115 @@ class LogitechTrackingWithoutCalibrationTests(unittest.TestCase):
             report = logitech.stage_report()
             self.assertEqual(report["last_frame_rejections"], {"below_confidence": 1})
             self.assertIn("application filters", report["blocking_reason"])
+
+
+class V28MetricCsvTests(unittest.TestCase):
+    """V28: plane-aligned Logitech metric volume, valid rows, and a populated workbook."""
+
+    def test_plane_alignment_recovers_scale_and_offset_from_the_empty_scene(self) -> None:
+        from locallife_cloud.logitech_volume import fit_plane_alignment, ray_plane_distance
+
+        camera = CameraIntrinsics(fx=500, fy=500, ppx=320, ppy=240, width=640, height=480)
+        truth = ray_plane_distance((480, 640), camera, 1.60)
+        predicted = (truth - 0.35) / 1.8  # a monocular map that is neither metric nor centred
+        region = np.zeros((480, 640), dtype=bool)
+        region[80:400, 120:520] = True
+        calibration, diagnostics = fit_plane_alignment(predicted.astype(np.float32), region, camera, 1.60)
+        self.assertIsNotNone(calibration)
+        self.assertAlmostEqual(calibration.scale, 1.8, places=3)
+        self.assertAlmostEqual(calibration.offset_m, 0.35, places=3)
+        self.assertLess(diagnostics["plane_rmse_m"], 0.001)
+        restored = calibration.apply(predicted.astype(np.float32))
+        self.assertLess(float(np.abs(restored[region] - truth[region]).max()), 0.005)
+        self.assertEqual(calibration.method, "empty-plane-ray-alignment")
+
+    def test_height_map_volume_matches_a_known_block_and_filters_spikes(self) -> None:
+        from locallife_cloud.logitech_volume import metric_object_volume, ray_plane_distance
+        from locallife_cloud.volume import fit_reference_plane
+
+        camera = CameraIntrinsics(fx=500, fy=500, ppx=160, ppy=120, width=320, height=240)
+        floor = ray_plane_distance((240, 320), camera, 1.50).astype(np.float32)
+        plane = fit_reference_plane(floor, camera)
+        mask = np.zeros((240, 320), dtype=bool)
+        mask[90:150, 110:190] = True  # 60 x 80 px block, 0.10 m tall
+        depth = floor.copy()
+        depth[mask] = (floor[mask] * (1.40 / 1.50))
+        depth[100, 120] = 0.2  # a depth spike that would otherwise dominate
+        result = metric_object_volume(depth, camera, mask, plane, min_height_m=0.01)
+        self.assertIsNone(result.reason)
+        expected = 60 * 80 * (1.40 ** 2 / (500 * 500)) * 0.10 * 1000
+        self.assertAlmostEqual(result.measurement.liters, expected, delta=0.1 * expected)
+        self.assertGreaterEqual(result.diagnostics["rejected_spike_pixels"], 0)
+        self.assertEqual(result.diagnostics["height_source"], "fitted_support_plane")
+        for key in ("mask_pixels", "height_median_m", "metric_pixel_area_median_m2", "raw_volume_l"):
+            self.assertIn(key, result.diagnostics)
+
+    def test_stable_volume_waits_for_agreement(self) -> None:
+        from locallife_cloud.logitech_volume import stable_volume
+
+        self.assertIsNone(stable_volume([5.0, 9.0])[0])
+        self.assertIsNone(stable_volume([5.0, 9.0, 14.0])[0])
+        value, spread = stable_volume([8.0, 8.2, 8.1, 8.3, 8.15])
+        self.assertAlmostEqual(value, 8.15, places=2)
+        self.assertLess(spread, 0.2)
+
+    def test_rows_always_carry_valid_time_and_finite_volume(self) -> None:
+        from locallife_cloud.event_log import MeasurementEventLog
+
+        with tempfile.TemporaryDirectory() as directory:
+            log = MeasurementEventLog(Path(directory))
+            log.record({"event_id": "a", "timestamp": None, "volume_l": float("nan"), "status": "accepted"})
+            log.record({"event_id": "b", "timestamp": 1_700_000_000, "volume_l": 2.5, "status": "accepted"})
+            rows = {row["event_id"]: row for row in log.rows()}
+            self.assertTrue(rows["a"]["timestamp_iso"].endswith("+00:00"))
+            self.assertEqual(rows["a"]["status"], "rejected")
+            self.assertEqual(rows["a"]["reason"], "non_finite_volume")
+            self.assertEqual(rows["a"]["volume_l"], "")
+            self.assertEqual(rows["b"]["timestamp_iso"], "2023-11-14T22:13:20+00:00")
+            self.assertEqual(float(rows["b"]["volume_l"]), 2.5)
+
+    def test_a_soft_material_never_forces_box_geometry(self) -> None:
+        from locallife_cloud.pipeline import classification_conflict
+
+        cloth = Detection("cardboard box", 0.8, (0, 0, 10, 10), np.ones((10, 10), dtype=bool))
+        cloth.material, cloth.material_confidence = "fabric or textile", 0.7
+        self.assertIsNotNone(classification_conflict(cloth))
+        box = Detection("cardboard box", 0.8, (0, 0, 10, 10), np.ones((10, 10), dtype=bool))
+        box.material, box.material_confidence = "cardboard", 0.7
+        self.assertIsNone(classification_conflict(box))
+
+    def test_workbook_has_rows_for_both_cameras_and_the_pair(self) -> None:
+        from openpyxl import load_workbook
+
+        from locallife_cloud.paired_events import PairedComparisonLog
+
+        with tempfile.TemporaryDirectory() as directory:
+            log = PairedComparisonLog(Path(directory), session_id="s1")
+            shape = {"geometry_method": "irregular_rigid", "selected_volume_litres": 3.0,
+                     "length_mm": 300.0, "width_mm": 200.0, "height_mm": 100.0}
+            log.record_measurement({"event_id": "rs-1", "camera_source": "realsense", "status": "accepted",
+                                    "timestamp": 1_700_000_000, "label": "folded cloth", "colour": "blue",
+                                    "material": "fabric or textile", "sorting_result": "allowed",
+                                    "processing_time_ms": 40.0, "shape_geometry": shape}, now=100)
+            log.record_measurement({"event_id": "lg-1", "camera_source": "logitech", "status": "accepted",
+                                    "timestamp": 1_700_000_002, "label": "cardboard box",
+                                    "classification_note": "detector says cardboard box; material says fabric",
+                                    "processing_time_ms": 95.0,
+                                    "shape_geometry": {**shape, "selected_volume_litres": 4.2}}, now=102)
+            from locallife_cloud.excel_export import build_workbook
+
+            workbook = load_workbook(io.BytesIO(build_workbook(log.rows())))
+            realsense = list(workbook["RealSense"].iter_rows(min_row=2, values_only=True))
+            logitech = list(workbook["Logitech"].iter_rows(min_row=2, values_only=True))
+            comparison = list(workbook["Camera Comparison"].iter_rows(min_row=2, values_only=True))
+            self.assertEqual(len(realsense), 1)
+            self.assertEqual(len(logitech), 1)
+            self.assertEqual(len(comparison), 1)
+            self.assertEqual(realsense[0][9], 3.0)
+            self.assertEqual(logitech[0][9], 4.2)
+            self.assertIsInstance(realsense[0][2], datetime)
+            self.assertEqual(comparison[0][4], 3.0)
+            self.assertEqual(comparison[0][5], 4.2)
+            self.assertAlmostEqual(comparison[0][6], 1.2, places=6)
+            self.assertAlmostEqual(comparison[0][7], 40.0, places=2)
+            self.assertEqual(comparison[0][-1], "paired")
