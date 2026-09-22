@@ -621,6 +621,56 @@ function Invoke-VerifiedCloudSsh {
     }
 }
 
+function New-CloudBundle {
+    <#
+        Stage only the cloud application itself.
+
+        The old upload sent the whole project directory recursively, which on a
+        used laptop meant gigabytes of run output -- frames.jsonl, .npy
+        captures, screenshots, result CSV/XLSX, __pycache__ and a 572 MB
+        mobileclip_blt.ts -- so startup looked frozen during scp. This copies an
+        explicit include list into a staging folder named after the project, and
+        that folder is what gets uploaded. Nothing already on the VM (models,
+        virtualenv, previous results) is touched.
+    #>
+    param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+    $source = Get-Item -LiteralPath $ProjectRoot
+    $staging = Join-Path $script:SessionDirectory 'cloud-bundle'
+    $target = Join-Path $staging $source.Name
+    if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force }
+    New-Item -ItemType Directory -Path $target -Force | Out-Null
+    $includeFiles = @(
+        'requirements-cloud.txt', 'requirements-local.txt', 'requirements-edge.txt',
+        'cloud.env.example', 'PACKAGE_VERSION.txt', 'setup.py', '.locallife_deployment'
+    )
+    foreach ($name in $includeFiles) {
+        $path = Join-Path $source.FullName $name
+        if (Test-Path -LiteralPath $path) { Copy-Item -LiteralPath $path -Destination $target -Force }
+    }
+    foreach ($folder in @('locallife_cloud', 'scripts')) {
+        $from = Join-Path $source.FullName $folder
+        if (-not (Test-Path -LiteralPath $from)) { continue }
+        $to = Join-Path $target $folder
+        New-Item -ItemType Directory -Path $to -Force | Out-Null
+        Get-ChildItem -LiteralPath $from -Recurse -File |
+            Where-Object {
+                $_.Extension -in @('.py', '.yaml', '.yml', '.sh', '.txt', '.json') -and
+                $_.FullName -notmatch '\\__pycache__\\' -and $_.Name -notmatch '\.pyc$'
+            } |
+            ForEach-Object {
+                $relative = $_.FullName.Substring($from.Length).TrimStart('\')
+                $destination = Join-Path $to $relative
+                New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+                Copy-Item -LiteralPath $_.FullName -Destination $destination -Force
+            }
+    }
+    $sizeMb = [math]::Round(((Get-ChildItem -LiteralPath $target -Recurse -File |
+        Measure-Object -Property Length -Sum).Sum / 1MB), 1)
+    $fileCount = (Get-ChildItem -LiteralPath $target -Recurse -File | Measure-Object).Count
+    Write-Step ('Cloud bundle: ' + $fileCount + ' files, ' + $sizeMb + ' MB (run output, caches and models excluded)')
+    return $target
+}
+
 function Invoke-VerifiedCloudScp {
     param(
         [Parameter(Mandatory = $true)][string]$LocalPath,
@@ -1393,8 +1443,10 @@ function Start-AppRole {
         if ([string]::IsNullOrWhiteSpace($remoteHome)) {
             throw 'Could not determine the cloud VM home directory over SSH; cannot upload the project safely.'
         }
-        Write-Step ('Uploading to ' + $remoteHome + ' on ' + $VmName + '...')
-        Invoke-VerifiedCloudScp -LocalPath $projectRoot -RemotePath ($remoteHome + '/')
+        Write-Step ('Uploading the cloud application bundle to ' + $remoteHome + ' on ' + $VmName + '...')
+        Set-CloudStage -Stage 'uploading_bundle' -Status 'running' -Zone $script:CloudZone
+        $bundle = New-CloudBundle -ProjectRoot $projectRoot
+        Invoke-VerifiedCloudScp -LocalPath $bundle -RemotePath ($remoteHome + '/')
         if ($LASTEXITCODE -ne 0) {
             throw 'Could not upload the project to the cloud VM (see its output above). Run `python gpu.py ssh` and check disk space, or copy it manually.'
         }
@@ -1416,6 +1468,9 @@ function Start-AppRole {
         ) | Out-Null
         Write-Step ('Upload complete and verified (version ' + $deploymentVersion + ').')
     }
+    # Each remaining step publishes its own stage, so Window 2 and the welcome
+    # page name what is actually happening instead of the last SSH step.
+    Set-CloudStage -Stage 'installing_dependencies' -Status 'running' -Zone $script:CloudZone
 
     # --host 127.0.0.1: the VM server binds its OWN loopback only, never the
     # public internet. It is reachable only through SSH tunnels that are
@@ -1438,6 +1493,7 @@ function Start-AppRole {
         'export LOCALLIFE_OPERATING_MODE=' + $OperatingMode + '; ' +
         # The GPU backend runs the Large Depth Anything V2 on every Logitech frame.
         'export CLOUD_ENABLED=true; ' +
+        'echo LOCALLIFE_STAGE=installing_dependencies; ' +
         # Do not restart a backend that is already serving. A reconnect after a
         # dropped tunnel used to kill a healthy, model-loaded process and pay
         # the whole model-load cost again for nothing.
@@ -1642,6 +1698,10 @@ function Start-CloudTunnelRole {
 
     $zone = Wait-ForCloudZoneFile
     Write-Step ('Tunneling to depth-l4 in ' + $zone)
+    $stage = Get-CloudStage
+    if ($null -ne $stage -and -not [string]::IsNullOrWhiteSpace($stage.stage)) {
+        Write-Step ('Window 1 stage: ' + $stage.stage + ' (' + $stage.status + ')')
+    }
 
     # This window is its own process, so it establishes the VM's identity for
     # itself rather than trusting a variable Window 1 set. Window 1 has already
@@ -2017,7 +2077,9 @@ function Start-Demo {
         Save-Session -Session $session
     }
 
+    if ($Mode -eq 'Cloud') { Set-CloudStage -Stage 'starting_backend' -Status 'running' -Zone $script:CloudZone }
     Wait-ForAppHealth -Address $appAddress
+    if ($Mode -eq 'Cloud') { Set-CloudStage -Stage 'opening_tunnel' -Status 'running' -Zone $script:CloudZone }
 
     $piWindowNumber = if ($Mode -eq 'Cloud') { 'Window 3' } else { 'Window 2' }
     Write-Step ('Opening ' + $piWindowNumber + ': Raspberry Pi, private bridge, and both cameras...')
