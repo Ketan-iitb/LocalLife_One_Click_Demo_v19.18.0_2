@@ -249,9 +249,18 @@ class ContainerSegmentationTests(unittest.TestCase):
         self.assertIn("shoe", config.negative_prompts)
         self.assertIn("soda can", config.negative_prompts)
 
-    def test_local_environment_defaults_skip_expensive_monocular_depth(self) -> None:
+    def test_local_environment_runs_small_throttled_monocular_depth(self) -> None:
+        # The Logitech comparison needs Depth Anything V2 locally too; the Large
+        # checkpoint was the cost, so local runs get Small at a throttled rate.
         with patch.dict("os.environ", {}, clear=True):
-            self.assertFalse(AppConfig.from_env().enable_monocular_depth)
+            config = AppConfig.from_env()
+        self.assertTrue(config.enable_monocular_depth)
+        self.assertIn("Small", config.depth_model)
+        self.assertGreater(config.logitech_depth_interval_s, 0)
+        with patch.dict("os.environ", {"CLOUD_ENABLED": "true"}, clear=True):
+            cloud = AppConfig.from_env()
+        self.assertIn("Large", cloud.depth_model)
+        self.assertEqual(cloud.logitech_depth_interval_s, 0)
 
     def test_geometry_validation_mode_is_explicit_and_reversible(self) -> None:
         with patch.dict("os.environ", {"LOCALLIFE_OPERATING_MODE": "geometry-validation"}, clear=True):

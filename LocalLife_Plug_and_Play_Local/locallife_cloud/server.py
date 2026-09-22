@@ -451,6 +451,25 @@ def create_app(
             },
         )
 
+    @app.get("/api/export/LocalLife_Measurements.xlsx")
+    def simple_excel() -> Response | tuple[Any, int]:
+        """RealSense, Logitech and Camera Comparison sheets from the canonical CSV."""
+        try:
+            from .excel_export import build_workbook
+        except ImportError as exc:
+            return jsonify(error=f"Excel export needs openpyxl ({exc}); the raw CSV is still available"), 503
+        with manager.paired_log._lock:
+            manager.paired_log.flush_expired()
+            rows = manager.paired_log.rows()
+        return Response(
+            build_workbook(rows),
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": "attachment; filename=LocalLife_Measurements.xlsx",
+                "Cache-Control": "no-store",
+            },
+        )
+
     @app.post("/api/comparison/ground-truth")
     @protected
     def paired_ground_truth() -> Any:
@@ -484,6 +503,17 @@ def create_app(
     @app.get("/api/logitech/calibration")
     def logitech_calibration() -> Any:
         return jsonify(manager.camera("logitech").logitech_calibration_status())
+
+    @app.post("/api/logitech/calibrate-empty")
+    @protected
+    def logitech_calibrate_empty() -> Any:
+        """Calibrate Empty Logitech Scene: camera height + empty-plane reference."""
+        payload = request.get_json(silent=True) or {}
+        try:
+            result = manager.camera("logitech").calibrate_empty_scene(float(payload["camera_height_m"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            return jsonify(error=str(exc)), 400
+        return jsonify(ok=True, **result)
 
     @app.post("/api/logitech/calibration/sample")
     @protected

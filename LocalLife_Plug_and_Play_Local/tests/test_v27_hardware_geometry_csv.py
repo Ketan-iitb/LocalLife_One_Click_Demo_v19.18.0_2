@@ -22,7 +22,7 @@ from locallife_cloud.config import AppConfig
 from locallife_cloud.logitech import bound_logitech_detections
 from locallife_cloud.logitech_calibration import RELATIVE_ONLY_MESSAGE
 from locallife_cloud.server import create_app
-from locallife_cloud.shape_geometry import CYLINDER, UNCERTAIN, measure_shape
+from locallife_cloud.shape_geometry import CUBOID, CYLINDER, IRREGULAR_RIGID, measure_shape
 from locallife_cloud.types import CameraIntrinsics, Detection
 
 RADIUS_M = 0.0415
@@ -67,14 +67,14 @@ class CylinderFitTests(unittest.TestCase):
         self.assertAlmostEqual(result.cylinder_height_mm, 195, delta=5)
         self.assertAlmostEqual(result.selected_volume_litres, math.pi * RADIUS_M ** 2 * 0.195 * 1000, delta=0.08)
 
-    def test_poor_cylinder_fit_is_pending_never_a_cuboid_volume(self) -> None:
+    def test_poor_cylinder_fit_keeps_the_safe_height_map_result(self) -> None:
         # Only a 60 degree sliver of the shell is visible: too little arc to trust.
         points, heights = _bottle_shell(span_deg=60.0, noise=0.001)
-        result = measure_shape(points, heights, mesh_volume_l=0.6)
-        self.assertEqual(result.geometry_method, UNCERTAIN)
-        self.assertIsNone(result.selected_volume_litres)
-        self.assertIsNone(result.bounding_box_volume_litres)
-        self.assertIsNotNone(result.rejection_reason)
+        result = measure_shape(points, heights, mesh_volume_l=0.6, label="bottle")
+        self.assertEqual(result.geometry_method, IRREGULAR_RIGID)
+        self.assertEqual(result.selected_volume_litres, 0.6)
+        self.assertIsNone(result.cylinder_diameter_mm)
+        self.assertEqual(result.rejection_reason, "insufficient_arc_coverage")
 
 
 class SharedDetector:
@@ -264,3 +264,121 @@ class LogitechObjectMaskTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MetricDepthStub:
+    """Stand-in for Depth Anything V2 metric output: brighter pixels are closer."""
+
+    device = "cpu"
+
+    def estimate_batch(self, frames):
+        return [2.0 - frame.max(axis=2).astype(np.float32) * 0.0015 for frame in frames]
+
+
+class LogitechEndToEndTests(unittest.TestCase):
+    """Calibrate the empty Logitech scene, then one bag reaches history, pairing and the workbook."""
+
+    def _run(self, directory: str, logitech_frames: int = 4):
+        detector = SharedDetector()
+        config = AppConfig(
+            results_dir=Path(directory), roi=(0, 0, 1, 1), min_component_pixels=20,
+            tracker_confirm_frames=1, settle_frames=2, volume_window_frames=2,
+            auto_deposit=True, logitech_reference_distance_m=0.0,
+        )
+        manager = DualCameraCoordinator(config, detector=detector, depth_estimator=MetricDepthStub())
+        empty = np.zeros((40, 40, 3), dtype=np.uint8)
+        floor = np.full((40, 40), 2.0, dtype=np.float32)
+        camera = CameraIntrinsics(fx=100, fy=100, ppx=20, ppy=20, width=40, height=40)
+        manager.camera("realsense").process_frame(empty, depth_m=floor, intrinsics=camera, persist=False)
+        manager.camera("realsense").set_baseline()
+        logitech = manager.camera("logitech")
+        logitech.process_frame(empty, intrinsics=camera, persist=False)
+        self.assertIn("CALIBRATION REQUIRED", logitech.logitech_calibration_status()["message"])
+        logitech.calibrate_empty_scene(2.0)
+        mask = np.zeros((40, 40), dtype=bool)
+        mask[10:25, 10:25] = True
+        frame = empty.copy()
+        frame[mask] = (200, 0, 0)
+        depth = floor.copy()
+        depth[mask] = 1.7
+        detector.items = [Detection("blue garbage bag", 0.9, (10, 10, 25, 25), mask, color="blue")]
+        for index in range(4):
+            manager.camera("realsense").process_frame(frame, depth_m=depth, intrinsics=camera, timestamp=100.0 + index)
+        for index in range(logitech_frames):
+            logitech.process_frame(frame, intrinsics=camera, timestamp=100.5 + index)
+        return manager
+
+    def test_calibrated_logitech_volume_reaches_history_pairing_and_workbook(self) -> None:
+        from openpyxl import load_workbook
+
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self._run(directory)
+            logitech = manager.camera("logitech")
+            status = logitech.logitech_calibration_status()
+            self.assertTrue(status["metric_ready"])
+            self.assertEqual(status["active_calibration"]["method"], "reference-distance-scale")
+            self.assertTrue((Path(directory) / "logitech" / "calibration" / "logitech_depth.json").is_file())
+            history = logitech.event_log.rows()
+            self.assertEqual(len(history), 1)
+            self.assertGreater(float(history[0]["volume_l"]), 0)
+            rows = manager.paired_log.rows()
+            self.assertEqual(sorted(row["camera_source"] for row in rows), ["logitech", "realsense"])
+            self.assertEqual(len({row["comparison_event_id"] for row in rows}), 1)
+            response = create_app(manager.config, pipeline=manager).test_client().get(
+                "/api/export/LocalLife_Measurements.xlsx")
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.headers["Cache-Control"], "no-store")
+            workbook = load_workbook(io.BytesIO(response.data))
+            self.assertEqual(workbook.sheetnames, ["RealSense", "Logitech", "Camera Comparison"])
+            logitech_rows = list(workbook["Logitech"].iter_rows(min_row=2, values_only=True))
+            self.assertEqual(len(logitech_rows), 1)
+            self.assertGreater(logitech_rows[0][9], 0)  # Volume (L)
+            self.assertEqual(len(list(workbook["RealSense"].iter_rows(min_row=2))), 1)
+            pair = list(workbook["Camera Comparison"].iter_rows(min_row=2, values_only=True))
+            self.assertEqual(len(pair), 1)
+            self.assertEqual(pair[0][-1], "paired")
+
+    def test_late_logitech_result_fills_the_missing_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            from locallife_cloud.paired_events import PairedComparisonLog
+
+            log = PairedComparisonLog(Path(directory), window_seconds=10)
+            event = log.record_measurement({"event_id": "rs-1", "camera_source": "realsense", "status": "accepted"},
+                                           now=100)["comparison_event_id"]
+            log.flush_expired(now=115)
+            self.assertEqual([row["status"] for row in log.rows()], ["accepted", "missing"])
+            late = log.record_measurement({"event_id": "lg-1", "camera_source": "logitech", "status": "accepted",
+                                           "label": "clothing"}, now=118)
+            self.assertEqual(late["comparison_event_id"], event)
+            self.assertEqual([row["measurement_id"] for row in log.rows()], ["rs-1", "lg-1"])
+
+    def test_uncalibrated_or_non_empty_scene_calibration_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self._run(directory, logitech_frames=1)
+            with self.assertRaises(ValueError):
+                manager.camera("logitech").calibrate_empty_scene(2.0)  # the bag is still in view
+
+
+class RealSenseCylinderPathTests(unittest.TestCase):
+    def test_labelled_oblique_containers_select_cylinder_and_cuboid_stays_cuboid(self) -> None:
+        rng = np.random.default_rng(1)
+
+        def oblique(radius, height, n=5000):
+            t, theta = rng.uniform(0, 1, n // 2), rng.uniform(0, 2 * math.pi, n // 2)
+            top = np.column_stack((radius * np.sqrt(t) * np.cos(theta), radius * np.sqrt(t) * np.sin(theta)))
+            arc = rng.uniform(math.pi * 0.1, math.pi * 0.9, n // 2)
+            side = np.column_stack((radius * np.cos(arc), radius * np.sin(arc)))
+            points = np.vstack([top, side]) + rng.normal(0, 0.001, (n, 2))
+            heights = np.r_[np.full(n // 2, height), rng.uniform(0.01, height, n // 2)] + rng.normal(0, 0.001, n)
+            return points, heights
+
+        for label, radius, height in (("soda can", 0.033, 0.12), ("cream jar", 0.03, 0.05), ("bottle", 0.04, 0.2)):
+            result = measure_shape(*oblique(radius, height), mesh_volume_l=math.pi * radius ** 2 * height * 1100,
+                                   label=label)
+            self.assertEqual(result.geometry_method, CYLINDER, label)
+            self.assertAlmostEqual(result.cylinder_diameter_mm, radius * 2000, delta=radius * 2000 * 0.08)
+            self.assertEqual(result.length_mm, result.width_mm)
+        x, y = np.meshgrid(np.arange(-0.1, 0.1, 0.002), np.arange(-0.06, 0.06, 0.002))
+        box = np.column_stack((x.ravel(), y.ravel()))
+        self.assertEqual(measure_shape(box, 0.1 + rng.normal(0, 0.002, len(box)), label="bottle").geometry_method,
+                         CUBOID)

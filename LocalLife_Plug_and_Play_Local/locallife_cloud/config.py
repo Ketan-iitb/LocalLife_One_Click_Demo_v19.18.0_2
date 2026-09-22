@@ -145,6 +145,9 @@ def _tuple_env(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(item.strip() for item in value.split(",") if item.strip())
 
 
+LOCAL_DEPTH_MODEL = "depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf"
+
+
 @dataclass(slots=True)
 class AppConfig:
     project_id: str = "locallife-thesis-depth"
@@ -309,13 +312,22 @@ class AppConfig:
     # "realsense_only" or "logitech_only". Fusion is never implied by any.
     research_mode: str = "paired"
     # Two finalised camera measurements this close in time are one physical object.
-    comparison_pair_window_s: float = 20.0
+    comparison_pair_window_s: float = 60.0
+    # Smallest Logitech object mask accepted (pixels). The shared
+    # min_component_pixels (700) rejected cans and cream jars outright; the
+    # Logitech mask is already foreground-gated and opened, so noise is not the
+    # limit there.
+    logitech_min_object_pixels: int = 150
     # A confirmed object that has not settled after this many frames is
     # recorded once as rejected (unstable_volume / no_valid_measurement).
     finalise_max_frames: int = 45
     # Save per-measurement and periodic scene bundles for real-hardware debugging.
     hardware_diagnostic: bool = False
     hardware_diagnostic_interval_s: float = 5.0
+    # Minimum seconds between Logitech Depth Anything V2 inferences; the last
+    # prediction is reused in between. 0 = every frame (cloud GPU). A local CPU
+    # run throttles so the shared inference lock never starves RealSense.
+    logitech_depth_interval_s: float = 0.0
     logitech_horizontal_fov_deg: float = 70.42
     logitech_roi: tuple[float, float, float, float] | None = None
     logitech_max_scene_fraction: float = 0.45
@@ -506,10 +518,18 @@ class AppConfig:
             geometry_validation_prompts=_tuple_env(
                 "LOCALLIFE_VALIDATION_PROMPTS", DEFAULT_GEOMETRY_VALIDATION_PROMPTS,
             ),
-            depth_model=os.environ.get("LOCALLIFE_DEPTH_MODEL", defaults.depth_model),
-            enable_monocular_depth=_bool_env(
-                "LOCALLIFE_ENABLE_DEPTH", defaults.enable_monocular_depth,
+            # The Logitech comparison needs Depth Anything V2 in every mode, so
+            # a launched app enables it; local CPU runs get the Small metric
+            # checkpoint (the Large one took minutes per frame on a laptop CPU)
+            # and a throttled rate, the cloud GPU gets Large at full rate.
+            depth_model=os.environ.get(
+                "LOCALLIFE_DEPTH_MODEL",
+                defaults.depth_model if _bool_env("CLOUD_ENABLED", False) else LOCAL_DEPTH_MODEL,
             ),
+            enable_monocular_depth=_bool_env("LOCALLIFE_ENABLE_DEPTH", True),
+            logitech_depth_interval_s=float(os.environ.get(
+                "LOCALLIFE_LOGITECH_DEPTH_INTERVAL_S", "0" if _bool_env("CLOUD_ENABLED", False) else "1.0",
+            )),
             enable_material_classification=_bool_env(
                 "LOCALLIFE_ENABLE_MATERIAL", defaults.enable_material_classification,
             ),
@@ -618,6 +638,8 @@ class AppConfig:
             research_mode=os.environ.get("LOCALLIFE_RESEARCH_MODE", defaults.research_mode).strip().lower(),
             comparison_pair_window_s=float(os.environ.get("LOCALLIFE_COMPARISON_PAIR_WINDOW_S", defaults.comparison_pair_window_s)),
             finalise_max_frames=int(os.environ.get("LOCALLIFE_FINALISE_MAX_FRAMES", defaults.finalise_max_frames)),
+            logitech_min_object_pixels=int(os.environ.get(
+                "LOCALLIFE_LOGITECH_MIN_OBJECT_PIXELS", defaults.logitech_min_object_pixels)),
             hardware_diagnostic=_bool_env("LOCALLIFE_HARDWARE_DIAGNOSTIC", defaults.hardware_diagnostic),
             hardware_diagnostic_interval_s=float(os.environ.get(
                 "LOCALLIFE_HARDWARE_DIAGNOSTIC_INTERVAL_S", defaults.hardware_diagnostic_interval_s)),

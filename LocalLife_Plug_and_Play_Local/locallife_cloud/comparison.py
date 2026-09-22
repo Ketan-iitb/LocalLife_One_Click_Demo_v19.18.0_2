@@ -255,7 +255,13 @@ class DualCameraCoordinator:
             if hasattr(hardware.detector, "load"):
                 hardware.detector.load()
             if webcam.depth_estimator is not None and hasattr(webcam.depth_estimator, "load"):
-                webcam.depth_estimator.load()
+                try:
+                    webcam.depth_estimator.load()
+                except Exception as exc:  # noqa: BLE001
+                    # RealSense must keep running; Logitech reports why it cannot measure.
+                    LOGGER.warning("Depth Anything V2 (%s) failed to load: %s", webcam.config.depth_model, exc)
+                    webcam.depth_load_error = f"{type(exc).__name__}: {exc}"
+                    webcam.depth_estimator = None
         return {"shared_detector": hardware.config.detector_model,
                 "logitech_depth_model": webcam.config.depth_model if webcam.depth_estimator else None,
                 "runtime": getattr(hardware.detector, "runtime", {}), "cameras": list(CAMERA_IDS)}
@@ -291,9 +297,7 @@ class DualCameraCoordinator:
                 camera_id: None for camera_id in camera_ids
             }
             if "logitech" in packets and webcam.depth_estimator is not None:
-                predicted_by_camera["logitech"] = webcam.depth_estimator.estimate_batch(
-                    [packets["logitech"]["frame"]]
-                )[0]
+                predicted_by_camera["logitech"] = webcam.predict_depth(packets["logitech"]["frame"])
         elapsed_ms = (time.perf_counter() - started) * 1000.0 / len(camera_ids)
         detections_by_camera = dict(zip(camera_ids, detections_batch, strict=True))
         semantic_presence: dict[str, bool] = {}

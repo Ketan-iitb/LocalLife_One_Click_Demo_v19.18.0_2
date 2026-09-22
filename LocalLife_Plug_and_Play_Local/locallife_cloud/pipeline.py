@@ -49,7 +49,7 @@ from .storage import ResultStore
 from .tracking import ObjectTracker
 from .box_templates import load_box_templates, match_box_template
 from .logitech_calibration import RELATIVE_ONLY_MESSAGE, LogitechCalibrationStore, LogitechLens, depth_output_kind
-from .shape_geometry import CYLINDER, CYLINDER_REJECTIONS, GeometryLock, ShapeGeometry, measure_shape
+from .shape_geometry import CYLINDER, CYLINDER_REJECTIONS, UNCERTAIN, GeometryLock, ShapeGeometry, measure_shape
 from .types import BoxVolumeMeasurement, CameraIntrinsics, DepthCalibration, Detection, FrameAnalysis
 from .volume import (
     ReferencePlane,
@@ -517,6 +517,9 @@ class VisionPipeline:
             enabled=config.hardware_diagnostic, interval_s=config.hardware_diagnostic_interval_s,
         )
         self._frame_context: dict[str, Any] = {}
+        # Why Depth Anything V2 is unavailable, when it is (shown on the dashboard).
+        self.depth_load_error: str | None = None
+        self._depth_cache: tuple[float, np.ndarray] | None = None
         # Frames each confirmed track has waited for finalisation (non-waste modes).
         self._unfinalised_frames: dict[int, int] = {}
         # Detector / foreground / final / rejected masks of the latest Logitech
@@ -591,6 +594,7 @@ class VisionPipeline:
                     self.camera_id, self.config.depth_model, exc,
                 )
                 self.depth_estimator = None
+                self.depth_load_error = f"{type(exc).__name__}: {exc}"
         if self.material_classifier is not None:
             try:
                 self.material_classifier.load()
@@ -1038,7 +1042,7 @@ class VisionPipeline:
                 self.reference_rgb,
                 detections,
                 bin_region,
-                min_pixels=self.config.min_component_pixels,
+                min_pixels=min(self.config.min_component_pixels, self.config.logitech_min_object_pixels),
                 foreground_threshold=self.config.foreground_threshold,
                 max_scene_fraction=self.config.logitech_max_scene_fraction,
                 max_expansion=self.config.logitech_max_mask_expansion,
@@ -2291,7 +2295,7 @@ class VisionPipeline:
                 return "pending-empty-baseline"
         else:
             if self.depth_estimator is None:
-                return "unavailable-offline-local-rgb-only"
+                return "unavailable-depth-anything-not-loaded"
             if self.latest_monocular_depth is None and self.reference_monocular is None:
                 return "pending-monocular-depth"
             if self.reference_monocular is None:
@@ -3126,6 +3130,54 @@ class VisionPipeline:
             return frame, intrinsics
         return self.logitech_lens.prepare(frame, intrinsics)
 
+    def predict_depth(self, frame: np.ndarray) -> np.ndarray | None:
+        """Depth Anything V2 for one Logitech frame, at most every logitech_depth_interval_s."""
+        if self.depth_estimator is None:
+            return None
+        now = time.monotonic()
+        cached = self._depth_cache
+        if (
+            cached is not None and cached[1].shape == frame.shape[:2]
+            and now - cached[0] < self.config.logitech_depth_interval_s
+        ):
+            return cached[1]
+        try:
+            prediction = self.depth_estimator.estimate_batch([frame])[0]
+        except Exception as exc:  # noqa: BLE001
+            # A model that fails at inference must say so, not silently
+            # leave the camera "offline" forever.
+            LOGGER.exception("Logitech Depth Anything V2 inference failed")
+            self.depth_load_error = f"inference failed: {type(exc).__name__}: {exc}"
+            return None
+        self._depth_cache = (now, prediction)
+        return prediction
+
+    def calibrate_empty_scene(self, camera_height_m: float) -> dict[str, Any]:
+        """One-time Logitech metric calibration from the empty scene and camera height.
+
+        The measurement area must be empty: the tape-measured lens-to-floor
+        distance fixes Depth Anything V2's scale on the empty support plane,
+        the plane becomes the reference, and both are saved and reused on the
+        next start. No known-volume object is involved.
+        """
+        if self.camera_id != "logitech":
+            raise ValueError("Empty-scene metric calibration applies to the Logitech camera")
+        if not np.isfinite(camera_height_m) or not 0.2 <= camera_height_m <= 5.0:
+            raise ValueError("Enter the measured camera-to-empty-floor distance (0.2-5 m)")
+        if self.depth_estimator is None:
+            raise ValueError("Depth Anything V2 is not loaded: " + (self.depth_load_error or "depth disabled"))
+        analysis = self.latest_analysis
+        if analysis is not None and any(
+            item.tracking_status != "tentative" and not _is_phantom_detection(item) for item in analysis.detections
+        ):
+            raise ValueError("Remove every object from the Logitech view before calibrating the empty scene")
+        self.config.logitech_reference_distance_m = float(camera_height_m)
+        sample = self.add_logitech_calibration_sample(float(camera_height_m))
+        baseline = self.set_baseline()
+        self.store.save_json("calibration/reference_distance.json",
+                             {"distance_m": float(camera_height_m), "captured_at": time.time()})
+        return {"calibration": sample, "baseline": baseline, "status": self.logitech_calibration_status()}
+
     def _apply_cylinder_geometry(self, detection: Detection) -> None:
         """Make a fitted cylinder the object's reported dimensions and volume.
 
@@ -3154,7 +3206,7 @@ class VisionPipeline:
                 detection.monocular_volume_l = volume
             else:
                 detection.realsense_volume_l = volume
-        elif shape.rejection_reason in CYLINDER_REJECTIONS:
+        elif shape.geometry_method == UNCERTAIN and shape.rejection_reason in CYLINDER_REJECTIONS:
             if logitech:
                 detection.monocular_volume_l = None
             else:
@@ -3205,7 +3257,13 @@ class VisionPipeline:
         detections = [] if analysis is None else analysis.detections
         rejection = next((item.volume_rejection_reason for item in detections if item.volume_rejection_reason), None)
         latency = None if analysis is None else round(float(analysis.inference_ms), 1)
+        stream_age = None if analysis is None else max(0.0, time.time() - float(analysis.timestamp or 0))
         return {
+            "camera_connected": analysis is not None and stream_age is not None and stream_age < 10.0,
+            "detector_ready": self.detector is not None,
+            "da_v2_model": self.config.depth_model if self.depth_estimator is not None else None,
+            "da_v2_device": getattr(self.depth_estimator, "device", None),
+            "da_v2_error": self.depth_load_error,
             "da_v2_loaded": bool(self.depth_estimator is not None and self._recent_monocular_frames),
             "calibration_loaded": bool(self._logitech_measurement_ready() and self.calibration is not None),
             "final_mask_valid": bool(debug.get("final_mask_valid")),
@@ -3267,7 +3325,9 @@ class VisionPipeline:
                 return {
                     "ready": True,
                     "code": "local_rgb_only",
-                    "message": "Local Logitech tracking and colour are ready; independent Logitech litres are unavailable offline",
+                    "message": "Depth Anything V2 is not loaded, so Logitech litres are unavailable: " + (
+                        self.depth_load_error or "enable LOCALLIFE_ENABLE_DEPTH"
+                    ),
                 }
             if self.latest_monocular_depth is None:
                 return {"ready": False, "code": "missing_monocular_depth", "message": "Waiting for Logitech RGB and Depth Anything inference"}
