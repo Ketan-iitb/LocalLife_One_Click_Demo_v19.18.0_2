@@ -76,6 +76,11 @@ def object_color(
     return dominant_color(tiled, np.ones((5, 5), dtype=bool))
 
 
+# A Logitech detection whose mask was not confirmed by change against the
+# empty reference: tracked and counted, never used for metric volume.
+DETECTOR_ONLY_SOURCE = "yoloe-logitech-detector-mask"
+
+
 def _foreground_change(
     frame: np.ndarray,
     baseline: np.ndarray | None,
@@ -152,14 +157,18 @@ def bound_logitech_detections(
     whole scene. The final mask is the largest connected component of
     (detector mask intersect foreground change against the empty-bin
     reference, shadows removed, speckle opened, inside the ROI), optionally
-    grown into the changed blob it belongs to. Without an empty reference
-    there is no object mask at all -- never the detector box or the ROI.
+    grown into the changed blob it belongs to. Without an empty reference, or
+    when too little of a plausibly sized detector mask changed, the opened
+    detector mask is kept as DETECTOR_ONLY_SOURCE: tracked, counted and
+    coloured, never measured. Scene-sized or border-spanning masks are still
+    rejected; the ROI or detector box is never used as the object.
 
     `debug`, when given, receives the detector, foreground, final and
     rejected masks for the diagnostic overlay, and a reason per rejection.
     """
     region_area = max(1, int(np.count_nonzero(region)))
     changed = _foreground_change(frame, baseline, region, detections, foreground_threshold)
+    detector_only = 0
     if changed is not None:
         changed = _open(changed)
     components = connected_components(changed, min_area=min_pixels) if changed is not None else []
@@ -168,17 +177,40 @@ def bound_logitech_detections(
     reasons: list[str] = []
     detector_union = np.zeros(frame.shape[:2], dtype=bool)
     if changed is None and detections:
-        warnings.append("Logitech object masks need the empty-bin reference; capture the Logitech baseline")
+        warnings.append("Logitech masks are detector-only until the empty-scene reference exists; "
+                        "tracking continues, metric volume waits for it")
         reasons.append("missing_empty_reference")
-    for detected in detections if changed is not None else []:
+    for detected in detections:
         seed = _seed_mask(detected, frame.shape[:2]) & region
         detector_union |= seed
         seed_area = int(np.count_nonzero(seed))
         if seed_area < min_pixels:
             reasons.append("detector_mask_too_small")
             continue
-        core = _largest_component(seed & changed, min_pixels)
+        core = _largest_component(seed & changed, min_pixels) if changed is not None else seed & False
         core_area = int(np.count_nonzero(core))
+        seed_rows_all, seed_columns_all = np.nonzero(seed)
+        seed_box_fraction = (np.ptp(seed_rows_all) + 1) * (np.ptp(seed_columns_all) + 1) / region_area
+        if core_area < min_pixels and seed_area / region_area <= max_scene_fraction \
+                and seed_box_fraction <= max_scene_fraction and not (
+                    _touched_sides(seed, region) >= 2 and seed_area / region_area > 0.25):
+            # No (or too little) verified change -- no empty reference yet, an
+            # object close to the floor colour, or auto-exposure. The detector's
+            # own mask is still a sound object for tracking, colour and
+            # counting; it is marked so it never feeds metric volume.
+            measured = _largest_component(_open(seed), min_pixels)
+            if int(np.count_nonzero(measured)) >= min_pixels:
+                rows, columns = np.nonzero(measured)
+                retained.append(Detection(
+                    label=detected.label, confidence=detected.confidence,
+                    box=(int(columns.min()), int(rows.min()), int(columns.max()) + 1, int(rows.max()) + 1),
+                    mask=measured, source=DETECTOR_ONLY_SOURCE,
+                    color=object_color(frame, measured, baseline=baseline, label=detected.label,
+                                       foreground_threshold=foreground_threshold),
+                ))
+                detector_only += 1
+                reasons.append("detector_mask_without_foreground_verification")
+                continue
         if core_area < min_pixels:
             seed_rows, seed_columns = np.nonzero(seed)
             seed_footprint = (np.ptp(seed_rows) + 1) * (np.ptp(seed_columns) + 1)
@@ -240,7 +272,8 @@ def bound_logitech_detections(
             "final": final,
             "rejected": detector_union & ~final,
             "reasons": reasons,
-            "final_mask_valid": bool(retained),
+            "detector_only_masks": detector_only,
+            "final_mask_valid": any(item.source != DETECTOR_ONLY_SOURCE for item in retained),
         })
     unique: list[Detection] = []
     # Nested open-vocabulary prompts often label one cardboard box several times.
