@@ -30,7 +30,7 @@ from .geometry import (
 from .inference import MetricDepthEstimator, create_segmenter
 from .material import MaterialClassifier
 from .ledger import WastePlantLedger, waste_object_type
-from .logitech import bound_logitech_detections, stabilize_background_depth
+from .logitech import DETECTOR_ONLY_SOURCE, bound_logitech_detections, stabilize_background_depth
 from .heightmap_volume import (
     HeightMapSettings,
     HeightMapVolume,
@@ -219,6 +219,10 @@ def filter_waste_detections(
     frame_shape: tuple[int, ...],
     region: np.ndarray,
     config: AppConfig,
+    *,
+    min_pixels: int | None = None,
+    rejections: Counter | None = None,
+    confidence: float | None = None,
 ) -> list[Detection]:
     """Apply installation-aware quality gates before tracking or measuring.
 
@@ -231,8 +235,10 @@ def filter_waste_detections(
     region_area = max(1, int(np.count_nonzero(region)))
     minimum_area = max(
         int(region_area * config.min_detection_area_fraction),
-        min(config.min_component_pixels, max(1, int(region_area * 0.10))),
+        min(config.min_component_pixels if min_pixels is None else min_pixels, max(1, int(region_area * 0.10))),
     )
+    threshold = config.detector_confidence if confidence is None else confidence
+    rejections = Counter() if rejections is None else rejections
     retained: list[Detection] = []
     candidates = (
         detections
@@ -244,26 +250,37 @@ def filter_waste_detections(
             detection.label, config.operating_mode,
         )
         if detection.accepted_class is None:
+            rejections["class_not_accepted"] += 1
             continue
         if config.operating_mode == "waste" and config.bag_only and not is_bag_detection(detection.label):
+            rejections["class_not_accepted"] += 1
             continue
         if config.operating_mode == "waste" and not config.bag_only and not is_supported_waste_detection(detection.label):
+            rejections["class_not_accepted"] += 1
             continue
-        if detection.source.startswith("yolo") and detection.confidence < config.detector_confidence:
+        if detection.source.startswith("yolo") and detection.confidence < threshold:
+            rejections["below_confidence"] += 1
             continue
         x1, y1, x2, y2 = detection.box
         width, height = max(0, x2 - x1), max(0, y2 - y1)
         if width < frame_width * config.min_detection_side_fraction:
+            rejections["box_too_narrow"] += 1
             continue
         if height < frame_height * config.min_detection_side_fraction:
+            rejections["box_too_short"] += 1
             continue
         center_x = min(frame_width - 1, max(0, (x1 + x2) // 2))
         center_y = min(frame_height - 1, max(0, (y1 + y2) // 2))
         if not region[center_y, center_x]:
+            rejections["centre_outside_roi"] += 1
             continue
         mask = combined_mask([detection], (frame_height, frame_width)) & region
         area = int(np.count_nonzero(mask))
-        if area < minimum_area or area / region_area > config.max_detection_area_fraction:
+        if area < minimum_area:
+            rejections["mask_area_too_small"] += 1
+            continue
+        if area / region_area > config.max_detection_area_fraction:
+            rejections["mask_area_too_large"] += 1
             continue
         retained.append(detection)
 
@@ -517,6 +534,10 @@ class VisionPipeline:
             enabled=config.hardware_diagnostic, interval_s=config.hardware_diagnostic_interval_s,
         )
         self._frame_context: dict[str, Any] = {}
+        # Per-camera production-path counters (frames -> detections -> masks ->
+        # tracks -> DA-V2 -> finalised), shown on the research dashboard.
+        self.stage_counters: Counter = Counter()
+        self.last_stage_rejections: dict[str, int] = {}
         # Why Depth Anything V2 is unavailable, when it is (shown on the dashboard).
         self.depth_load_error: str | None = None
         self._depth_cache: tuple[float, np.ndarray] | None = None
@@ -1031,7 +1052,20 @@ class VisionPipeline:
             if detection.confidence >= self.config.detector_confidence
             and (family := mis_sort_family(detection.label)) is not None
         })
-        detections = filter_waste_detections(detections, frame.shape, bin_region, self.config)
+        logitech = self.camera_id == "logitech"
+        counters = self.stage_counters
+        counters["frames_processed"] += 1
+        counters["raw_detections"] += len(detections)
+        rejections: Counter = Counter()
+        detections = filter_waste_detections(
+            detections, frame.shape, bin_region, self.config, rejections=rejections,
+            # Logitech-only: a can is a few hundred pixels in a 640x480 C920 frame.
+            min_pixels=self.config.logitech_min_object_pixels if logitech else None,
+            confidence=self.config.logitech_detector_confidence if logitech else None,
+        )
+        counters.update({f"rejected_{key}": value for key, value in rejections.items()})
+        counters["after_class_confidence_roi_area"] += len(detections)
+        self.last_stage_rejections = dict(rejections)
         for family in mis_sorted:
             warnings.append(f"MIS-SORT: a {family} object was detected; this bin does not accept it")
 
@@ -1050,6 +1084,11 @@ class VisionPipeline:
                 debug=mask_debug,
             )
             self.logitech_mask_debug = {"frame": frame, **mask_debug}
+            counters["valid_masks"] += len(detections)
+            counters["detector_only_masks"] += int(mask_debug.get("detector_only_masks", 0))
+            for reason in mask_debug.get("reasons") or []:
+                if reason != "detector_mask_without_foreground_verification":
+                    counters[f"mask_rejected_{reason}"] += 1
             warnings.extend(segmentation_warnings)
             if self.config.logitech_stabilize_depth:
                 calibrated_prediction, self.last_background_stabilization = stabilize_background_depth(
@@ -1687,7 +1726,10 @@ class VisionPipeline:
                 if cuboid is not None:
                     pending_box_measurements[id(detection)] = cuboid
                     self._apply_box_cuboid(detection, cuboid, warnings)
-            if self.calibration is not None and logitech_ready and logitech_height_coherent:
+            if (
+                self.calibration is not None and logitech_ready and logitech_height_coherent
+                and detection.source != DETECTOR_ONLY_SOURCE
+            ):
                 individual_mono = estimate_volume(
                     calibrated_prediction,
                     self.reference_monocular,
@@ -1792,6 +1834,8 @@ class VisionPipeline:
         # but never added to experiment databases").
         tracking_detections = detections
         new_ids = self.tracker.update(tracking_detections) if self.config.auto_count else []
+        self.stage_counters["active_tracks_last_frame"] = sum(1 for item in detections if item.track_id is not None)
+        self.stage_counters["confirmed_tracks_total"] = int(self.tracker.total_count)
         if self._previous_bin_total_l is not None:
             for track_id in new_ids:
                 self._bin_total_before_track[track_id] = self._previous_bin_total_l
@@ -2884,6 +2928,8 @@ class VisionPipeline:
         )
         row = self._measurement_row(detection, timestamp, event_id, status, status_reason)
         result = self.event_log.record(row)
+        if result.written:
+            self.stage_counters["finalised_measurements"] += 1
         if self.diagnostics.enabled and not result.duplicate:
             context = self._frame_context
             self.diagnostics.record_measurement(
@@ -3141,6 +3187,7 @@ class VisionPipeline:
             and now - cached[0] < self.config.logitech_depth_interval_s
         ):
             return cached[1]
+        self.stage_counters["da_v2_calls"] += 1
         try:
             prediction = self.depth_estimator.estimate_batch([frame])[0]
         except Exception as exc:  # noqa: BLE001
@@ -3273,6 +3320,112 @@ class VisionPipeline:
             "processing_fps": None if not latency else round(1000.0 / latency, 2),
         }
 
+    def stage_report(self) -> dict[str, Any]:
+        """Counters plus the single most likely reason nothing is reaching history."""
+        counters = dict(self.stage_counters)
+        if not counters.get("frames_processed"):
+            reason = "no frames reached inference for this camera"
+        elif not counters.get("raw_detections"):
+            reason = "detector returned no predictions (check prompts / confidence)"
+        elif not counters.get("after_class_confidence_roi_area"):
+            top = max(self.last_stage_rejections.items(), key=lambda item: item[1], default=(None, 0))[0]
+            reason = f"every prediction removed by application filters (last frame mostly: {top})"
+        elif self.camera_id == "logitech" and not counters.get("valid_masks"):
+            reason = "every mask rejected by the Logitech mask gate"
+        elif not counters.get("confirmed_tracks_total"):
+            reason = "masks exist but no track has been confirmed yet"
+        elif not counters.get("finalised_measurements"):
+            reason = "tracks exist; waiting for a stable volume (or metric calibration)"
+        else:
+            reason = None
+        return {
+            "counters": counters,
+            "last_frame_rejections": self.last_stage_rejections,
+            "blocking_reason": reason,
+            "detector": {
+                "model": self.config.detector_model,
+                "device": getattr(self.detector, "device", None),
+                "prompts": len(self.config.prompts),
+                "image_size": self.config.image_size,
+                "confidence": (self.config.logitech_detector_confidence if self.camera_id == "logitech"
+                               else self.config.detector_confidence),
+            },
+        }
+
+    def diagnose_detector_frame(self) -> dict[str, Any]:
+        """Run the detector once on the latest frame, before and after every filter, and save it."""
+        import cv2
+
+        with self.lock:
+            frame = None if self.latest_frame is None else self.latest_frame.copy()
+        if frame is None:
+            raise ValueError(f"No {self.camera_id} frame has been received yet")
+        with self.inference_lock:
+            raw = self.detector.detect_batch([frame])[0]
+        region = fixed_bin_mask(frame.shape, self.config.roi, self.config.bin_polygon)
+        verdicts = []
+        for item in raw:
+            single: Counter = Counter()
+            kept = filter_waste_detections(
+                [Detection(item.label, item.confidence, item.box, item.mask, source=item.source)],
+                frame.shape, region, self.config, rejections=single,
+                min_pixels=self.config.logitech_min_object_pixels if self.camera_id == "logitech" else None,
+                confidence=self.config.logitech_detector_confidence if self.camera_id == "logitech" else None,
+            )
+            verdicts.append({
+                "label": item.label, "confidence": round(float(item.confidence), 4), "box": list(item.box),
+                "mask_pixels": int(item.area_pixels), "passed_filters": bool(kept),
+                "rejected_by": next(iter(single), None),
+            })
+        accepted = filter_waste_detections(
+            list(raw), frame.shape, region, self.config,
+            min_pixels=self.config.logitech_min_object_pixels if self.camera_id == "logitech" else None,
+            confidence=self.config.logitech_detector_confidence if self.camera_id == "logitech" else None,
+        )
+        debug: dict[str, Any] = {}
+        final = accepted
+        if self.camera_id == "logitech":
+            final, _ = bound_logitech_detections(
+                frame, self.reference_rgb, accepted, region,
+                min_pixels=self.config.logitech_min_object_pixels,
+                foreground_threshold=self.config.foreground_threshold,
+                max_scene_fraction=self.config.logitech_max_scene_fraction,
+                max_expansion=self.config.logitech_max_mask_expansion,
+                duplicate_overlap=self.config.logitech_duplicate_overlap, debug=debug,
+            )
+        raw_view = frame.copy()
+        for item, verdict in zip(raw, verdicts):
+            colour = (0, 200, 0) if verdict["passed_filters"] else (0, 0, 255)
+            if item.mask is not None and item.mask.shape == frame.shape[:2]:
+                raw_view[item.mask] = (0.5 * raw_view[item.mask] + 0.5 * np.array(colour)).astype(np.uint8)
+            x1, y1, x2, y2 = item.box
+            cv2.rectangle(raw_view, (x1, y1), (x2, y2), colour, 2)
+            cv2.putText(raw_view, f"{item.label} {item.confidence:.2f} {verdict['rejected_by'] or 'ok'}",
+                        (x1, max(12, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, colour, 1)
+        final_view = frame.copy()
+        for item in final:
+            final_view[item.mask] = (0.5 * final_view[item.mask] + np.array((0, 110, 0))).clip(0, 255).astype(np.uint8)
+        directory = self.config.results_dir / "hardware_diagnostics" / self.camera_id / \
+            (time.strftime("%Y%m%d-%H%M%S") + "_detector")
+        directory.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(directory / "original.png"), frame)
+        cv2.imwrite(str(directory / "raw_predictions.png"), raw_view)
+        cv2.imwrite(str(directory / "final_masks.png"), final_view)
+        depth = self.predict_depth(frame) if self.camera_id == "logitech" else None
+        if depth is not None:
+            from .diagnostics import _depth_image
+
+            cv2.imwrite(str(directory / "relative_depth.png"), _depth_image(depth))
+        summary = {
+            "camera": self.camera_id, "frame_shape": list(frame.shape), "raw_predictions": verdicts,
+            "after_filters": len(accepted), "final_masks": len(final),
+            "detector_only_masks": int(debug.get("detector_only_masks", 0)),
+            "mask_gate_reasons": debug.get("reasons"), "has_empty_reference": self.reference_rgb is not None,
+            "stage_report": self.stage_report(), "saved_to": str(directory),
+        }
+        (directory / "summary.json").write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
+        return summary
+
     def logitech_mask_overlay(self) -> np.ndarray | None:
         """Detector (blue), foreground (yellow), final object (green), rejected (red)."""
         debug = self.logitech_mask_debug
@@ -3334,7 +3487,11 @@ class VisionPipeline:
             if self.latest_intrinsics is None:
                 return {"ready": False, "code": "missing_intrinsics", "message": "Logitech lens calibration or field of view is missing"}
             if self.baseline_monocular is None:
-                return {"ready": False, "code": "missing_empty_baseline", "message": "Clear the Logitech view; automatic empty-scene setup is running"}
+                return {"ready": False, "code": "missing_empty_baseline", "message": (
+                    "Tracked — metric calibration required (clear the view, then Calibrate Empty Logitech Scene)"
+                    if self.latest_analysis.detections
+                    else "Clear the Logitech view; automatic empty-scene setup is running"
+                )}
             if (
                 self.config.logitech_require_reference
                 and self.calibration_mode != "independent-measured-distance"
@@ -3343,7 +3500,11 @@ class VisionPipeline:
                 return {
                     "ready": False,
                     "code": "missing_reference_distance",
-                    "message": RELATIVE_ONLY_MESSAGE + " (add a measured reference distance to calibrate)",
+                    "message": (
+                        "Tracked — metric calibration required"
+                        if self.latest_analysis is not None and self.latest_analysis.detections
+                        else RELATIVE_ONLY_MESSAGE + " (use Calibrate Empty Logitech Scene)"
+                    ),
                 }
             if self._logitech_tilt_invalid():
                 return {

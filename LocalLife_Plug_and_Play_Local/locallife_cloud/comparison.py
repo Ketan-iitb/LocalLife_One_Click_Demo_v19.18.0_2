@@ -237,6 +237,7 @@ class DualCameraCoordinator:
             "events": self.paired_log.events(limit),
             "status": self.paired_log.status(),
             "logitech_calibration": self.camera("logitech").logitech_calibration_status(),
+            "logitech_stages": self.camera("logitech").stage_report(),
         }
 
     def _record_paired_measurement(self, row: dict[str, Any]) -> None:
@@ -262,6 +263,13 @@ class DualCameraCoordinator:
                     LOGGER.warning("Depth Anything V2 (%s) failed to load: %s", webcam.config.depth_model, exc)
                     webcam.depth_load_error = f"{type(exc).__name__}: {exc}"
                     webcam.depth_estimator = None
+        LOGGER.info(
+            "Logitech inference: detector %s on %s, %d prompts, image size %s, confidence %.2f; "
+            "Depth Anything V2 %s",
+            webcam.config.detector_model, getattr(webcam.detector, "device", "?"), len(webcam.config.prompts),
+            webcam.config.image_size, webcam.config.logitech_detector_confidence,
+            webcam.config.depth_model if webcam.depth_estimator is not None else f"OFF ({webcam.depth_load_error})",
+        )
         return {"shared_detector": hardware.config.detector_model,
                 "logitech_depth_model": webcam.config.depth_model if webcam.depth_estimator else None,
                 "runtime": getattr(hardware.detector, "runtime", {}), "cameras": list(CAMERA_IDS)}

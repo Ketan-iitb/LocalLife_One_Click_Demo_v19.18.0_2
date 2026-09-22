@@ -382,3 +382,74 @@ class RealSenseCylinderPathTests(unittest.TestCase):
         box = np.column_stack((x.ravel(), y.ravel()))
         self.assertEqual(measure_shape(box, 0.1 + rng.normal(0, 0.002, len(box)), label="bottle").geometry_method,
                          CUBOID)
+
+
+class LogitechTrackingWithoutCalibrationTests(unittest.TestCase):
+    """Detection and tracking must not wait for an empty reference or metric calibration."""
+
+    def _station(self, directory: str):
+        detector = SharedDetector()
+        config = AppConfig(results_dir=Path(directory), roi=(0, 0, 1, 1), min_component_pixels=20,
+                           tracker_confirm_frames=1, settle_frames=2, volume_window_frames=2,
+                           operating_mode="geometry_validation", auto_deposit=False,
+                           logitech_reference_distance_m=0.0, automatic_baseline=False)
+        manager = DualCameraCoordinator(config, detector=detector, depth_estimator=MetricDepthStub())
+        mask = np.zeros((60, 80), dtype=bool)
+        mask[20:40, 30:50] = True
+        frame = np.zeros((60, 80, 3), dtype=np.uint8)
+        frame[mask] = (30, 30, 200)
+        detector.items = [Detection("cream bottle", 0.6, (30, 20, 50, 40), mask, color="red")]
+        return manager, frame
+
+    def test_object_is_tracked_with_stable_id_before_any_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager, frame = self._station(directory)
+            logitech = manager.camera("logitech")
+            camera = CameraIntrinsics(fx=80, fy=80, ppx=40, ppy=30, width=80, height=60)
+            ids = []
+            for index in range(4):
+                result = logitech.process_frame(frame, intrinsics=camera, timestamp=10.0 + index)
+                ids.append(result.detections[0].track_id)
+            self.assertIsNone(logitech.reference_rgb)
+            self.assertEqual(len(set(ids)), 1)
+            self.assertIsNotNone(ids[0])
+            self.assertIsNone(result.detections[0].monocular_volume_l)  # never measured from a detector-only mask
+            report = logitech.stage_report()
+            counters = report["counters"]
+            self.assertEqual(counters["frames_processed"], 4)
+            self.assertEqual(counters["raw_detections"], 4)
+            self.assertEqual(counters["valid_masks"], 4)
+            self.assertEqual(counters["detector_only_masks"], 4)
+            self.assertGreaterEqual(counters["confirmed_tracks_total"], 1)
+            self.assertEqual(counters["active_tracks_last_frame"], 1)
+            state = logitech.state()
+            self.assertTrue(state["volume_status"]["message"].startswith("Tracked — metric calibration required"))
+            # The RealSense station was never touched by any of this.
+            self.assertEqual(manager.camera("realsense").stage_counters["frames_processed"], 0)
+
+    def test_detector_diagnostic_saves_raw_and_final_predictions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager, frame = self._station(directory)
+            logitech = manager.camera("logitech")
+            logitech.process_frame(frame, timestamp=1.0)
+            response = create_app(manager.config, pipeline=manager).test_client().post(
+                "/api/cameras/logitech/diagnose-detector")
+            self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+            body = response.get_json()
+            self.assertEqual(len(body["raw_predictions"]), 1)
+            self.assertTrue(body["raw_predictions"][0]["passed_filters"])
+            self.assertEqual(body["final_masks"], 1)
+            saved = Path(body["saved_to"])
+            for name in ("original.png", "raw_predictions.png", "final_masks.png", "relative_depth.png",
+                         "summary.json"):
+                self.assertTrue((saved / name).is_file(), name)
+
+    def test_filter_rejection_reasons_are_counted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager, frame = self._station(directory)
+            logitech = manager.camera("logitech")
+            logitech.config.logitech_detector_confidence = 0.9
+            logitech.process_frame(frame, timestamp=1.0)
+            report = logitech.stage_report()
+            self.assertEqual(report["last_frame_rejections"], {"below_confidence": 1})
+            self.assertIn("application filters", report["blocking_reason"])

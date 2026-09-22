@@ -318,6 +318,9 @@ class AppConfig:
     # Logitech mask is already foreground-gated and opened, so noise is not the
     # limit there.
     logitech_min_object_pixels: int = 150
+    # Logitech detector confidence; same as detector_confidence unless tuned
+    # from the /api/cameras/logitech/diagnose-detector raw predictions.
+    logitech_detector_confidence: float = 0.24
     # A confirmed object that has not settled after this many frames is
     # recorded once as rejected (unstable_volume / no_valid_measurement).
     finalise_max_frames: int = 45
@@ -638,6 +641,9 @@ class AppConfig:
             research_mode=os.environ.get("LOCALLIFE_RESEARCH_MODE", defaults.research_mode).strip().lower(),
             comparison_pair_window_s=float(os.environ.get("LOCALLIFE_COMPARISON_PAIR_WINDOW_S", defaults.comparison_pair_window_s)),
             finalise_max_frames=int(os.environ.get("LOCALLIFE_FINALISE_MAX_FRAMES", defaults.finalise_max_frames)),
+            logitech_detector_confidence=float(os.environ.get(
+                "LOCALLIFE_LOGITECH_DETECTOR_CONFIDENCE",
+                os.environ.get("LOCALLIFE_DETECTOR_CONFIDENCE", defaults.logitech_detector_confidence))),
             logitech_min_object_pixels=int(os.environ.get(
                 "LOCALLIFE_LOGITECH_MIN_OBJECT_PIXELS", defaults.logitech_min_object_pixels)),
             hardware_diagnostic=_bool_env("LOCALLIFE_HARDWARE_DIAGNOSTIC", defaults.hardware_diagnostic),

@@ -500,6 +500,23 @@ def create_app(
             return jsonify(error="Could not encode the mask overlay"), 500
         return Response(encoded.tobytes(), mimetype="image/jpeg", headers={"Cache-Control": "no-store"})
 
+    @app.get("/api/cameras/<camera_id>/stages")
+    def camera_stages(camera_id: str) -> Any:
+        """Production-path counters for one camera: frames -> detections -> tracks -> history."""
+        try:
+            return jsonify(manager.camera(camera_id).stage_report())
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 404
+
+    @app.post("/api/cameras/<camera_id>/diagnose-detector")
+    @protected
+    def diagnose_detector(camera_id: str) -> Any:
+        """One detector pass on the latest frame, before/after every filter, saved to disk."""
+        try:
+            return jsonify(ok=True, **manager.camera(camera_id).diagnose_detector_frame())
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+
     @app.get("/api/logitech/calibration")
     def logitech_calibration() -> Any:
         return jsonify(manager.camera("logitech").logitech_calibration_status())
