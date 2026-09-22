@@ -407,7 +407,13 @@ function Assert-CloudSshIdentity {
         throw ('Cloud SSH probe failed (' + $probe.code + '): ' + $probe.message)
     }
     Write-Step ('Authenticated SSH to ' + $VmName + ' works.')
-    Write-Step 'Verifying SSH host key...'
+    # The authenticated gcloud readiness command above is the startup
+    # authority. Publish progress now: the published-host-key lookup below is
+    # an optional diagnostic, and it used to spend the whole verifying_ssh
+    # budget (6 x 10 s) waiting for guest attributes, so a healthy VM was
+    # reported "SSH identity NOT verified" and startup failed.
+    Set-CloudStage -Stage 'checking_deployment' -Status 'running' -Zone $Zone
+    Write-Step 'Checking for a Google-published SSH host key (optional)...'
     # PYTHONPATH, not the current directory: this script lives at the repository
     # root while the package is one level down in $ProjectDirectory, so
     # `python -m locallife_cloud.cloud_ssh` from here could not import it at
@@ -426,7 +432,7 @@ function Assert-CloudSshIdentity {
         $raw = (& $PythonExe '-m' 'locallife_cloud.cloud_ssh' `
             '--vm' $VmName '--zone' $Zone '--project' $CloudProject `
             '--gcloud' (Assert-GcloudAvailable) `
-            '--known-hosts' $knownHosts 2>$errorFile | Out-String)
+            '--known-hosts' $knownHosts '--attempts' '1' '--delay' '0' 2>$errorFile | Out-String)
         $verifyExitCode = $LASTEXITCODE
     }
     finally {
@@ -474,8 +480,8 @@ function Assert-CloudSshIdentity {
         # fingerprint and they answer once. A HUMAN confirms the key; nothing
         # is auto-accepted, and the key is never labelled as verified.
         Write-Host ''
-        Write-Host 'SSH HOST KEY NOT AUTOMATICALLY VERIFIED' -ForegroundColor Yellow
-        Write-Host ('  Reason: ' + $report.error) -ForegroundColor Yellow
+        Write-Host 'SSH HOST KEY NOT AUTOMATICALLY VERIFIED (optional diagnostic only; startup continues).' -ForegroundColor Yellow
+        Write-Host ('  Detail: ' + $report.error) -ForegroundColor DarkYellow
         if ($null -ne $report.identity) {
             Write-Host ('  VM: ' + $report.identity.vm_name + '  instance ' + $report.identity.instance_id) -ForegroundColor Yellow
             Write-Host ('  Zone: ' + $report.identity.zone + '  address ' + $report.identity.external_ip) -ForegroundColor Yellow
@@ -1430,6 +1436,8 @@ function Start-AppRole {
         'exit 1; fi; ' +
         'cd ~/' + $ProjectDirectory + ' || exit 1; ' +
         'export LOCALLIFE_OPERATING_MODE=' + $OperatingMode + '; ' +
+        # The GPU backend runs the Large Depth Anything V2 on every Logitech frame.
+        'export CLOUD_ENABLED=true; ' +
         # Do not restart a backend that is already serving. A reconnect after a
         # dropped tunnel used to kill a healthy, model-loaded process and pay
         # the whole model-load cost again for nothing.
@@ -2169,6 +2177,12 @@ catch {
     Write-Host ''
     Write-Host ('DEMONSTRATION ERROR: ' + $_.Exception.Message) -ForegroundColor Red
     Write-Host ''
+    if ($Mode -eq 'Cloud' -and $Role -in @('App', 'CloudTunnel')) {
+        # A failed startup can leave the GPU VM running and billed.
+        Write-Host 'The cloud VM may still be running and billable. Stop it with:' -ForegroundColor Yellow
+        Write-Host '  STOP_LOCAL_LIFE_DEMO.cmd   (or: python gpu.py stop)' -ForegroundColor Yellow
+        Write-Host ''
+    }
     if ($Role -in @('App', 'CloudTunnel', 'Pi', 'RecipeApi')) {
         Read-Host 'Press Enter after you have read the error'
     }

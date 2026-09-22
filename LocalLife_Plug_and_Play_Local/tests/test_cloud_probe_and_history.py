@@ -153,7 +153,7 @@ class CloudProbeScriptTests(unittest.TestCase):
 
     def test_an_authenticated_probe_runs_before_host_key_pinning(self) -> None:
         probe = self.script.index("Probing the VM over authenticated gcloud SSH")
-        pinning = self.script.index("Write-Step 'Verifying SSH host key...'")
+        pinning = self.script.index("Write-Step 'Checking for a Google-published SSH host key (optional)...'")
         self.assertLess(probe, pinning)
 
     def test_missing_guest_attributes_no_longer_block_a_working_vm(self) -> None:
@@ -318,4 +318,5 @@ class CsvSnapshotTests(unittest.TestCase):
 
         self.assertIn("Recorded measurements: ", OPERATOR_DASHBOARD)
         self.assertIn("Last CSV write: ", OPERATOR_DASHBOARD)
-        self.assertIn("DOWNLOAD LATEST CSV", OPERATOR_DASHBOARD)
+        self.assertIn("DOWNLOAD SIMPLE EXCEL", OPERATOR_DASHBOARD)
+        self.assertIn("DOWNLOAD DETAILED RAW CSV", OPERATOR_DASHBOARD)

@@ -480,7 +480,9 @@ def verify_cloud_ssh(
             ", ".join(key.fingerprint for key in result.keys),
         )
     else:
-        LOGGER.error("SSH identity NOT verified for %s: %s", vm_name, result.error)
+        # Optional diagnostic: the launcher's authenticated gcloud readiness
+        # command is the startup authority, so this is not an error.
+        LOGGER.warning("No published SSH host key pinned for %s: %s", vm_name, result.error)
     return result.to_dict()
 
 
@@ -494,11 +496,14 @@ def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover - CLI
     parser.add_argument("--project", required=True)
     parser.add_argument("--known-hosts", required=True)
     parser.add_argument("--gcloud", default="gcloud")
+    parser.add_argument("--attempts", type=int, default=6)
+    parser.add_argument("--delay", type=float, default=10.0)
     arguments = parser.parse_args(argv)
     try:
         report = verify_cloud_ssh(
             arguments.vm, arguments.zone, arguments.project,
             Path(arguments.known_hosts), gcloud=arguments.gcloud,
+            attempts=arguments.attempts, delay=arguments.delay,
         )
     except Exception as exc:  # noqa: BLE001
         # A bare traceback on stderr told a real operator nothing. The caller
