@@ -254,7 +254,10 @@ class MeasurementEventLog:
                 self._append(payload)
             except OSError as exc:
                 reason = f"{type(exc).__name__}: {exc}"
-                self._failures.append(_Failure(event_id=event_id, reason=reason, row=payload))
+                # One queued copy per event: a repeated attempt for the same
+                # immutable event must not grow the retry queue.
+                if all(item.event_id != event_id for item in self._failures):
+                    self._failures.append(_Failure(event_id=event_id, reason=reason, row=payload))
                 self._last_error = reason
                 LOGGER.error("Failed to persist event %s to %s: %s", event_id, self.path, reason)
                 return PersistResult(event_id=event_id, written=False, error=reason, path=self.path)

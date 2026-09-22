@@ -52,6 +52,9 @@ COLUMNS = [
     "colour", "colour_confidence", "material", "material_confidence", "sorting_result",
     "overall_confidence", "processing_time_ms", "status", "reason",
     "model_version", "pipeline_version",
+    # Flat names the operator spreadsheet uses; same values as above.
+    "camera", "sorting", "diameter_mm", "radius_mm", "volume_liters",
+    "confidence", "fit_confidence", "rejection_reason",
 ]
 
 GROUND_TRUTH_FIELDS = (
@@ -129,11 +132,23 @@ def comparison_row(
         "reason": measurement.get("reason") or measurement.get("volume_rejection_reason"),
         "model_version": measurement.get("model_version"),
         "pipeline_version": measurement.get("pipeline_version"),
+        "radius_mm": shape.get("radius_mm"),
+        "fit_confidence": shape.get("fit_confidence"),
     }
 
 
 def _first(*values: Any) -> Any:
     return next((value for value in values if value is not None), None)
+
+
+def _with_aliases(row: dict[str, Any]) -> dict[str, Any]:
+    row["camera"] = row.get("camera_source")
+    row["sorting"] = row.get("sorting_result")
+    row["diameter_mm"] = row.get("cylinder_diameter_mm")
+    row["volume_liters"] = row.get("selected_volume_litres")
+    row["confidence"] = row.get("overall_confidence")
+    row["rejection_reason"] = row.get("reason")
+    return row
 
 
 def _with_errors(row: dict[str, Any]) -> dict[str, Any]:
@@ -170,9 +185,35 @@ class PairedComparisonLog:
         self._last_write_at: float | None = None
         self._last_error: str | None = None
         self._ground_truth: dict[str, dict[str, Any]] = self._load_ground_truth()
+        for row in self._rotate_outdated_header():
+            if row.get("measurement_id"):
+                self._seen.add(str(row["measurement_id"]))
         for row in self.rows():
             if row.get("measurement_id"):
                 self._seen.add(str(row["measurement_id"]))
+        LOGGER.info("Comparison CSV: %s (%d rows)", self.path, len(self._seen))
+
+    def _rotate_outdated_header(self) -> list[dict[str, Any]]:
+        """Keep an older-schema file intact beside a fresh one.
+
+        Appending rows under a different header would misalign every column
+        in Excel. The old file is renamed, never rewritten, so previous
+        sessions stay readable; its ids still count for idempotency.
+        """
+        if not self.path.is_file():
+            return []
+        try:
+            with self.path.open("r", encoding=CSV_ENCODING, newline="") as source:
+                header = next(csv.reader(source), None)
+        except OSError:
+            return []
+        if header is None or header == COLUMNS:
+            return []
+        rows = self.rows()
+        archived = self.path.with_name(f"{self.path.stem}.before-{int(time.time())}{self.path.suffix}")
+        self.path.replace(archived)
+        LOGGER.warning("Comparison CSV schema changed; previous file kept as %s", archived)
+        return rows
 
     # ------------------------------------------------------------ pairing
     def record_measurement(self, measurement: dict[str, Any], *, now: float | None = None) -> dict[str, Any]:
@@ -233,7 +274,7 @@ class PairedComparisonLog:
         measurement_id = str(row["measurement_id"])
         if measurement_id in self._seen:
             return False
-        row = _with_errors({**row, **self._truth_columns(row.get("comparison_event_id"))})
+        row = _with_aliases(_with_errors({**row, **self._truth_columns(row.get("comparison_event_id"))}))
         try:
             self.directory.mkdir(parents=True, exist_ok=True)
             new_file = not self.path.is_file() or self.path.stat().st_size == 0
@@ -247,12 +288,14 @@ class PairedComparisonLog:
         except OSError as exc:
             # Never raised into the measurement thread: queued and retried.
             self._last_error = f"{type(exc).__name__}: {exc}"
+            LOGGER.error("Comparison CSV write failed at %s", self.path)
             if all(item["measurement_id"] != measurement_id for item in self._failures):
                 self._failures.append(row)
             LOGGER.error("Comparison row %s not persisted: %s", measurement_id, self._last_error)
             return False
         self._seen.add(measurement_id)
         self._last_write_at = time.time()
+        LOGGER.info("Comparison CSV row %s written to %s (%d rows)", measurement_id, self.path, len(self._seen))
         return True
 
     def retry_failed(self) -> dict[str, Any]:
