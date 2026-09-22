@@ -49,6 +49,7 @@ from .storage import ResultStore
 from .tracking import ObjectTracker
 from .box_templates import load_box_templates, match_box_template
 from .logitech_calibration import RELATIVE_ONLY_MESSAGE, LogitechCalibrationStore, LogitechLens, depth_output_kind
+from .logitech_volume import fit_plane_alignment, metric_object_volume, stable_volume
 from .shape_geometry import CYLINDER, CYLINDER_REJECTIONS, UNCERTAIN, GeometryLock, ShapeGeometry, measure_shape
 from .types import BoxVolumeMeasurement, CameraIntrinsics, DepthCalibration, Detection, FrameAnalysis
 from .volume import (
@@ -96,6 +97,21 @@ NON_WASTE_BAG_QUALIFIERS = {
 # same zero-confidence signature, and depositing one records fictional waste
 # with a fictional volume, as happened with the 87-118 L phantom "deposits"
 # reported live against a real ~37 L object.
+# Materials that contradict a rigid-box label.
+SOFT_MATERIALS = ("fabric", "textile", "cloth", "foam", "plastic film")
+
+
+def classification_conflict(detection: Detection) -> str | None:
+    """A box-family label with a soft material is not a trustworthy cuboid."""
+    label = _normalized_label(detection.label)
+    if not set(label.split()) & {"box", "boxes", "carton", "cartons", "parcel", "parcels", "package"}:
+        return None
+    material = (detection.material or "").lower()
+    if any(word in material for word in SOFT_MATERIALS) and detection.material_confidence >= 0.4:
+        return f"detector says {detection.label}; material says {detection.material}"
+    return None
+
+
 def _is_phantom_detection(detection: Detection) -> bool:
     return is_phantom_source(detection.source)
 
@@ -538,6 +554,10 @@ class VisionPipeline:
         # tracks -> DA-V2 -> finalised), shown on the research dashboard.
         self.stage_counters: Counter = Counter()
         self.last_stage_rejections: dict[str, int] = {}
+        # Live Logitech volumes per track, and the trimmed-median stable value.
+        self._logitech_volume_samples: dict[int, deque[float]] = defaultdict(lambda: deque(maxlen=9))
+        self._logitech_volume_spread: dict[int, float] = {}
+        self.last_logitech_volume_diagnostics: dict[str, Any] = {}
         # Why Depth Anything V2 is unavailable, when it is (shown on the dashboard).
         self.depth_load_error: str | None = None
         self._depth_cache: tuple[float, np.ndarray] | None = None
@@ -1695,6 +1715,9 @@ class VisionPipeline:
                 )
                 and not _is_phantom_detection(detection)
                 and depth_m is not None
+                # A "cardboard box" made of fabric is measured as what it is:
+                # the height-map path below, not a forced cuboid.
+                and (conflict := classification_conflict(detection)) is None
             ):
                 cuboid = estimate_box_volume_cuboid(
                     depth_m,
@@ -1726,11 +1749,28 @@ class VisionPipeline:
                 if cuboid is not None:
                     pending_box_measurements[id(detection)] = cuboid
                     self._apply_box_cuboid(detection, cuboid, warnings)
+            detection.classification_note = classification_conflict(detection)
             if (
                 self.calibration is not None and logitech_ready and logitech_height_coherent
                 and detection.source != DETECTOR_ONLY_SOURCE
             ):
-                individual_mono = estimate_volume(
+                if self.camera_id == "logitech":
+                    result = metric_object_volume(
+                        calibrated_prediction, intrinsics, instance_mask, measurement_plane,
+                        reference_depth_m=self.reference_monocular,
+                        measurement_mask=bin_region,
+                        min_height_m=self.config.logitech_min_object_height_m,
+                        max_height_m=self.config.max_object_height_m,
+                        min_pixels=min(25, self.config.logitech_min_object_pixels),
+                    )
+                    individual_mono = result.measurement
+                    self.last_logitech_volume_diagnostics = {
+                        **result.diagnostics, "reason": result.reason, "label": detection.label,
+                    }
+                    if result.reason is not None:
+                        detection.volume_rejection_reason = result.reason
+                else:
+                    individual_mono = estimate_volume(
                     calibrated_prediction,
                     self.reference_monocular,
                     intrinsics,
@@ -1744,7 +1784,7 @@ class VisionPipeline:
                     depth_noise_m=self.config.depth_noise_m,
                     reference_plane=measurement_plane,
                     **precision,
-                )
+                    )
                 if individual_mono is not None:
                     if self.camera_id == "logitech":
                         detection.depth_coverage_percent = round(individual_mono.coverage_ratio * 100, 1)
@@ -1864,6 +1904,13 @@ class VisionPipeline:
                 detection.track_id, pending_shapes.get(id(detection)),
             )
             self._apply_cylinder_geometry(detection)
+            if self.camera_id == "logitech" and detection.track_id is not None:
+                live = detection.monocular_volume_l
+                if live is not None:
+                    self._logitech_volume_samples[detection.track_id].append(float(live))
+                stable, spread = stable_volume(list(self._logitech_volume_samples[detection.track_id]))
+                detection.stable_volume_l = None if stable is None else round(stable, 6)
+                self._logitech_volume_spread[detection.track_id] = spread
         for detection in detections:
             if detection.track_id is None or id(detection) not in pending_box_attempted:
                 continue
@@ -2996,8 +3043,10 @@ class VisionPipeline:
             "sorting_status": detection.sorting_status,
             "material": detection.material,
             "material_confidence": round(float(detection.material_confidence), 4),
-            # Each camera's own volume: Logitech's lives in monocular_volume_l.
-            "volume_l": self._detection_volume(detection),
+            # Each camera's own volume: Logitech's lives in monocular_volume_l,
+            # and a finalised Logitech row carries its stable trimmed median.
+            "volume_l": detection.stable_volume_l or self._detection_volume(detection),
+            "live_volume_l": self._detection_volume(detection),
             "added_volume_l": detection.added_volume_l,
             "displaced_volume_l": detection.displaced_volume_l,
             "volume_before_l": detection.volume_before_l,
@@ -3088,6 +3137,8 @@ class VisionPipeline:
             self._box_frames_considered.pop(track_id, None)
             self._geometry_lock.forget(track_id)
             self._unfinalised_frames.pop(track_id, None)
+            self._logitech_volume_samples.pop(track_id, None)
+            self._logitech_volume_spread.pop(track_id, None)
             self._color_history.pop(track_id, None)
             self._material_history.pop(track_id, None)
             self._material_frame_counts.pop(track_id, None)
@@ -3218,12 +3269,30 @@ class VisionPipeline:
             item.tracking_status != "tentative" and not _is_phantom_detection(item) for item in analysis.detections
         ):
             raise ValueError("Remove every object from the Logitech view before calibrating the empty scene")
+        with self.lock:
+            if not self._recent_monocular_frames:
+                raise ValueError("No Logitech Depth Anything V2 prediction has been received yet")
+            latest = self._recent_monocular_frames[-1]
+            frames = [item for item in self._recent_monocular_frames if item.shape == latest.shape]
+            predicted = np.median(np.stack(frames), axis=0).astype(np.float32)
+            intrinsics = self.latest_intrinsics
+            region = fixed_bin_mask(self.latest_frame.shape, self.config.roi, self.config.bin_polygon)
+        if intrinsics is None:
+            raise ValueError("The Logitech camera has not reported intrinsics yet")
+        calibration, diagnostics = fit_plane_alignment(
+            predicted, region, intrinsics, float(camera_height_m),
+            inverse=depth_output_kind(self.config.depth_model) != "metric",
+        )
+        if calibration is None:
+            raise ValueError(f"Empty-plane calibration failed: {diagnostics.get('reason')}")
+        calibration.roi = tuple(self.config.roi)
         self.config.logitech_reference_distance_m = float(camera_height_m)
-        sample = self.add_logitech_calibration_sample(float(camera_height_m))
+        sample = self.logitech_calibration.set_calibration(calibration, diagnostics)
         baseline = self.set_baseline()
         self.store.save_json("calibration/reference_distance.json",
                              {"distance_m": float(camera_height_m), "captured_at": time.time()})
-        return {"calibration": sample, "baseline": baseline, "status": self.logitech_calibration_status()}
+        return {"calibration": sample, "baseline": baseline, "diagnostics": diagnostics,
+                "status": self.logitech_calibration_status()}
 
     def _apply_cylinder_geometry(self, detection: Detection) -> None:
         """Make a fitted cylinder the object's reported dimensions and volume.
@@ -3272,6 +3341,9 @@ class VisionPipeline:
             return None
         if calibration.inverse != (depth_output_kind(self.config.depth_model) != "metric"):
             return None
+        if calibration.roi is not None and tuple(calibration.roi) != tuple(self.config.roi):
+            # The fit belongs to the region it was measured over.
+            return None
         return calibration
 
     def add_logitech_calibration_sample(self, known_distance_m: float) -> dict[str, Any]:
@@ -3318,6 +3390,7 @@ class VisionPipeline:
             "rejection_reason": rejection or (reasons[0] if reasons else None),
             "latency_ms": latency,
             "processing_fps": None if not latency else round(1000.0 / latency, 2),
+            "volume_trace": self.last_logitech_volume_diagnostics,
         }
 
     def stage_report(self) -> dict[str, Any]:

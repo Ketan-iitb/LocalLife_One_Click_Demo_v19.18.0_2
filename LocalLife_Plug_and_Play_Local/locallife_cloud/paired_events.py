@@ -26,6 +26,7 @@ import logging
 import os
 import threading
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -40,7 +41,7 @@ CAMERAS = ("realsense", "logitech")
 STATUS_MISSING = "missing"
 
 COLUMNS = [
-    "session_id", "comparison_event_id", "measurement_id", "camera_source", "timestamp",
+    "session_id", "comparison_event_id", "measurement_id", "camera_source", "timestamp", "timestamp_iso",
     "processing_mode", "calibration_id", "calibration_method",
     "object_type", "geometry_method", "geometry_confidence",
     "length_mm", "width_mm", "height_mm",
@@ -54,7 +55,7 @@ COLUMNS = [
     "model_version", "pipeline_version",
     # Flat names the operator spreadsheet uses; same values as above.
     "camera", "sorting", "diameter_mm", "radius_mm", "volume_liters",
-    "confidence", "fit_confidence", "rejection_reason",
+    "confidence", "fit_confidence", "rejection_reason", "classification_note",
 ]
 
 GROUND_TRUTH_FIELDS = (
@@ -101,6 +102,7 @@ def comparison_row(
         "measurement_id": measurement.get("event_id"),
         "camera_source": measurement.get("camera_source") or measurement.get("camera_id"),
         "timestamp": measurement.get("timestamp"),
+        "timestamp_iso": measurement.get("timestamp_iso"),
         "processing_mode": measurement.get("processing_mode"),
         "calibration_id": measurement.get("calibration_id"),
         "calibration_method": measurement.get("calibration_method"),
@@ -126,6 +128,7 @@ def comparison_row(
         "processing_time_ms": measurement.get("processing_time_ms"),
         "status": measurement.get("status"),
         "reason": measurement.get("reason") or measurement.get("volume_rejection_reason"),
+        "classification_note": measurement.get("classification_note"),
         "model_version": measurement.get("model_version"),
         "pipeline_version": measurement.get("pipeline_version"),
         "radius_mm": shape.get("radius_mm"),
@@ -148,6 +151,12 @@ def _with_aliases(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _with_errors(row: dict[str, Any]) -> dict[str, Any]:
+    if not row.get("timestamp_iso") and row.get("timestamp"):
+        try:
+            row["timestamp_iso"] = datetime.fromtimestamp(
+                float(row["timestamp"]), tz=timezone.utc).isoformat(timespec="seconds")
+        except (TypeError, ValueError, OSError):
+            row["timestamp_iso"] = None
     truth, estimate = row.get("ground_truth_volume_litres"), row.get("selected_volume_litres")
     row["absolute_error_litres"] = row["percentage_error"] = None
     try:
@@ -297,7 +306,9 @@ class PairedComparisonLog:
                         "comparison_event_id": event.comparison_event_id,
                         "measurement_id": f"{event.comparison_event_id}-{camera}-missing",
                         "camera_source": camera,
-                        "timestamp": event.opened_at + self.window_seconds,
+                        "timestamp": round(event.opened_at + self.window_seconds, 3),
+                        "timestamp_iso": datetime.fromtimestamp(
+                            event.opened_at + self.window_seconds, tz=timezone.utc).isoformat(timespec="seconds"),
                         "status": STATUS_MISSING,
                         "reason": "no_finalised_measurement_within_pairing_window",
                     }))

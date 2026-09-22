@@ -33,9 +33,11 @@ import csv
 import hashlib
 import json
 import logging
+import math
 import os
 import threading
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -53,6 +55,44 @@ CSV_ENCODING = "utf-8-sig"
 # answers "what was accepted" and "what was withheld, and why".
 STATUS_ACCEPTED = "accepted"
 STATUS_REJECTED = "rejected"
+
+
+def _with_valid_timestamp(row: dict[str, Any]) -> dict[str, Any]:
+    """Every row carries an epoch seconds value and its ISO-8601 UTC spelling.
+
+    A missing timestamp reached the dashboard as "Invalid Date"; it is filled
+    here, at the one place every row passes through.
+    """
+    stamp = row.get("timestamp")
+    try:
+        seconds = float(stamp)
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        seconds = time.time()
+    row["timestamp"] = round(seconds, 3)
+    row["timestamp_iso"] = datetime.fromtimestamp(seconds, tz=timezone.utc).isoformat(timespec="seconds")
+    return row
+
+
+def _with_valid_volume(row: dict[str, Any]) -> dict[str, Any]:
+    """An accepted row must carry a finite volume; otherwise it is a rejection.
+
+    NaN and empty strings used to be written as if they were litres, so the
+    dashboard showed "NaN L" beside a row marked saved.
+    """
+    for key in ("volume_l", "estimated_litres", "live_volume_l"):
+        value = row.get(key)
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            row[key] = None
+            continue
+        row[key] = round(number, 6) if math.isfinite(number) else None
+    if row.get("status") == STATUS_ACCEPTED and row.get("volume_l") is None:
+        row["status"] = STATUS_REJECTED
+        row["reason"] = row.get("reason") or "non_finite_volume"
+    return row
 
 
 @dataclass
@@ -107,7 +147,7 @@ class MeasurementEventLog:
         # Identity and provenance -- first, so a spreadsheet opens on the keys.
         # `event_id` is the permanent measurement id from stable_identity.py,
         # never the detector's track number, which is renumbered mid-object.
-        "session_id", "event_id", "track_id", "timestamp", "processing_mode",
+        "session_id", "event_id", "track_id", "timestamp", "timestamp_iso", "processing_mode",
         "camera_source", "camera_id", "calibration_id", "operating_mode",
         "diagnostic", "status", "reason",
         # Classification
@@ -123,7 +163,7 @@ class MeasurementEventLog:
         # Method and quality
         "dimension_confidence", "dimension_method", "depth_coverage_percent",
         "measurement_method", "measurement_quality", "volume_rejection_reason",
-        "calibration_valid", "stable_frames", "detector_track_ids",
+        "calibration_valid", "stable_frames", "detector_track_ids", "classification_note",
         "model_version", "pipeline_version",
         # Optional ground truth, filled in by the operator for benchmark runs.
         "ground_truth_litres", "absolute_error_litres", "percentage_error",
@@ -182,11 +222,11 @@ class MeasurementEventLog:
             ) from exc
 
     def startup_report(self, *, diagnostic: bool = False) -> list[str]:
-        """The three lines the operator must see before a run begins."""
+        """The lines the operator must see before a run begins."""
         return [
             f"Measurement mode: {'diagnostic' if diagnostic else 'normal'}",
             "History ledger: enabled",
-            f"CSV persistence: enabled ({self.path})",
+            f"CSV persistence: enabled ({self.path}, {self._persisted} rows)",
         ]
 
     # ------------------------------------------------------------- identity
@@ -245,9 +285,10 @@ class MeasurementEventLog:
         with self._lock:
             if event_id in self._seen:
                 return PersistResult(event_id=event_id, written=False, duplicate=True, path=self.path)
-            payload = dict(row)
+            payload = _with_valid_timestamp(dict(row))
             payload.setdefault("session_id", self.session_id)
             payload.setdefault("status", STATUS_ACCEPTED)
+            payload = _with_valid_volume(payload)
             payload = self._with_aliases(payload)
             payload = self._with_ground_truth_error(payload)
             try:
@@ -389,6 +430,7 @@ class MeasurementEventLog:
             {
                 "event_id": row.get("event_id"),
                 "timestamp": row.get("timestamp"),
+                "timestamp_iso": row.get("timestamp_iso"),
                 "object_type": row.get("object_type") or row.get("label"),
                 "colour": row.get("colour") or row.get("color"),
                 "material": row.get("material"),

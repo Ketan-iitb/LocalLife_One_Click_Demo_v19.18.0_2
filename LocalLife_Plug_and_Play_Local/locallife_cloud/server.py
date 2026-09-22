@@ -184,6 +184,13 @@ def create_app(
     else:
         manager = DualCameraCoordinator(settings)
     vision = manager.camera("realsense")
+    for camera_id, station in manager.pipelines.items():
+        LOGGER.info("%s canonical raw CSV: %s (%d rows)", camera_id, station.event_log.path,
+                    len(station.event_log.rows()))
+    LOGGER.info(
+        "Comparison CSV: %s (%d rows); workbook: /api/export/LocalLife_Measurements.xlsx",
+        manager.paired_log.path, len(manager.paired_log.rows()),
+    )
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = settings.max_upload_mb * 1024 * 1024
     app.config["VISION_PIPELINE"] = vision

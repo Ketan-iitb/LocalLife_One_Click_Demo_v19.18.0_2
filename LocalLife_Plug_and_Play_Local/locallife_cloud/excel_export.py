@@ -18,8 +18,8 @@ CAMERA_COLUMNS = [
 ]
 COMPARISON_COLUMNS = [
     "Comparison Event ID", "Object Number", "Date and Time", "Object Type",
-    "RealSense Dimensions", "RealSense Volume (L)", "Logitech Dimensions", "Logitech Volume (L)",
-    "Absolute Difference (L)", "Percentage Difference", "RealSense Processing Time (ms)",
+    "RealSense Volume (L)", "Logitech Volume (L)", "Absolute Difference (L)", "Percentage Difference",
+    "RealSense Dimensions", "Logitech Dimensions", "RealSense Processing Time (ms)",
     "Logitech Processing Time (ms)", "Pairing Status",
 ]
 
@@ -31,8 +31,15 @@ def _number(value: Any) -> float | None:
         return None
 
 
-def _when(value: Any) -> datetime | None:
-    stamp = _number(value)
+def _when(row: dict[str, Any]) -> datetime | None:
+    """Local date and time from the row's ISO-8601 UTC value, or its epoch seconds."""
+    text = row.get("timestamp_iso")
+    if text:
+        try:
+            return datetime.fromisoformat(str(text)).astimezone().replace(tzinfo=None)
+        except ValueError:
+            pass
+    stamp = _number(row.get("timestamp"))
     return None if stamp is None else datetime.fromtimestamp(stamp)
 
 
@@ -52,7 +59,7 @@ def _camera_row(number: int, row: dict[str, Any]) -> list[Any]:
     if row.get("reason"):
         status += f" ({row['reason']})"
     return [
-        number, row.get("measurement_id"), _when(row.get("timestamp")), row.get("object_type"),
+        number, row.get("measurement_id"), _when(row), row.get("object_type"),
         row.get("colour"), row.get("material"), row.get("sorting_result"), row.get("geometry_method"),
         dimensions_text(row), _number(row.get("selected_volume_litres")),
         None if confidence is None else round(confidence, 3), status,
@@ -93,11 +100,12 @@ def build_workbook(rows: list[dict[str, Any]]) -> bytes:
         missing = [name for name, row in (("RealSense", realsense), ("Logitech", logitech))
                    if row is None or row.get("status") == "missing"]
         comparison.append([
-            event_id, number, _when(first.get("timestamp")), first.get("object_type"),
-            "" if realsense is None else dimensions_text(realsense), left,
-            "" if logitech is None else dimensions_text(logitech), right,
+            event_id, number, _when(first), first.get("object_type"),
+            left, right,
             None if difference is None else round(difference, 6),
             None if difference is None or not left else round(difference / left * 100.0, 2),
+            "" if realsense is None else dimensions_text(realsense),
+            "" if logitech is None else dimensions_text(logitech),
             None if realsense is None else _number(realsense.get("processing_time_ms")),
             None if logitech is None else _number(logitech.get("processing_time_ms")),
             "paired" if not missing else "missing: " + ", ".join(missing),
