@@ -310,6 +310,12 @@ class AppConfig:
     research_mode: str = "paired"
     # Two finalised camera measurements this close in time are one physical object.
     comparison_pair_window_s: float = 20.0
+    # A confirmed object that has not settled after this many frames is
+    # recorded once as rejected (unstable_volume / no_valid_measurement).
+    finalise_max_frames: int = 45
+    # Save per-measurement and periodic scene bundles for real-hardware debugging.
+    hardware_diagnostic: bool = False
+    hardware_diagnostic_interval_s: float = 5.0
     logitech_horizontal_fov_deg: float = 70.42
     logitech_roi: tuple[float, float, float, float] | None = None
     logitech_max_scene_fraction: float = 0.45
@@ -611,6 +617,10 @@ class AppConfig:
             logitech_reference_distance_m=float(os.environ.get("LOCALLIFE_LOGITECH_REFERENCE_DISTANCE_M", defaults.logitech_reference_distance_m)),
             research_mode=os.environ.get("LOCALLIFE_RESEARCH_MODE", defaults.research_mode).strip().lower(),
             comparison_pair_window_s=float(os.environ.get("LOCALLIFE_COMPARISON_PAIR_WINDOW_S", defaults.comparison_pair_window_s)),
+            finalise_max_frames=int(os.environ.get("LOCALLIFE_FINALISE_MAX_FRAMES", defaults.finalise_max_frames)),
+            hardware_diagnostic=_bool_env("LOCALLIFE_HARDWARE_DIAGNOSTIC", defaults.hardware_diagnostic),
+            hardware_diagnostic_interval_s=float(os.environ.get(
+                "LOCALLIFE_HARDWARE_DIAGNOSTIC_INTERVAL_S", defaults.hardware_diagnostic_interval_s)),
             logitech_horizontal_fov_deg=float(os.environ.get("LOCALLIFE_LOGITECH_HORIZONTAL_FOV_DEG", defaults.logitech_horizontal_fov_deg)),
             logitech_roi=logitech_roi,
             logitech_max_scene_fraction=float(os.environ.get("LOCALLIFE_LOGITECH_MAX_SCENE_FRACTION", defaults.logitech_max_scene_fraction)),

@@ -107,10 +107,23 @@ def _annotate_frame(frame: np.ndarray, pipeline: VisionPipeline) -> np.ndarray:
             and detection.footprint_width_mm is not None
             and detection.physical_height_mm is not None
         ):
-            dimensions = (
-                f"LxWxH {detection.footprint_length_mm:.0f}x"
-                f"{detection.footprint_width_mm:.0f}x{detection.physical_height_mm:.0f} mm"
-            )
+            shape = detection.shape_geometry
+            if shape is not None and shape.geometry_method == "cylinder" and shape.cylinder_orientation == "lying":
+                dimensions = (
+                    f"cylinder D{shape.cylinder_diameter_mm:.0f} x axis {shape.cylinder_height_mm:.0f} mm"
+                    " = pi r2 L"
+                )
+            elif shape is not None and shape.geometry_method == "cylinder":
+                # The same fitted numbers the API and CSV carry.
+                dimensions = (
+                    f"cylinder D{shape.cylinder_diameter_mm:.0f}xD{shape.cylinder_diameter_mm:.0f}"
+                    f"xH{detection.physical_height_mm:.0f} mm = pi r2 h"
+                )
+            else:
+                dimensions = (
+                    f"LxWxH {detection.footprint_length_mm:.0f}x"
+                    f"{detection.footprint_width_mm:.0f}x{detection.physical_height_mm:.0f} mm"
+                )
             dimension_y = min(output.shape[0] - 8, max(20, y1 + 20))
             cv2.putText(
                 output, dimensions, (x1, dimension_y),
@@ -318,6 +331,7 @@ def create_app(
                 # Lets the operator page show where the file actually is without
                 # a second round trip.
                 "X-LocalLife-CSV-Path": str(station.event_log.path),
+                "Cache-Control": "no-store",
             },
         )
 
@@ -433,6 +447,7 @@ def create_app(
             headers={
                 "Content-Disposition": "attachment; filename=comparison_measurements.csv",
                 "Cache-Control": "no-store",
+                "X-LocalLife-CSV-Path": str(manager.paired_log.path),
             },
         )
 
@@ -452,6 +467,19 @@ def create_app(
     @protected
     def paired_retry() -> Any:
         return jsonify(ok=True, **manager.paired_log.retry_failed())
+
+    @app.get("/api/cameras/logitech/mask-debug.jpg")
+    def logitech_mask_debug() -> Response | tuple[Any, int]:
+        """Detector / foreground / final / rejected masks over the latest Logitech frame."""
+        import cv2
+
+        overlay = manager.camera("logitech").logitech_mask_overlay()
+        if overlay is None:
+            return jsonify(error="No Logitech frame has been processed yet"), 404
+        ok, encoded = cv2.imencode(".jpg", overlay)
+        if not ok:
+            return jsonify(error="Could not encode the mask overlay"), 500
+        return Response(encoded.tobytes(), mimetype="image/jpeg", headers={"Cache-Control": "no-store"})
 
     @app.get("/api/logitech/calibration")
     def logitech_calibration() -> Any:

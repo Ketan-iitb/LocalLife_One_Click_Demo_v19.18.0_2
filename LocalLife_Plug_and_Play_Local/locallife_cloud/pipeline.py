@@ -43,12 +43,13 @@ from .sorting_rules import classify_sorting, mis_sort_family
 from . import __version__
 from .stable_identity import Observation, StabilitySettings, StableObjectRegistry, observations_from
 from .footprint import DimensionSmoother
+from .diagnostics import HardwareDiagnostics
 from .event_log import MeasurementEventLog, STATUS_ACCEPTED, STATUS_REJECTED, resolve_event_id
 from .storage import ResultStore
 from .tracking import ObjectTracker
 from .box_templates import load_box_templates, match_box_template
 from .logitech_calibration import RELATIVE_ONLY_MESSAGE, LogitechCalibrationStore, LogitechLens, depth_output_kind
-from .shape_geometry import GeometryLock, ShapeGeometry, measure_shape
+from .shape_geometry import CYLINDER, CYLINDER_REJECTIONS, GeometryLock, ShapeGeometry, measure_shape
 from .types import BoxVolumeMeasurement, CameraIntrinsics, DepthCalibration, Detection, FrameAnalysis
 from .volume import (
     ReferencePlane,
@@ -511,6 +512,16 @@ class VisionPipeline:
         self._box_frames_considered: dict[int, int] = defaultdict(int)
         # Shape method voting and freeze per track (shape_geometry.py).
         self._geometry_lock = GeometryLock(required_frames=max(3, config.settle_frames))
+        self.diagnostics = HardwareDiagnostics(
+            config.results_dir / "hardware_diagnostics", camera_id,
+            enabled=config.hardware_diagnostic, interval_s=config.hardware_diagnostic_interval_s,
+        )
+        self._frame_context: dict[str, Any] = {}
+        # Frames each confirmed track has waited for finalisation (non-waste modes).
+        self._unfinalised_frames: dict[int, int] = {}
+        # Detector / foreground / final / rejected masks of the latest Logitech
+        # frame, for the diagnostic overlay.
+        self.logitech_mask_debug: dict[str, Any] = {}
         # Called with each persisted measurement row (DualCameraCoordinator
         # pairs the two cameras through it).
         self.measurement_listener: Callable[[dict[str, Any]], None] | None = None
@@ -989,6 +1000,7 @@ class VisionPipeline:
         # Per-frame shape-router result, keyed like the cuboid stash above and
         # folded into the track's `GeometryLock` once tracking has run.
         pending_shapes: dict[int, ShapeGeometry] = {}
+        pending_points: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         if depth_m is not None and depth_m.shape != frame.shape[:2]:
             warnings.append("RealSense depth is not aligned to the RGB frame; hardware volume was skipped")
             depth_m = None
@@ -1020,6 +1032,7 @@ class VisionPipeline:
             warnings.append(f"MIS-SORT: a {family} object was detected; this bin does not accept it")
 
         if self.camera_id == "logitech":
+            mask_debug: dict[str, Any] = {}
             detections, segmentation_warnings = bound_logitech_detections(
                 frame,
                 self.reference_rgb,
@@ -1030,7 +1043,9 @@ class VisionPipeline:
                 max_scene_fraction=self.config.logitech_max_scene_fraction,
                 max_expansion=self.config.logitech_max_mask_expansion,
                 duplicate_overlap=self.config.logitech_duplicate_overlap,
+                debug=mask_debug,
             )
+            self.logitech_mask_debug = {"frame": frame, **mask_debug}
             warnings.extend(segmentation_warnings)
             if self.config.logitech_stabilize_depth:
                 calibrated_prediction, self.last_background_stabilization = stabilize_background_depth(
@@ -1595,6 +1610,8 @@ class VisionPipeline:
                     min_height_m=minimum_height_m,
                     max_height_m=self.config.max_object_height_m,
                 )
+                if plane_points is not None and self.diagnostics.enabled:
+                    pending_points[id(detection)] = plane_points
                 if plane_points is not None:
                     # Mesh volume is the height-map integral set just above,
                     # before any cuboid override below replaces it.
@@ -1719,6 +1736,8 @@ class VisionPipeline:
                     max_height_m=self.config.max_object_height_m,
                     erode_px=LOGITECH_MASK_ERODE_PX,
                 )
+                if plane_points is not None and self.diagnostics.enabled:
+                    pending_points[id(detection)] = plane_points
                 if plane_points is not None:
                     pending_shapes[id(detection)] = measure_shape(
                         *plane_points,
@@ -1786,10 +1805,17 @@ class VisionPipeline:
         # already applied above. A track with fewer accepted frames than
         # `box_aggregation_min_frames` keeps its current single-frame
         # result, so early frames are never hidden.
+        # What a diagnostic bundle saves if a measurement is persisted this frame.
+        self._frame_context = {
+            "frame": frame,
+            "depth": (calibrated_prediction if calibrated_prediction is not None else predicted_depth) if self.camera_id == "logitech" else depth_m,
+            "points": pending_points,
+        }
         for detection in detections:
             detection.shape_geometry = self._geometry_lock.update(
                 detection.track_id, pending_shapes.get(id(detection)),
             )
+            self._apply_cylinder_geometry(detection)
         for detection in detections:
             if detection.track_id is None or id(detection) not in pending_box_attempted:
                 continue
@@ -2025,6 +2051,17 @@ class VisionPipeline:
             self.latest_depth = None if depth_m is None else depth_m.copy()
             self.latest_frame_timestamp = float(timestamp)
         self.latest_monocular_depth = None if calibrated_prediction is None else calibrated_prediction.copy()
+        if self.diagnostics.enabled:
+            self.diagnostics.maybe_record_scene(
+                frame=frame,
+                depth=(calibrated_prediction if calibrated_prediction is not None else predicted_depth) if self.camera_id == "logitech" else depth_m,
+                mask_overlay=self.logitech_mask_overlay() if self.camera_id == "logitech" else None,
+                summary={
+                    "detections": [item.to_dict() for item in detections],
+                    "warnings": list(warnings),
+                    "logitech": self.logitech_diagnostics() if self.camera_id == "logitech" else None,
+                },
+            )
         self.latest_analysis = analysis
         self.latest_processed_frame = frame.copy()
         self.latest_analysis_timestamp = float(timestamp)
@@ -2792,11 +2829,28 @@ class VisionPipeline:
         for detection in detections:
             if detection.track_id is None or detection.track_id in self._csv_logged:
                 continue
-            if self._detection_volume(detection) is None or _is_phantom_detection(detection):
+            if _is_phantom_detection(detection):
                 continue
-            if not self._is_settled(detection.track_id):
+            if self._detection_volume(detection) is not None and self._is_settled(detection.track_id):
+                self.persist_measurement_event(detection, timestamp)
                 continue
-            self.persist_measurement_event(detection, timestamp)
+            track = self.tracker.tracks.get(detection.track_id)
+            if track is None or not track.counted:
+                continue
+            frames = self._unfinalised_frames[detection.track_id] = (
+                self._unfinalised_frames.get(detection.track_id, 0) + 1
+            )
+            if frames >= self.config.finalise_max_frames:
+                # An object that never settles (or never gets a valid volume)
+                # is still a real outcome: one rejected row with its reason,
+                # instead of silently producing no row at all.
+                reason = detection.volume_rejection_reason or (
+                    "unstable_volume" if self._detection_volume(detection) is not None
+                    else "no_valid_measurement"
+                )
+                self.persist_measurement_event(
+                    detection, timestamp, status=STATUS_REJECTED, status_reason=reason,
+                )
 
     def persist_measurement_event(
         self,
@@ -2826,7 +2880,17 @@ class VisionPipeline:
         )
         row = self._measurement_row(detection, timestamp, event_id, status, status_reason)
         result = self.event_log.record(row)
-        if detection.track_id is not None and result.ok:
+        if self.diagnostics.enabled and not result.duplicate:
+            context = self._frame_context
+            self.diagnostics.record_measurement(
+                row=row, frame=context.get("frame"), mask=detection.mask, depth=context.get("depth"),
+                points=(context.get("points") or {}).get(id(detection)),
+                mask_overlay=self.logitech_mask_overlay() if self.camera_id == "logitech" else None,
+                latency_ms=row.get("processing_time_ms"),
+            )
+        if detection.track_id is not None and (result.ok or result.error):
+            # A failed write is queued in the event log for retry; the track
+            # is finalised either way, so later frames do not re-create it.
             self._csv_logged.add(detection.track_id)
         if result.ok and self.measurement_listener is not None:
             # Paired comparison is a passive downstream consumer: whatever it
@@ -2973,6 +3037,7 @@ class VisionPipeline:
             self._box_measurement_history.pop(track_id, None)
             self._box_frames_considered.pop(track_id, None)
             self._geometry_lock.forget(track_id)
+            self._unfinalised_frames.pop(track_id, None)
             self._color_history.pop(track_id, None)
             self._material_history.pop(track_id, None)
             self._material_frame_counts.pop(track_id, None)
@@ -3061,6 +3126,41 @@ class VisionPipeline:
             return frame, intrinsics
         return self.logitech_lens.prepare(frame, intrinsics)
 
+    def _apply_cylinder_geometry(self, detection: Detection) -> None:
+        """Make a fitted cylinder the object's reported dimensions and volume.
+
+        Before this, the router could say "cylinder" while the overlay, API and
+        CSV still read the support-plane footprint rectangle (an upright bottle
+        showed 83 x 23 mm: its visible arc) and the height-map litres. Every
+        downstream reader uses these same fields, so they now carry the fitted
+        diameter x diameter x height and pi r^2 h. A cylinder candidate whose
+        fit was rejected stays pending with its reason -- never a box volume.
+        Cuboids and irregular objects keep the existing measurement untouched.
+        """
+        shape = detection.shape_geometry
+        if shape is None:
+            return
+        logitech = self.camera_id == "logitech"
+        if shape.geometry_method == CYLINDER:
+            detection.footprint_length_mm = round(float(shape.length_mm), 2)
+            detection.footprint_width_mm = round(float(shape.width_mm), 2)
+            detection.physical_height_mm = round(float(shape.height_mm), 2)
+            detection.height_above_baseline_cm = round(float(shape.height_mm) / 10.0, 1)
+            detection.dimension_confidence = round(float(shape.geometry_confidence), 4)
+            detection.dimension_method = f"fitted_cylinder_{shape.cylinder_orientation}"
+            detection.measurement_method = "cylinder_pi_r2_h"
+            volume = round(float(shape.selected_volume_litres), 6)
+            if logitech:
+                detection.monocular_volume_l = volume
+            else:
+                detection.realsense_volume_l = volume
+        elif shape.rejection_reason in CYLINDER_REJECTIONS:
+            if logitech:
+                detection.monocular_volume_l = None
+            else:
+                detection.realsense_volume_l = None
+            detection.volume_rejection_reason = shape.rejection_reason
+
     def _fitted_logitech_calibration(self, shape: tuple[int, ...]) -> DepthCalibration | None:
         """The stored multi-distance fit, if it matches this resolution and model."""
         store = self.logitech_calibration
@@ -3096,6 +3196,41 @@ class VisionPipeline:
         status["apply"] = "Capture the empty baseline again to apply this calibration"
         return status
 
+    def logitech_diagnostics(self) -> dict[str, Any]:
+        """The operator-facing yes/no chain for Logitech + Depth Anything V2."""
+        analysis = self.latest_analysis
+        debug = self.logitech_mask_debug
+        status = self._volume_status({}) if analysis is not None else {"message": "Waiting for camera frames"}
+        reasons = list(debug.get("reasons") or [])
+        detections = [] if analysis is None else analysis.detections
+        rejection = next((item.volume_rejection_reason for item in detections if item.volume_rejection_reason), None)
+        latency = None if analysis is None else round(float(analysis.inference_ms), 1)
+        return {
+            "da_v2_loaded": bool(self.depth_estimator is not None and self._recent_monocular_frames),
+            "calibration_loaded": bool(self._logitech_measurement_ready() and self.calibration is not None),
+            "final_mask_valid": bool(debug.get("final_mask_valid")),
+            "metric_volume_status": status.get("message"),
+            "rejection_reason": rejection or (reasons[0] if reasons else None),
+            "latency_ms": latency,
+            "processing_fps": None if not latency else round(1000.0 / latency, 2),
+        }
+
+    def logitech_mask_overlay(self) -> np.ndarray | None:
+        """Detector (blue), foreground (yellow), final object (green), rejected (red)."""
+        debug = self.logitech_mask_debug
+        frame = debug.get("frame")
+        if frame is None:
+            return None
+        output = frame.copy()
+        for key, colour in (("detector", (255, 120, 0)), ("foreground", (0, 220, 255)),
+                            ("rejected", (0, 0, 255)), ("final", (0, 220, 0))):
+            mask = debug.get(key)
+            if mask is not None and mask.shape == output.shape[:2] and mask.any():
+                tinted = output.copy()
+                tinted[mask] = colour
+                output = (0.55 * output + 0.45 * tinted).astype(np.uint8)
+        return output
+
     def logitech_calibration_status(self) -> dict[str, Any]:
         store = self.logitech_calibration
         active = self.calibration if self.camera_id == "logitech" else None
@@ -3107,6 +3242,7 @@ class VisionPipeline:
             "active_calibration": None if active is None else active.to_dict(),
             "depth_output": depth_output_kind(self.config.depth_model),
             "stored": None if store is None else store.status(),
+            "diagnostics": self.logitech_diagnostics() if self.camera_id == "logitech" else None,
             "lens": None if self.logitech_lens is None else {
                 "status": self.logitech_lens.status, "profile": self.logitech_lens.source,
             },
