@@ -146,3 +146,31 @@ class CloudStartupGateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MaskLeakageTests(unittest.TestCase):
+    def test_detached_background_patch_is_dropped_before_integration(self) -> None:
+        depth, mask, floor = upright_cylinder_scene(25.0, 0.0425, 0.20)
+        plane = fit_reference_plane(floor.astype(np.float32), CAMERA)
+        clean = metric_object_volume(depth, CAMERA, mask, plane, min_height_m=0.01, min_pixels=50)
+        # A patch of "floor" 10 cm away that leaked into the mask, raised just
+        # enough to pass the height gate -- a foot, or a bag's shadow edge.
+        leaked_mask = mask.copy()
+        leaked_depth = depth.copy()
+        leaked_mask[60:110, 300:360] = True
+        leaked_depth[60:110, 300:360] = floor[60:110, 300:360] - 0.05
+        leaked = metric_object_volume(leaked_depth, CAMERA, leaked_mask, plane, min_height_m=0.01, min_pixels=50)
+        self.assertGreater(leaked.diagnostics["background_cells_dropped"], 0)
+        self.assertAlmostEqual(leaked.measurement.liters, clean.measurement.liters,
+                               delta=0.15 * clean.measurement.liters)
+
+    def test_volume_trace_reports_every_diagnostic_the_brief_asks_for(self) -> None:
+        depth, mask, floor = upright_cylinder_scene(25.0, 0.0425, 0.20)
+        plane = fit_reference_plane(floor.astype(np.float32), CAMERA)
+        result = metric_object_volume(depth, CAMERA, mask, plane, min_height_m=0.01, min_pixels=50)
+        for key in ("mask_pixels", "above_plane_pixels", "rejected_spike_pixels", "height_median_m",
+                    "height_p90_m", "footprint_area_m2", "footprint_cells", "measured_cells",
+                    "background_cells_dropped", "occlusion_filled_cells", "length_mm", "width_mm",
+                    "object_depth_median_m", "plane_source", "raw_volume_l"):
+            with self.subTest(key=key):
+                self.assertIn(key, result.diagnostics)
