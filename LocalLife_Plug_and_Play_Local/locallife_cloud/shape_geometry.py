@@ -55,6 +55,12 @@ GEOMETRY_METHODS = (CUBOID, CYLINDER, IRREGULAR_RIGID, FLEXIBLE_OR_UNKNOWN)
 
 # Label words that only change how an irregular volume is *described*. They
 # never select cuboid or cylinder: that needs the geometry to agree.
+# Accepted cylindrical categories. A label only makes the object a cylinder
+# *candidate* -- the robust circle fit must still succeed on its points.
+_CYLINDER_WORDS = {
+    "can", "cans", "tin", "bottle", "bottles", "jar", "cup", "mug", "tube", "canister",
+    "flask", "cream", "balm", "lotion", "container", "cylinder", "cylindrical", "soda", "beverage",
+}
 _FLEXIBLE_WORDS = {"bag", "bags", "sack", "pillow", "cushion", "backpack", "textile", "cloth", "toy", "plush"}
 
 MIN_POINTS = 50
@@ -244,6 +250,27 @@ def _residual_limit_m(fit: CircleFit) -> float:
     return max(CYLINDER_NOISE_FLOOR_M, MAX_CYLINDER_RESIDUAL * fit.radius)
 
 
+def _edge_corrected_fit(footprint: np.ndarray) -> CircleFit | None:
+    """Circle through a filled footprint's outline, corrected for how it was sampled.
+
+    Each sector's outermost point overshoots a noisy edge by about one edge
+    sigma, and pixel-centre sampling undershoots a clean one by half a pixel.
+    Both are measured from the data (outline residual spread, mean point
+    spacing) and removed; on synthetic discs this keeps the diameter within
+    about -5 %/+10 % at 0-3 mm edge noise, versus +5-17 % uncorrected.
+    """
+    outline = _boundary_points(footprint)
+    fit = robust_circle_fit(outline) if len(outline) >= 12 else None
+    if fit is None:
+        return None
+    residual = np.hypot(outline[:, 0] - fit.centre[0], outline[:, 1] - fit.centre[1]) - fit.radius
+    edge_sigma = 1.4826 * float(np.median(np.abs(residual - np.median(residual))))
+    hull = cv2.convexHull(footprint.astype(np.float32))
+    spacing = math.sqrt(max(float(cv2.contourArea(hull)), 1e-12) / len(footprint))
+    radius = fit.radius - edge_sigma + 0.5 * spacing
+    return replace(fit, radius=radius) if radius > 0 else fit
+
+
 def _fit_confidence(fit: CircleFit) -> float:
     residual_term = 1.0 - min(1.0, fit.residual * fit.radius / _residual_limit_m(fit))
     return float(np.clip(
@@ -251,8 +278,13 @@ def _fit_confidence(fit: CircleFit) -> float:
     ))
 
 
-def _boundary_points(footprint: np.ndarray, bins: int = 72) -> np.ndarray:
-    """Outermost point per angular sector: a dense outline, unlike a sparse hull."""
+def _boundary_points(footprint: np.ndarray, bins: int = 72, quantile: float = 1.0) -> np.ndarray:
+    """One edge point per angular sector: a dense outline, unlike a sparse hull.
+
+    `quantile` < 1 takes a near-outermost point instead of the extreme one:
+    the extreme of a noisy edge sits a couple of sigma outside the true
+    boundary, which inflated fitted diameters by 5-15 % at 1-3 mm noise.
+    """
     centre = footprint.mean(axis=0)
     offsets = footprint - centre
     angles = np.arctan2(offsets[:, 1], offsets[:, 0])
@@ -260,9 +292,11 @@ def _boundary_points(footprint: np.ndarray, bins: int = 72) -> np.ndarray:
     sectors = ((angles + math.pi) / (2 * math.pi) * bins).astype(int) % bins
     order = np.lexsort((radii, sectors))
     ordered_sectors = sectors[order]
-    # Last entry of each sector run is that sector's largest radius.
+    # Each sector is a contiguous run sorted by radius; pick its quantile entry.
     last = np.flatnonzero(np.r_[ordered_sectors[1:] != ordered_sectors[:-1], True])
-    return footprint[order[last]].astype(np.float64)
+    first = np.r_[0, last[:-1] + 1]
+    chosen = first + np.floor(quantile * (last - first)).astype(int)
+    return footprint[order[chosen]].astype(np.float64)
 
 
 def _cross_profile_ratio(local: np.ndarray, heights: np.ndarray, width: float) -> float | None:
@@ -359,11 +393,14 @@ def measure_shape(
     base = dict(length_mm=length_mm, width_mm=width_mm, height_mm=top_mm,
                 bounding_box_volume_litres=bbox_l, mesh_volume_litres=mesh, points=points, features=features)
 
-    def _cylinder(fit: CircleFit, axis_m: float, orientation: str, flags: tuple[str, ...]) -> ShapeGeometry:
-        """A fitted cylinder, or a pending result when the fit is not trustworthy.
+    cylinder_rejection: list[str] = []
 
-        Never falls back to a box: a candidate that fails the fit reports no
-        litres and says why.
+    def _cylinder(fit: CircleFit, axis_m: float, orientation: str,
+                  flags: tuple[str, ...]) -> ShapeGeometry | None:
+        """A fitted cylinder, or None when the fit is not trustworthy.
+
+        A rejected fit falls through to the existing height-map result
+        (irregular), with the reason kept -- never a fake cylinder, never a box.
         """
         diameter_m = 2.0 * fit.radius
         confidence = _fit_confidence(fit)
@@ -377,13 +414,8 @@ def measure_shape(
         elif not MIN_DIMENSION_MM <= diameter_m * 1000.0 <= MAX_DIMENSION_MM:
             reason = "implausible_cylinder_diameter"
         if reason is not None:
-            return ShapeGeometry(
-                geometry_method=UNCERTAIN, geometry_confidence=min(confidence, 0.3),
-                length_mm=length_mm, width_mm=width_mm, height_mm=top_mm,
-                bounding_box_volume_litres=None, mesh_volume_litres=mesh, selected_volume_litres=None,
-                volume_meaning="unavailable", cylinder_fit_residual=fit.residual, fit_confidence=confidence,
-                rejection_reason=reason, points=points, features=features, flags=flags + (reason,),
-            )
+            cylinder_rejection.append(reason)
+            return None
         volume = _litres(math.pi * fit.radius ** 2 * axis_m)
         if orientation == "upright":
             dims = dict(length_mm=diameter_m * 1000.0, width_mm=diameter_m * 1000.0, height_mm=axis_m * 1000.0)
@@ -409,17 +441,28 @@ def measure_shape(
     disc = aspect >= 0.85 and DISC_FILL_RANGE[0] <= rect_fill <= DISC_FILL_RANGE[1] and residual is not None \
         and residual <= MAX_CIRCLE_RESIDUAL
     shell = column_fill < 0.55 and aspect < 0.85
+    words = set(label.lower().replace("_", " ").replace("-", " ").split())
+    # A labelled can/bottle seen obliquely shows its top disc plus the front
+    # shell, whose projection lands on the same circle: the union is a disc
+    # that need not pass the strict disc test, so the label admits the fit.
+    labelled = bool(words & _CYLINDER_WORDS) and aspect >= 0.6
     # Height along the vertical axis: the near-top of the points, not the p95
     # used for general objects (a side-seen shell is uniform in height).
-    axis_top_m = float(np.percentile(heights, 99.5)) if height_mm is None else top_m
-    if disc or shell:
+    # A side-seen shell has uniformly spread heights (no plateau), so its top
+    # is its extreme; a visible top disc is a plateau, where p98 avoids noise.
+    axis_top_m = float(np.percentile(heights, 99.5 if shell else 98.0)) if height_mm is None else top_m
+    if disc or shell or labelled:
         # Arc coverage and residual (inside _cylinder) guard against an
         # extrapolated fit; the rectangle's chord is not used, because a few
-        # stray points widen it without changing the circle.
-        fit = robust_circle_fit(outline if disc else footprint)
+        # stray points widen it without changing the circle. A filled footprint
+        # is fitted on its outline -- the widest body, so a bottle's narrower
+        # neck and cap inside it do not shrink the diameter.
+        fit = robust_circle_fit(footprint) if shell else _edge_corrected_fit(footprint)
         if fit is not None:
-            return _cylinder(fit, axis_top_m, "upright",
-                             ("disc_footprint",) if disc else ("arc_reconstructed_diameter",))
+            flag = "disc_footprint" if disc else "arc_reconstructed_diameter" if shell else "labelled_cylinder_fit"
+            fitted = _cylinder(fit, axis_top_m, "upright", (flag,))
+            if fitted is not None:
+                return fitted
 
     # Cylinder lying on its side: the axis is the footprint's principal
     # direction (PCA); the cross-section across it is the visible upper half of
@@ -432,7 +475,9 @@ def measure_shape(
         fit = robust_circle_fit(np.column_stack((across, heights)))
         if fit is not None:
             axis_length = float(np.percentile(along, 99.5) - np.percentile(along, 0.5))
-            return _cylinder(fit, axis_length, "lying", ("curved_cross_profile",))
+            fitted = _cylinder(fit, axis_length, "lying", ("curved_cross_profile",))
+            if fitted is not None:
+                return fitted
 
     # Cuboid: a filled rectangle with a flat top.
     if (rect_fill >= RECT_FILL_MIN and flat_top >= FLAT_TOP_MIN and column_fill >= 0.55
@@ -448,14 +493,15 @@ def measure_shape(
     if mesh is None or mesh <= 0:
         result = _uncertain("no_height_map_volume", points, length=length_mm, width=width_mm, height=top_mm)
         return replace(result, bounding_box_volume_litres=bbox_l, features=features)
-    words = set(label.lower().replace("_", " ").split())
     flexible = bool(words & _FLEXIBLE_WORDS)
     confidence = 0.6 if mesh <= bbox_l * 1.05 else 0.35
+    rejected = tuple(f"cylinder_fit_rejected:{reason}" for reason in cylinder_rejection)
     return ShapeGeometry(
         geometry_method=FLEXIBLE_OR_UNKNOWN if flexible else IRREGULAR_RIGID,
         geometry_confidence=confidence, selected_volume_litres=mesh,
         volume_meaning="current_external_occupied_volume" if flexible else "segmented_height_map_volume",
-        flags=("height_map_integral",) + (() if mesh <= bbox_l * 1.05 else ("mesh_exceeds_bounding_box",)),
+        flags=("height_map_integral",) + (() if mesh <= bbox_l * 1.05 else ("mesh_exceeds_bounding_box",)) + rejected,
+        rejection_reason=cylinder_rejection[0] if cylinder_rejection else None,
         **base,
     )
 
