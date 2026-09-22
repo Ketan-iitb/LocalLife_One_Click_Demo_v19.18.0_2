@@ -35,7 +35,7 @@ import numpy as np
 
 from .types import DepthCalibration
 
-RELATIVE_ONLY_MESSAGE = "Relative depth only - metric volume unavailable"
+RELATIVE_ONLY_MESSAGE = "CALIBRATION REQUIRED — metric volume unavailable"
 
 METRIC_OUTPUT = "metric"
 RELATIVE_INVERSE_OUTPUT = "relative_inverse"

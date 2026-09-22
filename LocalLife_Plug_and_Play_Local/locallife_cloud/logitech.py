@@ -92,7 +92,44 @@ def _foreground_change(
         shift = np.median(difference[anchors], axis=0)
         shift = np.clip(shift, -35, 35)
         difference = difference - shift[None, None, :]
-    return (np.max(np.abs(difference), axis=2) >= threshold) & region
+    changed = (np.max(np.abs(difference), axis=2) >= threshold) & region
+    return changed & ~_shadow_mask(frame, baseline)
+
+
+def _shadow_mask(frame: np.ndarray, baseline: np.ndarray) -> np.ndarray:
+    """Pixels that only got darker with the same chromaticity: cast shadows."""
+    current = frame.astype(np.float32) + 1.0
+    empty = baseline.astype(np.float32) + 1.0
+    ratio = current.sum(axis=2) / empty.sum(axis=2)
+    chroma_shift = np.abs(current / current.sum(axis=2, keepdims=True)
+                          - empty / empty.sum(axis=2, keepdims=True)).max(axis=2)
+    return (ratio >= 0.35) & (ratio <= 0.90) & (chroma_shift < 0.04)
+
+
+def _open(mask: np.ndarray) -> np.ndarray:
+    """Morphological opening: drops speckle foreground from sensor noise."""
+    import cv2
+
+    kernel = np.ones((3, 3), np.uint8)
+    return cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_OPEN, kernel) > 0
+
+
+def _largest_component(mask: np.ndarray, min_pixels: int) -> np.ndarray:
+    components = connected_components(mask, min_area=min_pixels)
+    if not components:
+        return np.zeros_like(mask, dtype=bool)
+    return max(components, key=lambda item: int(np.count_nonzero(item)))
+
+
+def _touched_sides(mask: np.ndarray, region: np.ndarray) -> int:
+    rows, columns = np.nonzero(region)
+    if rows.size == 0:
+        return 0
+    top, bottom, left, right = rows.min(), rows.max(), columns.min(), columns.max()
+    return sum((
+        bool(mask[top, left:right + 1].any()), bool(mask[bottom, left:right + 1].any()),
+        bool(mask[top:bottom + 1, left].any()), bool(mask[top:bottom + 1, right].any()),
+    ))
 
 
 def bound_logitech_detections(
@@ -106,30 +143,57 @@ def bound_logitech_detections(
     max_scene_fraction: float = 0.45,
     max_expansion: float = 2.0,
     duplicate_overlap: float = 0.55,
+    debug: dict | None = None,
 ) -> tuple[list[Detection], list[str]]:
-    """Never allow monocular depth drift to replace a semantic instance mask."""
+    """The deposited object's own pixels: detector mask AND changed-vs-empty AND ROI.
+
+    A detector mask alone is not trusted: on the real rig it covered the floor,
+    the sofa and the ROI border, and Depth Anything V2 then integrated the
+    whole scene. The final mask is the largest connected component of
+    (detector mask intersect foreground change against the empty-bin
+    reference, shadows removed, speckle opened, inside the ROI), optionally
+    grown into the changed blob it belongs to. Without an empty reference
+    there is no object mask at all -- never the detector box or the ROI.
+
+    `debug`, when given, receives the detector, foreground, final and
+    rejected masks for the diagnostic overlay, and a reason per rejection.
+    """
     region_area = max(1, int(np.count_nonzero(region)))
     changed = _foreground_change(frame, baseline, region, detections, foreground_threshold)
+    if changed is not None:
+        changed = _open(changed)
     components = connected_components(changed, min_area=min_pixels) if changed is not None else []
     retained: list[Detection] = []
     warnings: list[str] = []
-    for detected in detections:
+    reasons: list[str] = []
+    detector_union = np.zeros(frame.shape[:2], dtype=bool)
+    if changed is None and detections:
+        warnings.append("Logitech object masks need the empty-bin reference; capture the Logitech baseline")
+        reasons.append("missing_empty_reference")
+    for detected in detections if changed is not None else []:
         seed = _seed_mask(detected, frame.shape[:2]) & region
+        detector_union |= seed
         seed_area = int(np.count_nonzero(seed))
         if seed_area < min_pixels:
+            reasons.append("detector_mask_too_small")
             continue
-        core = seed.copy()
-        if changed is not None:
-            foreground_seed = seed & changed
-            foreground_area = int(np.count_nonzero(foreground_seed))
-            if foreground_area >= min_pixels and (
-                foreground_area >= int(seed_area * 0.20)
-                or seed_area / region_area > max_scene_fraction
-            ):
-                core = foreground_seed
+        core = _largest_component(seed & changed, min_pixels)
         core_area = int(np.count_nonzero(core))
+        if core_area < min_pixels:
+            seed_rows, seed_columns = np.nonzero(seed)
+            seed_footprint = (np.ptp(seed_rows) + 1) * (np.ptp(seed_columns) + 1)
+            if seed_area / region_area > max_scene_fraction:
+                warnings.append("Rejected a Logitech detection covering most of the scene; tighten its camera ROI")
+            elif seed_footprint / region_area > max_scene_fraction:
+                warnings.append(
+                    "Rejected a Logitech object mask spanning the wall or floor; "
+                    "restrict its region to the garbage-bin opening"
+                )
+            reasons.append("no_foreground_change_inside_detector_mask")
+            continue
         if core_area / region_area > max_scene_fraction:
             warnings.append("Rejected a Logitech detection covering most of the scene; tighten its camera ROI")
+            reasons.append("mask_covers_most_of_scene")
             continue
 
         best_component = None
@@ -145,16 +209,17 @@ def bound_logitech_detections(
             if expanded_area <= core_area * max_expansion and expanded_area / region_area <= max_scene_fraction:
                 measured = expanded
         pixels = int(np.count_nonzero(measured))
-        if pixels < min_pixels:
-            continue
         rows, columns = np.nonzero(measured)
         box = (int(columns.min()), int(rows.min()), int(columns.max()) + 1, int(rows.max()) + 1)
         footprint = (box[2] - box[0]) * (box[3] - box[1])
-        if footprint / region_area > max_scene_fraction:
+        if footprint / region_area > max_scene_fraction or (
+            _touched_sides(measured, region) >= 2 and pixels / region_area > 0.25
+        ):
             warnings.append(
                 "Rejected a Logitech object mask spanning the wall or floor; "
                 "restrict its region to the garbage-bin opening"
             )
+            reasons.append("mask_spans_roi_border")
             continue
         retained.append(Detection(
             label=detected.label,
@@ -165,6 +230,18 @@ def bound_logitech_detections(
             color=object_color(frame, measured, baseline=baseline, label=detected.label,
                                foreground_threshold=foreground_threshold),
         ))
+    if debug is not None:
+        final = np.zeros(frame.shape[:2], dtype=bool)
+        for item in retained:
+            final |= item.mask
+        debug.update({
+            "detector": detector_union,
+            "foreground": np.zeros(frame.shape[:2], dtype=bool) if changed is None else changed,
+            "final": final,
+            "rejected": detector_union & ~final,
+            "reasons": reasons,
+            "final_mask_valid": bool(retained),
+        })
     unique: list[Detection] = []
     # Nested open-vocabulary prompts often label one cardboard box several times.
     # Start with the tighter object footprint so the surrounding wall cannot win.
