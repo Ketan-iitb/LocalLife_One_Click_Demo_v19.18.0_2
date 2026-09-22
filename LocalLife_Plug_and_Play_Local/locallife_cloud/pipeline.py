@@ -2792,7 +2792,7 @@ class VisionPipeline:
         for detection in detections:
             if detection.track_id is None or detection.track_id in self._csv_logged:
                 continue
-            if detection.realsense_volume_l is None or _is_phantom_detection(detection):
+            if self._detection_volume(detection) is None or _is_phantom_detection(detection):
                 continue
             if not self._is_settled(detection.track_id):
                 continue
@@ -2882,7 +2882,8 @@ class VisionPipeline:
             "sorting_status": detection.sorting_status,
             "material": detection.material,
             "material_confidence": round(float(detection.material_confidence), 4),
-            "volume_l": detection.realsense_volume_l,
+            # Each camera's own volume: Logitech's lives in monocular_volume_l.
+            "volume_l": self._detection_volume(detection),
             "added_volume_l": detection.added_volume_l,
             "displaced_volume_l": detection.displaced_volume_l,
             "volume_before_l": detection.volume_before_l,
