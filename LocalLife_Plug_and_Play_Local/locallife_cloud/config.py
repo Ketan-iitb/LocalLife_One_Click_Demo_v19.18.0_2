@@ -111,7 +111,28 @@ DEFAULT_GEOMETRY_VALIDATION_PROMPTS = tuple(dict.fromkeys((
     "package",
     "book",
     "toy",
+    # Electronics and electrical items: absent from the bank, so a charger or a
+    # pair of headphones could only be named as something it is not.
+    "headphones", "earphones", "headset", "charger", "power adapter",
+    "charging cable", "electrical cable", "mobile phone", "laptop",
+    "computer mouse", "keyboard", "remote control", "battery", "circuit board",
+    "electronic device", "light bulb", "LED bulb", "lamp", "table lamp",
+    "torch", "flashlight", "electric drill", "power drill", "power tool",
+    # Household and personal objects.
+    "handbag", "shoe", "clothing", "textile", "painting", "picture frame",
+    "framed artwork", "decorative object", "cosmetic bottle", "cream bottle",
+    "glass bottle", "aluminium can", "metal can", "food container", "jar",
+    "cup", "packet", "wrapper", "milk carton", "beverage carton",
+    # Parent categories: a truthful fallback when the specific name is weak.
+    "packaging object", "electronic item", "electrical item", "textile item",
+    "rigid household object", "flexible household object", "unknown deposited object",
 )))
+
+# Scene classes the detector may name so it can reject them, never measure them.
+BACKGROUND_PROMPTS = (
+    "floor", "mat", "carpet", "sofa", "chair", "table", "furniture", "wall",
+    "foot", "hand", "person", "shadow", "empty background", "permanent fixture",
+)
 
 # Scene/background classes must not become measurement objects in validation
 # mode.  Hands and people are also excluded so placing/removing a reference
@@ -119,15 +140,15 @@ DEFAULT_GEOMETRY_VALIDATION_PROMPTS = tuple(dict.fromkeys((
 GEOMETRY_VALIDATION_REJECT_LABELS = frozenset({
     "person", "hand", "foot", "floor", "wall", "ceiling", "door", "window",
     "curtain", "drape", "rug", "floor mat", "carpet", "table", "desk",
-    "chair", "sofa", "couch", "bed", "furniture", "power cable", "power adapter",
-    "power strip", "charger",
+    "chair", "sofa", "couch", "bed", "furniture", "power strip",
+    "empty background", "permanent fixture", "shadow", "mat",
     "unknown", "unclassified object", "foreground object",
 })
 GEOMETRY_VALIDATION_REJECT_WORDS = frozenset({
     "person", "people", "human", "hand", "hands", "foot", "feet",
     "floor", "wall", "ceiling", "door", "window", "curtain", "drape",
     "rug", "carpet", "table", "desk", "chair", "sofa", "couch", "bed",
-    "furniture", "cable", "adapter", "charger",
+    "furniture", "shadow", "fixture",
 })
 
 
@@ -325,6 +346,9 @@ class AppConfig:
     logitech_min_object_height_m: float = 0.010
     # Support-plane cell size for the Logitech height map (metres).
     logitech_height_map_cell_m: float = 0.005
+    # Pixels trimmed from the Logitech mask before volume only: monocular depth
+    # bleeds across an object's rim, and that rim is floor.
+    logitech_volume_erode_px: int = 2
     # A confirmed object that has not settled after this many frames is
     # recorded once as rejected (unstable_volume / no_valid_measurement).
     finalise_max_frames: int = 45
@@ -648,6 +672,8 @@ class AppConfig:
             logitech_detector_confidence=float(os.environ.get(
                 "LOCALLIFE_LOGITECH_DETECTOR_CONFIDENCE",
                 os.environ.get("LOCALLIFE_DETECTOR_CONFIDENCE", defaults.logitech_detector_confidence))),
+            logitech_volume_erode_px=int(os.environ.get(
+                "LOCALLIFE_LOGITECH_VOLUME_ERODE_PX", defaults.logitech_volume_erode_px)),
             logitech_height_map_cell_m=float(os.environ.get(
                 "LOCALLIFE_LOGITECH_HEIGHT_MAP_CELL_M", defaults.logitech_height_map_cell_m)),
             logitech_min_object_height_m=float(os.environ.get(

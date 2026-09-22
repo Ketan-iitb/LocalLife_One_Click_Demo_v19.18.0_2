@@ -95,9 +95,11 @@ class Detection:
     # Set when the detector's class and the material classifier disagree (a
     # folded cloth called "cardboard box"): reported, and geometry is not forced.
     classification_note: str | None = None
-    # Set when the detector's class and the material classifier disagree (a
-    # folded cloth called "cardboard box"): reported, and geometry is not forced.
-    classification_note: str | None = None
+    # One canonical name per physical thing, or its parent category when the
+    # detector's specific guess is weak (vocabulary.py). Geometry ignores it.
+    canonical_type: str | None = None
+    # Logitech: the geometric volume before the frozen empirical factor.
+    raw_volume_l: float | None = None
     depth_coverage_percent: float | None = None
     volume_uncertainty_l: float | None = None
     measurement_method: str | None = None
@@ -173,7 +175,8 @@ class Detection:
             "volume_rejection_reason": self.volume_rejection_reason,
             "stable_volume_l": self.stable_volume_l,
             "classification_note": self.classification_note,
-            "classification_note": self.classification_note,
+            "canonical_type": self.canonical_type,
+            "raw_volume_l": self.raw_volume_l,
             "depth_coverage_percent": self.depth_coverage_percent,
             "volume_uncertainty_l": self.volume_uncertainty_l,
             "measurement_method": self.measurement_method,
