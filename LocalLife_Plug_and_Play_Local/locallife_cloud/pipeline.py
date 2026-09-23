@@ -49,6 +49,7 @@ from .storage import ResultStore
 from .tracking import ObjectTracker
 from .box_templates import load_box_templates, match_box_template
 from .logitech_calibration import RELATIVE_ONLY_MESSAGE, LogitechCalibrationStore, LogitechLens, depth_output_kind
+from .coordinates import clip_to_region, frame_consistency
 from .logitech_factor import LogitechVolumeFactors, geometry_group
 from .logitech_volume import fit_plane_alignment, metric_object_volume, stable_volume
 from .vocabulary import object_type as canonical_object_type
@@ -572,6 +573,8 @@ class VisionPipeline:
         self.depth_load_error: str | None = None
         # Why a stored calibration was refused (camera moved, ROI or resolution changed).
         self.calibration_rejected_reason: str | None = None
+        # The other camera's intrinsics, so this one can refuse to use them.
+        self.peer_intrinsics: CameraIntrinsics | None = None
         self._depth_cache: tuple[float, np.ndarray] | None = None
         # Frames each confirmed track has waited for finalisation (non-waste modes).
         self._unfinalised_frames: dict[int, int] = {}
@@ -1103,6 +1106,11 @@ class VisionPipeline:
 
         if self.camera_id == "logitech":
             mask_debug: dict[str, Any] = {}
+            depth_change = None
+            if calibrated_prediction is not None and self.reference_monocular is not None \
+                    and calibrated_prediction.shape == self.reference_monocular.shape:
+                rise = self.reference_monocular.astype(np.float32) - calibrated_prediction
+                depth_change = np.isfinite(rise) & (rise >= self.config.logitech_min_object_height_m)
             detections, segmentation_warnings = bound_logitech_detections(
                 frame,
                 self.reference_rgb,
@@ -1113,6 +1121,7 @@ class VisionPipeline:
                 max_scene_fraction=self.config.logitech_max_scene_fraction,
                 max_expansion=self.config.logitech_max_mask_expansion,
                 duplicate_overlap=self.config.logitech_duplicate_overlap,
+                depth_change=depth_change,
                 debug=mask_debug,
             )
             self.logitech_mask_debug = {"frame": frame, **mask_debug}
@@ -1767,7 +1776,24 @@ class VisionPipeline:
                 and detection.source != DETECTOR_ONLY_SOURCE
             ):
                 if self.camera_id == "logitech":
-                    volume_mask = instance_mask
+                    volume_mask = clip_to_region(instance_mask, bin_region)
+                    problems = frame_consistency(
+                        frame, volume_mask, calibrated_prediction, intrinsics,
+                        region=bin_region,
+                        foreign_intrinsics=self.peer_intrinsics,
+                    )
+                    # Sharing one estimated matrix between two cameras at the
+                    # same resolution is legal; measuring with a mask or depth
+                    # map from another coordinate system is not.
+                    blocking = [item for item in problems
+                                if item != "intrinsics_belong_to_the_other_camera"]
+                    if blocking:
+                        detection.volume_rejection_reason = blocking[0]
+                        self.last_logitech_volume_diagnostics = {
+                            "reason": blocking[0], "coordinate_problems": problems,
+                            "label": detection.label,
+                        }
+                        continue
                     if self.config.logitech_volume_erode_px > 0:
                         # Classification keeps the full mask; volume uses the
                         # core, because the rim pixel is floor at object depth.
@@ -3063,6 +3089,23 @@ class VisionPipeline:
         result = self.event_log.record(row)
         if result.written:
             self.stage_counters["finalised_measurements"] += 1
+        if self.camera_id == "logitech" and result.ok and not result.duplicate:
+            # A side-car for the accuracy benchmark, keyed by measurement id.
+            # The measurement CSV and its schema are deliberately untouched.
+            self.store.append_jsonl("logitech_raw_volumes.jsonl", {
+                "measurement_id": result.event_id,
+                "timestamp": row.get("timestamp"),
+                "object_type": row.get("object_type"),
+                "raw_volume_l": detection.raw_volume_l,
+                "corrected_volume_l": detection.monocular_volume_l,
+                "stable_volume_l": detection.stable_volume_l,
+                "empirical_factor": (self.last_logitech_volume_diagnostics or {}).get("empirical_factor"),
+                "geometry_method": None if detection.shape_geometry is None
+                else detection.shape_geometry.geometry_method,
+                "length_mm": detection.footprint_length_mm,
+                "width_mm": detection.footprint_width_mm,
+                "height_mm": detection.physical_height_mm,
+            })
         if self.diagnostics.enabled and not result.duplicate:
             context = self._frame_context
             self.diagnostics.record_measurement(
@@ -3443,8 +3486,6 @@ class VisionPipeline:
             # Depth predictions are resampled to the frame, so a fit made at a
             # different resolution does not describe this crop.
             self.calibration_rejected_reason = "resolution_changed_recalibrate_empty_scene"
-            return None
-        if calibration.inverse != (depth_output_kind(self.config.depth_model) != "metric"):
             return None
         if calibration.roi is not None and tuple(calibration.roi) != tuple(self.config.roi):
             # The fit belongs to the region it was measured over.

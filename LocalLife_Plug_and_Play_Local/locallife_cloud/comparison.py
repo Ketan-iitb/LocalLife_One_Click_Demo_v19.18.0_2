@@ -188,6 +188,9 @@ class DualCameraCoordinator:
             expected_cameras=expected,
         )
         self.attach_paired_listeners()
+        # Each station knows the other's geometry only so it can refuse to
+        # measure with it (coordinates.frame_consistency).
+        self.pipelines["logitech"].peer_intrinsics = self.pipelines["realsense"].latest_intrinsics
         # Recipe pipeline (pointcloud_volume.py / recipe_*.py): a separate,
         # additive result -- see config.recipe_enabled's own comment for why
         # it defaults off and why it is loaded/cached lazily rather than
@@ -350,6 +353,8 @@ class DualCameraCoordinator:
             peer_box = semantic_box_presence.get(peer_id, False) or bool(
                 peer_box_seen_at is not None and time.monotonic() - peer_box_seen_at <= 2.5
             )
+            if camera_id == "logitech":
+                self.pipelines["logitech"].peer_intrinsics = self.pipelines["realsense"].latest_intrinsics
             results[camera_id] = self.camera(camera_id).process_precomputed(
                 packet["frame"],
                 detections=detections,
