@@ -47,11 +47,20 @@ import numpy as np
 from .footprint import _column_fill_ratio, _fit_circle
 
 CUBOID = "cuboid"
+SPHERE = "sphere"
+HEMISPHERE = "hemisphere"
+ELLIPSOID = "ellipsoid"
+CONE = "cone"
 CYLINDER = "cylinder"
 IRREGULAR_RIGID = "irregular_rigid"
 FLEXIBLE_OR_UNKNOWN = "flexible_or_unknown"
 UNCERTAIN = "uncertain"
-GEOMETRY_METHODS = (CUBOID, CYLINDER, IRREGULAR_RIGID, FLEXIBLE_OR_UNKNOWN)
+GEOMETRY_METHODS = (CUBOID, CYLINDER, SPHERE, HEMISPHERE, ELLIPSOID, CONE,
+                    IRREGULAR_RIGID, FLEXIBLE_OR_UNKNOWN)
+# An analytic formula only replaces the integrated height map when the two
+# agree this closely; otherwise the integral is what the object actually
+# occupies and the analytic value stays a diagnostic.
+MAX_ANALYTIC_DISAGREEMENT = 0.35
 
 # Label words that only change how an irregular volume is *described*. They
 # never select cuboid or cylinder: that needs the geometry to agree.
@@ -438,14 +447,18 @@ def measure_shape(
     # normal, so the circle is fitted in the footprint plane -- to the outline
     # of a filled disc, or to every point of a thin shell -- and the height is
     # measured along that axis.
+    # A cylinder's visible end is flat. A round footprint under a *rounded*
+    # top is a dome or a cone, and calling it a cylinder over-counted it by
+    # about half, so the flat-top evidence is part of the test.
+    flat_enough = flat_top >= FLAT_TOP_MIN or (profile is not None and profile >= CURVED_PROFILE_MAX)
     disc = aspect >= 0.85 and DISC_FILL_RANGE[0] <= rect_fill <= DISC_FILL_RANGE[1] and residual is not None \
-        and residual <= MAX_CIRCLE_RESIDUAL
+        and residual <= MAX_CIRCLE_RESIDUAL and flat_enough
     shell = column_fill < 0.55 and aspect < 0.85
     words = set(label.lower().replace("_", " ").replace("-", " ").split())
     # A labelled can/bottle seen obliquely shows its top disc plus the front
     # shell, whose projection lands on the same circle: the union is a disc
     # that need not pass the strict disc test, so the label admits the fit.
-    labelled = bool(words & _CYLINDER_WORDS) and aspect >= 0.6
+    labelled = bool(words & _CYLINDER_WORDS) and aspect >= 0.6 and flat_enough
     # Height along the vertical axis: the near-top of the points, not the p95
     # used for general objects (a side-seen shell is uniform in height).
     # A side-seen shell has uniformly spread heights (no plateau), so its top
@@ -479,6 +492,16 @@ def measure_shape(
             if fitted is not None:
                 return fitted
 
+    # Domes and cones: a rounded top over a round or oval footprint. The mean
+    # height over the footprint tells them apart -- 1 for a flat top, about
+    # 2/3 for a hemisphere or ellipsoid cap, about 1/3 for a cone -- and the
+    # analytic value is only used when it agrees with the integral.
+    dome = None if words & _FLEXIBLE_WORDS else _dome_geometry(
+        footprint, heights, length_m, width_m, top_m, rect_fill, aspect, mesh, points, features,
+    )
+    if dome is not None:
+        return dome
+
     # Cuboid: a filled rectangle with a flat top.
     if (rect_fill >= RECT_FILL_MIN and flat_top >= FLAT_TOP_MIN and column_fill >= 0.55
             and (profile is None or profile >= CURVED_PROFILE_MAX)):
@@ -503,6 +526,67 @@ def measure_shape(
         flags=("height_map_integral",) + (() if mesh <= bbox_l * 1.05 else ("mesh_exceeds_bounding_box",)) + rejected,
         rejection_reason=cylinder_rejection[0] if cylinder_rejection else None,
         **base,
+    )
+
+
+def _dome_geometry(
+    footprint: np.ndarray,
+    heights: np.ndarray,
+    length_m: float,
+    width_m: float,
+    top_m: float,
+    rect_fill: float,
+    aspect: float,
+    mesh: float | None,
+    points: int,
+    features: dict[str, float],
+) -> ShapeGeometry | None:
+    """Sphere, hemisphere, ellipsoid cap or cone, when the points support it.
+
+    Rigid objects only: a bag or a pillow also mounds into a dome, but its
+    volume is what it currently occupies, not a fitted solid (see the
+    flexible branch below).
+    """
+    if rect_fill < DISC_FILL_RANGE[0] or rect_fill > 0.95 or top_m <= 0:
+        return None
+    semi_major, semi_minor = length_m / 2.0, width_m / 2.0
+    fill = float(np.mean(heights)) / top_m           # 1 flat, ~2/3 dome, ~1/3 cone
+    features["height_fill_ratio"] = fill
+    radius = 0.5 * (semi_major + semi_minor)
+    round_footprint = aspect >= 0.85
+    integral = None if mesh is None else mesh
+    if 0.55 <= fill <= 0.80:
+        if round_footprint and abs(top_m - 2.0 * radius) <= 0.25 * radius:
+            method, volume = SPHERE, 4.0 / 3.0 * math.pi * radius ** 3
+            parameters = {"radius_mm": radius * 1000.0}
+        elif round_footprint and abs(top_m - radius) <= 0.35 * radius:
+            method, volume = HEMISPHERE, 2.0 / 3.0 * math.pi * radius ** 3
+            parameters = {"radius_mm": radius * 1000.0}
+        else:
+            method = ELLIPSOID
+            volume = 2.0 / 3.0 * math.pi * semi_major * semi_minor * top_m
+            parameters = {"semi_axis_a_mm": semi_major * 1000.0, "semi_axis_b_mm": semi_minor * 1000.0}
+    elif round_footprint and 0.25 <= fill <= 0.45 and top_m >= radius:
+        # A cone's p95 height sits at 0.78 of its apex (the tip is a few
+        # pixels), so the apex comes from the near-maximum instead.
+        apex = float(np.percentile(heights, 99.5))
+        method, volume = CONE, math.pi * radius ** 2 * apex / 3.0
+        parameters = {"radius_mm": radius * 1000.0, "apex_mm": apex * 1000.0}
+        top_m = apex
+    else:
+        return None
+    litres = _litres(volume)
+    if integral is not None and abs(litres - integral) > MAX_ANALYTIC_DISAGREEMENT * max(integral, 1e-6):
+        return None
+    confidence = float(np.clip(0.75 - abs(fill - (0.667 if method != CONE else 0.333)), 0.05, 0.9))
+    return ShapeGeometry(
+        geometry_method=method, geometry_confidence=confidence,
+        length_mm=length_m * 1000.0, width_mm=width_m * 1000.0, height_mm=top_m * 1000.0,
+        bounding_box_volume_litres=_litres(length_m * width_m * top_m),
+        mesh_volume_litres=mesh, selected_volume_litres=litres,
+        volume_meaning=f"{method}_analytic_volume", fit_confidence=confidence,
+        points=points, features={**features, **{key: value / 1000.0 for key, value in parameters.items()}},
+        flags=("analytic_shape_agrees_with_height_map",),
     )
 
 
