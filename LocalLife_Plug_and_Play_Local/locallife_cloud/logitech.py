@@ -148,6 +148,7 @@ def bound_logitech_detections(
     max_scene_fraction: float = 0.45,
     max_expansion: float = 2.0,
     duplicate_overlap: float = 0.55,
+    depth_change: np.ndarray | None = None,
     debug: dict | None = None,
 ) -> tuple[list[Detection], list[str]]:
     """The deposited object's own pixels: detector mask AND changed-vs-empty AND ROI.
@@ -168,6 +169,11 @@ def bound_logitech_detections(
     """
     region_area = max(1, int(np.count_nonzero(region)))
     changed = _foreground_change(frame, baseline, region, detections, foreground_threshold)
+    if depth_change is not None and depth_change.shape == region.shape:
+        # An object the same colour as the floor still stands above it: the
+        # height change against the empty reference is the second witness.
+        depth_change = depth_change.astype(bool) & region
+        changed = depth_change if changed is None else (changed | depth_change)
     detector_only = 0
     if changed is not None:
         changed = _open(changed)
@@ -231,6 +237,9 @@ def bound_logitech_detections(
         best_component = None
         best_overlap = 0
         for component in components:
+            if _touched_sides(component, region) >= 3:
+                # A blob that reaches three sides of the ROI is the floor.
+                continue
             overlap = int(np.count_nonzero(component & core))
             if overlap > best_overlap and overlap >= max(10, int(core_area * 0.12)):
                 best_component, best_overlap = component, overlap
