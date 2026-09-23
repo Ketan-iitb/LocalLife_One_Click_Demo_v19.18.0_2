@@ -349,6 +349,10 @@ class AppConfig:
     # Pixels trimmed from the Logitech mask before volume only: monocular depth
     # bleeds across an object's rim, and that rim is floor.
     logitech_volume_erode_px: int = 2
+    # A confirmed Logitech track waits this many frames for a stable volume;
+    # after that the median of what it has is finalised rather than staying
+    # pending for ever.
+    logitech_measurement_timeout_frames: int = 12
     # A confirmed object that has not settled after this many frames is
     # recorded once as rejected (unstable_volume / no_valid_measurement).
     finalise_max_frames: int = 45
@@ -672,6 +676,8 @@ class AppConfig:
             logitech_detector_confidence=float(os.environ.get(
                 "LOCALLIFE_LOGITECH_DETECTOR_CONFIDENCE",
                 os.environ.get("LOCALLIFE_DETECTOR_CONFIDENCE", defaults.logitech_detector_confidence))),
+            logitech_measurement_timeout_frames=int(os.environ.get(
+                "LOCALLIFE_LOGITECH_MEASUREMENT_TIMEOUT_FRAMES", defaults.logitech_measurement_timeout_frames)),
             logitech_volume_erode_px=int(os.environ.get(
                 "LOCALLIFE_LOGITECH_VOLUME_ERODE_PX", defaults.logitech_volume_erode_px)),
             logitech_height_map_cell_m=float(os.environ.get(
