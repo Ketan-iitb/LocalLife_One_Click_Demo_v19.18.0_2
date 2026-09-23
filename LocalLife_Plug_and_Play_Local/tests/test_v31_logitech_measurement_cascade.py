@@ -191,6 +191,81 @@ class MeasurementCascadeTests(unittest.TestCase):
             self.assertIsNotNone(result.detections[0].track_id)
 
 
+class RestoredCalibrationWithoutBaselineTests(unittest.TestCase):
+    """The reported hardware state: a calibration object exists, nothing else does."""
+
+    def _restored(self, directory: str, **overrides):
+        from locallife_cloud.types import DepthCalibration
+
+        manager, _, frame, camera = _station(directory, **overrides)
+        logitech = manager.camera("logitech")
+        # What a restored profile leaves behind: a calibration, and no empty
+        # scene reference, no support plane.
+        logitech.calibration = DepthCalibration(
+            scale=1.0, offset_m=0.0, rmse_m=0.0, sample_pixels=1000,
+            method="model-metric-unverified",
+        )
+        logitech.calibration_mode = "model-metric-unverified"
+        logitech.reference_monocular = None
+        logitech.reference_plane = None
+        return manager, logitech, frame, camera
+
+    def test_a_restored_calibration_without_a_baseline_still_measures(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager, logitech, frame, camera = self._restored(directory)
+            detection = _run(logitech, frame, camera).detections[0]
+            self.assertIsNotNone(logitech.calibration)          # the state that used to block
+            self.assertIsNone(logitech.reference_monocular)
+            for value in (detection.monocular_volume_l, detection.footprint_length_mm,
+                          detection.footprint_width_mm, detection.physical_height_mm,
+                          detection.height_above_baseline_cm):
+                self.assertIsNotNone(value)
+                self.assertGreater(value, 0)
+                self.assertTrue(np.isfinite(value))
+            self.assertIn(detection.calibration_mode,
+                          ("reference-distance-estimate", "uncalibrated-estimate"))
+            self.assertIn(detection.measurement_quality,
+                          ("reference-distance-estimate", "uncalibrated-estimate",
+                           "median-after-stability-timeout"))
+            reason = logitech._pending_measurement_reason(detection, depth_m=None, intrinsics=camera)
+            self.assertNotIn("pending", reason)
+            self.assertNotIn("empty-baseline", reason)
+            status = logitech.state()["volume_status"]
+            self.assertNotIn("pending", (status["message"] or "").lower())
+
+    def test_a_restored_calibration_with_a_measured_distance_uses_mode_2(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager, logitech, frame, camera = self._restored(
+                directory, logitech_reference_distance_m=1.5)
+            detection = _run(logitech, frame, camera).detections[0]
+            self.assertEqual(detection.calibration_mode, "reference-distance-estimate")
+            self.assertGreater(detection.monocular_volume_l, 0)
+
+    def test_a_calibration_for_another_resolution_falls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager, logitech, frame, camera = self._restored(directory)
+            logitech.calibration_rejected_reason = "resolution_changed_recalibrate_empty_scene"
+            detection = _run(logitech, frame, camera).detections[0]
+            self.assertIsNotNone(detection.monocular_volume_l)
+            self.assertIn(detection.calibration_mode,
+                          ("reference-distance-estimate", "uncalibrated-estimate"))
+
+    def test_the_provisional_result_survives_tracking_and_serialisation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager, logitech, frame, camera = self._restored(directory)
+            _run(logitech, frame, camera, frames=8)
+            state = logitech.state()
+            payload = state["latest"]["detections"][0]
+            self.assertIsNotNone(payload["monocular_volume_l"])
+            self.assertGreater(payload["monocular_volume_l"], 0)
+            self.assertIsNotNone(payload["dimensions_mm"])
+            self.assertGreater(payload["dimensions_mm"]["height"], 0)
+            self.assertIsNotNone(payload["height_above_baseline_cm"])
+            self.assertEqual(payload["track_id"], 1)
+            self.assertEqual(payload["label"], "cosmetic bottle")
+            self.assertEqual(payload["color"], "red")
+
+
 class ProtectedFilesTests(unittest.TestCase):
     def test_realsense_geometry_csv_and_cloud_are_unchanged_since_v30(self) -> None:
         protected = [

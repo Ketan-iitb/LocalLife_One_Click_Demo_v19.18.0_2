@@ -1115,16 +1115,30 @@ class VisionPipeline:
         # Missing intrinsics fall back to the configured field of view, so a
         # tracked object is never left without geometry to measure it with.
         measure_intrinsics = intrinsics or self.latest_intrinsics
+        # Whether the *whole* calibrated chain can actually run -- not merely
+        # whether a calibration object exists. A restored profile whose
+        # monocular reference or support plane is missing has a calibration and
+        # still cannot measure, which is what left every object pending.
+        full_metric_ready = self._full_metric_ready(calibrated_prediction, measure_intrinsics)
         uncalibrated_logitech = (
-            self.camera_id == "logitech" and self.calibration is None and predicted_depth is not None
+            self.camera_id == "logitech" and predicted_depth is not None and not full_metric_ready
+            # The hard mounting-tilt limit is a safety rule, not a calibration
+            # step: past it the bin floor is barely visible and no mode may
+            # report litres.
+            and not self._logitech_tilt_invalid()
         )
         if uncalibrated_logitech:
             if measure_intrinsics is None:
                 measure_intrinsics = self._field_of_view_intrinsics(frame.shape)
-            plane_values = predicted_depth[bin_region & np.isfinite(predicted_depth) & (predicted_depth > 0.1)]
+            source_depth = (
+                calibrated_prediction
+                if calibrated_prediction is not None and calibrated_prediction.shape == predicted_depth.shape
+                else predicted_depth
+            )
+            plane_values = source_depth[bin_region & np.isfinite(source_depth) & (source_depth > 0.1)]
             uncalibrated_logitech = measure_intrinsics is not None and plane_values.size >= 100
             if uncalibrated_logitech:
-                calibrated_prediction = predicted_depth
+                calibrated_prediction = source_depth
                 measured_distance = self.config.logitech_reference_distance_m
                 plane_distance = measured_distance if measured_distance > 0 else float(np.median(plane_values))
                 self._uncalibrated_plane = axis_aligned_plane(measure_intrinsics, plane_distance)
@@ -1938,7 +1952,12 @@ class VisionPipeline:
                         detection.depth_coverage_percent = round(individual_mono.coverage_ratio * 100, 1)
                         detection.volume_uncertainty_l = round(individual_mono.uncertainty_l, 6)
                         detection.measurement_method = "logitech-depth-anything-v2"
-                        detection.measurement_quality = individual_mono.quality
+                        # A provisional mode keeps its own name here: the
+                        # dashboard, the row and the operator all need to see
+                        # that this number is an estimate, not a calibration.
+                        detection.measurement_quality = (
+                            self.calibration_mode if uncalibrated_logitech else individual_mono.quality
+                        )
                         detection.calibration_mode = self.calibration_mode
                     foreground_fraction = individual_mono.valid_pixels / max(1, individual_mono.candidate_pixels)
                     if foreground_fraction < self.config.minimum_foreground_fraction:
@@ -2559,7 +2578,15 @@ class VisionPipeline:
         else:
             if self.depth_estimator is None:
                 return "unavailable-depth-anything-not-loaded"
-            if self.calibration is None and self.latest_monocular_depth is not None:
+            if self._detection_volume(detection) is not None:
+                # A numeric result is never described as pending.
+                return detection.measurement_quality or self.calibration_mode or "measured"
+            if self.latest_monocular_depth is not None and not self._full_metric_ready(
+                self.latest_monocular_depth, self.latest_intrinsics or self._field_of_view_intrinsics(
+                    (0, 0) if self.latest_frame is None else self.latest_frame.shape)
+            ):
+                # The provisional cascade can run, so the object is measured by
+                # it rather than waiting for a baseline that may never come.
                 return self.calibration_mode if self.calibration_mode in (
                     "reference-distance-estimate", "uncalibrated-estimate") else "uncalibrated-estimate"
             if self.latest_monocular_depth is None and self.reference_monocular is None:
@@ -3526,6 +3553,28 @@ class VisionPipeline:
                 detection.realsense_volume_l = None
             detection.volume_rejection_reason = shape.rejection_reason
 
+    def _full_metric_ready(
+        self, calibrated_depth: np.ndarray | None, intrinsics: CameraIntrinsics | None,
+    ) -> bool:
+        """Can the calibrated Logitech path actually produce a measurement?
+
+        Every prerequisite it dereferences, checked together: a calibration
+        that survived the resolution/ROI checks, intrinsics, the empty-scene
+        monocular reference at this frame's shape, and a usable support plane.
+        """
+        if self.camera_id != "logitech":
+            return True
+        return bool(
+            self.calibration is not None
+            and self.calibration_rejected_reason is None
+            and calibrated_depth is not None
+            and intrinsics is not None
+            and self.reference_monocular is not None
+            and self.reference_monocular.shape == calibrated_depth.shape
+            and self.reference_plane is not None
+            and self.reference_plane.coefficients is not None
+        )
+
     def _field_of_view_intrinsics(self, shape: tuple[int, ...]) -> CameraIntrinsics | None:
         """Intrinsics from the configured field of view, for a camera that sends none.
 
@@ -3783,7 +3832,8 @@ class VisionPipeline:
             return True
         if (
             self.config.logitech_require_reference
-            and self.calibration_mode not in ("independent-measured-distance", "uncalibrated-estimate")
+            and self.calibration_mode not in (
+                "independent-measured-distance", "uncalibrated-estimate", "reference-distance-estimate")
             and not self.config.logitech_allow_provisional_metric
         ):
             return False
