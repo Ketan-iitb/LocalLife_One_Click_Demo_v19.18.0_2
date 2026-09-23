@@ -355,20 +355,26 @@ class DualCameraCoordinator:
             )
             if camera_id == "logitech":
                 self.pipelines["logitech"].peer_intrinsics = self.pipelines["realsense"].latest_intrinsics
-            results[camera_id] = self.camera(camera_id).process_precomputed(
-                packet["frame"],
-                detections=detections,
-                predicted_depth=predicted_by_camera[camera_id],
-                depth_m=packet.get("depth_m"),
-                intrinsics=packet.get("intrinsics"),
-                source=str(packet.get("source", "live")),
-                timestamp=packet.get("timestamp"),
-                inference_ms=elapsed_ms,
-                persist=bool(packet.get("persist", True)),
-                peer_bag_present=peer_present,
-                peer_box_present=peer_box,
-            )
-        return results
+            try:
+                results[camera_id] = self.camera(camera_id).process_precomputed(
+                    packet["frame"],
+                    detections=detections,
+                    predicted_depth=predicted_by_camera[camera_id],
+                    depth_m=packet.get("depth_m"),
+                    intrinsics=packet.get("intrinsics"),
+                    source=str(packet.get("source", "live")),
+                    timestamp=packet.get("timestamp"),
+                    inference_ms=elapsed_ms,
+                    persist=bool(packet.get("persist", True)),
+                    peer_bag_present=peer_present,
+                    peer_box_present=peer_box,
+                )
+            except Exception:  # noqa: BLE001
+                # One camera's failure must never take the other's frame with
+                # it, and must never clear its tracks.
+                LOGGER.exception("%s frame processing failed", camera_id)
+                results[camera_id] = None
+        return {key: value for key, value in results.items() if value is not None}
 
     def automatic_empty_setup(self, logitech_distance_m: float | None = None) -> dict[str, Any]:
         """Capture both reusable empty-scene profiles in one coordinated action."""

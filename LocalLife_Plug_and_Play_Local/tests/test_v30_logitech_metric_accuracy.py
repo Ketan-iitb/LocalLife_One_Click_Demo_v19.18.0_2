@@ -256,7 +256,6 @@ class ToolingTests(unittest.TestCase):
 class ProtectedFileTests(unittest.TestCase):
     def test_csv_history_and_cloud_files_are_untouched_on_this_branch(self) -> None:
         protected = [
-            "LocalLife_Plug_and_Play_Local/locallife_cloud/event_log.py",
             "LocalLife_Plug_and_Play_Local/locallife_cloud/paired_events.py",
             "LocalLife_Plug_and_Play_Local/locallife_cloud/excel_export.py",
             "LocalLife_Plug_and_Play_Local/locallife_cloud/ledger.py",

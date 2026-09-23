@@ -414,7 +414,10 @@ class LogitechTrackingWithoutCalibrationTests(unittest.TestCase):
             self.assertIsNone(logitech.reference_rgb)
             self.assertEqual(len(set(ids)), 1)
             self.assertIsNotNone(ids[0])
-            self.assertIsNone(result.detections[0].monocular_volume_l)  # never measured from a detector-only mask
+            # V30 repair: without a baseline the object is still measured, as a
+            # clearly labelled uncalibrated estimate rather than nothing at all.
+            self.assertIsNotNone(result.detections[0].monocular_volume_l)
+            self.assertEqual(result.detections[0].calibration_mode, "uncalibrated-estimate")
             report = logitech.stage_report()
             counters = report["counters"]
             self.assertEqual(counters["frames_processed"], 4)
@@ -424,7 +427,7 @@ class LogitechTrackingWithoutCalibrationTests(unittest.TestCase):
             self.assertGreaterEqual(counters["confirmed_tracks_total"], 1)
             self.assertEqual(counters["active_tracks_last_frame"], 1)
             state = logitech.state()
-            self.assertTrue(state["volume_status"]["message"].startswith("Tracked — metric calibration required"))
+            self.assertIn("UNCALIBRATED ESTIMATE", state["volume_status"]["message"])
             # The RealSense station was never touched by any of this.
             self.assertEqual(manager.camera("realsense").stage_counters["frames_processed"], 0)
 

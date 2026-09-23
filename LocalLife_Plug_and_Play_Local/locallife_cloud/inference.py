@@ -56,19 +56,14 @@ def configure_torch(device: str) -> dict[str, Any]:
 def _resize_mask(mask: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     """Model-space mask in original frame pixels.
 
-    A plain resize stretches the detector's letterbox padding into the object
-    and widens it along the padded axis; `coordinates.restore_mask` removes the
-    padding first. Identical shapes (Ultralytics `retina_masks=True`) are the
-    common case and cost nothing.
+    Deliberately identical for both cameras: this is the shared detector's
+    path, and RealSense must behave exactly as it did before. The
+    letterbox-aware restoration (coordinates.restore_mask) is applied in the
+    Logitech station instead, where it can be wrong without costing the
+    benchmark camera anything.
     """
     if mask.shape == shape:
         return mask.astype(bool)
-    try:
-        from .coordinates import restore_mask
-
-        return restore_mask(mask, shape)
-    except ImportError:
-        pass
     try:
         import cv2
 

@@ -49,9 +49,9 @@ from .storage import ResultStore
 from .tracking import ObjectTracker
 from .box_templates import load_box_templates, match_box_template
 from .logitech_calibration import RELATIVE_ONLY_MESSAGE, LogitechCalibrationStore, LogitechLens, depth_output_kind
-from .coordinates import clip_to_region, frame_consistency
+from .coordinates import clip_to_region, frame_consistency, restore_mask
 from .logitech_factor import LogitechVolumeFactors, geometry_group
-from .logitech_volume import fit_plane_alignment, metric_object_volume, stable_volume
+from .logitech_volume import axis_aligned_plane, fit_plane_alignment, metric_object_volume, stable_volume
 from .vocabulary import object_type as canonical_object_type
 from .shape_geometry import CYLINDER, CYLINDER_REJECTIONS, UNCERTAIN, GeometryLock, ShapeGeometry, measure_shape
 from .types import BoxVolumeMeasurement, CameraIntrinsics, DepthCalibration, Detection, FrameAnalysis
@@ -576,6 +576,9 @@ class VisionPipeline:
         # The other camera's intrinsics, so this one can refuse to use them.
         self.peer_intrinsics: CameraIntrinsics | None = None
         self._depth_cache: tuple[float, np.ndarray] | None = None
+        # Support plane assumed from the ROI's own median depth while no
+        # empty-scene calibration exists (Logitech only).
+        self._uncalibrated_plane = None
         # Frames each confirmed track has waited for finalisation (non-waste modes).
         self._unfinalised_frames: dict[int, int] = {}
         # Detector / foreground / final / rejected masks of the latest Logitech
@@ -1104,6 +1107,21 @@ class VisionPipeline:
         for family in mis_sorted:
             warnings.append(f"MIS-SORT: a {family} object was detected; this bin does not accept it")
 
+        uncalibrated_logitech = (
+            self.camera_id == "logitech" and self.calibration is None and predicted_depth is not None
+            and intrinsics is not None
+        )
+        if uncalibrated_logitech:
+            # No empty baseline and no plane fit yet: the metric checkpoint's
+            # own output, with the ROI's median depth as the support plane, is
+            # still a usable estimate. It is reported as UNCALIBRATED, never
+            # stored as a calibrated result, and it keeps the demo running.
+            plane_values = predicted_depth[bin_region & np.isfinite(predicted_depth) & (predicted_depth > 0.1)]
+            uncalibrated_logitech = plane_values.size >= 100
+            if uncalibrated_logitech:
+                calibrated_prediction = predicted_depth
+                self._uncalibrated_plane = axis_aligned_plane(intrinsics, float(np.median(plane_values)))
+                self.calibration_mode = "uncalibrated-estimate"
         if self.camera_id == "logitech":
             mask_debug: dict[str, Any] = {}
             depth_change = None
@@ -1772,11 +1790,15 @@ class VisionPipeline:
                     self._apply_box_cuboid(detection, cuboid, warnings)
             detection.classification_note = classification_conflict(detection)
             if (
-                self.calibration is not None and logitech_ready and logitech_height_coherent
-                and detection.source != DETECTOR_ONLY_SOURCE
+                (self.calibration is not None or uncalibrated_logitech)
+                and (logitech_ready or uncalibrated_logitech) and logitech_height_coherent
+                # A detector-only mask is never measured as a calibrated
+                # result; in the uncalibrated mode it carries the estimate,
+                # which is labelled as such everywhere it appears.
+                and (detection.source != DETECTOR_ONLY_SOURCE or uncalibrated_logitech)
             ):
                 if self.camera_id == "logitech":
-                    volume_mask = clip_to_region(instance_mask, bin_region)
+                    volume_mask = clip_to_region(restore_mask(instance_mask, frame.shape[:2]), bin_region)
                     problems = frame_consistency(
                         frame, volume_mask, calibrated_prediction, intrinsics,
                         region=bin_region,
@@ -1805,8 +1827,12 @@ class VisionPipeline:
                         ) > 0
                         if int(np.count_nonzero(eroded)) >= self.config.logitech_min_object_pixels:
                             volume_mask = eroded
+                    plane_for_volume = measurement_plane
+                    if uncalibrated_logitech and (plane_for_volume is None
+                                                  or plane_for_volume.coefficients is None):
+                        plane_for_volume = self._uncalibrated_plane
                     result = metric_object_volume(
-                        calibrated_prediction, intrinsics, volume_mask, measurement_plane,
+                        calibrated_prediction, intrinsics, volume_mask, plane_for_volume,
                         reference_depth_m=self.reference_monocular,
                         measurement_mask=bin_region,
                         min_height_m=self.config.logitech_min_object_height_m,
@@ -1855,6 +1881,9 @@ class VisionPipeline:
                         "live_volume_l": None if result.measurement is None else round(result.measurement.liters, 6),
                         "stable_volume_l": detection.stable_volume_l,
                     }
+                    if uncalibrated_logitech and result.measurement is not None:
+                        detection.measurement_quality = "uncalibrated-estimate"
+                        detection.calibration_mode = "uncalibrated-estimate"
                     if result.reason is not None:
                         detection.volume_rejection_reason = result.reason
                     elif result.diagnostics.get("length_mm"):
@@ -2499,6 +2528,8 @@ class VisionPipeline:
         else:
             if self.depth_estimator is None:
                 return "unavailable-depth-anything-not-loaded"
+            if self.calibration is None and self.latest_monocular_depth is not None:
+                return "uncalibrated-estimate"
             if self.latest_monocular_depth is None and self.reference_monocular is None:
                 return "pending-monocular-depth"
             if self.reference_monocular is None:
@@ -3700,7 +3731,7 @@ class VisionPipeline:
             return True
         if (
             self.config.logitech_require_reference
-            and self.calibration_mode != "independent-measured-distance"
+            and self.calibration_mode not in ("independent-measured-distance", "uncalibrated-estimate")
             and not self.config.logitech_allow_provisional_metric
         ):
             return False
@@ -3723,11 +3754,16 @@ class VisionPipeline:
             if self.latest_intrinsics is None:
                 return {"ready": False, "code": "missing_intrinsics", "message": "Logitech lens calibration or field of view is missing"}
             if self.baseline_monocular is None:
-                return {"ready": False, "code": "missing_empty_baseline", "message": (
-                    "Tracked — metric calibration required (clear the view, then Calibrate Empty Logitech Scene)"
-                    if self.latest_analysis.detections
-                    else "Clear the Logitech view; automatic empty-scene setup is running"
-                )}
+                return {
+                    "ready": self.latest_monocular_depth is not None,
+                    "code": "uncalibrated_estimate" if self.latest_monocular_depth is not None
+                    else "missing_empty_baseline",
+                    "message": (
+                        "UNCALIBRATED ESTIMATE — capture the empty Logitech baseline for a calibrated result"
+                        if self.latest_monocular_depth is not None
+                        else "Clear the Logitech view; automatic empty-scene setup is running"
+                    ),
+                }
             if (
                 self.config.logitech_require_reference
                 and self.calibration_mode != "independent-measured-distance"

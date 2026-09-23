@@ -200,6 +200,7 @@ class MeasurementEventLog:
         self._last_error: str | None = None
         self._last_write_at: float | None = None
         self._seen: set[str] = set()
+        self._rotate_outdated_header()
         self._recover_existing_event_ids()
 
     def assert_writable(self) -> None:
@@ -249,6 +250,33 @@ class MeasurementEventLog:
         except (OSError, json.JSONDecodeError, ValueError):
             pass
         return "unknown-session"
+
+    def _rotate_outdated_header(self) -> None:
+        """Keep an older-schema file intact beside a new one.
+
+        Appending today's columns under yesterday's header shifts every later
+        field, which is what turned the dashboard's history into "Invalid Date
+        / local / realsense / False". The old file is renamed, never rewritten
+        or deleted, and a fresh one starts with the current header.
+        """
+        if not self.path.is_file():
+            return
+        try:
+            with self.path.open("r", encoding=CSV_ENCODING, newline="") as source:
+                header = next(csv.reader(source), None)
+        except OSError:
+            return
+        if header is None or header == self.COLUMNS:
+            return
+        archived = self.path.with_name(f"{self.path.stem}.before-{int(time.time())}{self.path.suffix}")
+        try:
+            self.path.replace(archived)
+        except OSError as exc:
+            LOGGER.error("Could not archive the previous-schema CSV %s: %s", self.path, exc)
+            return
+        LOGGER.warning(
+            "Measurement CSV schema changed; the previous file is kept as %s and a new one started", archived,
+        )
 
     def _recover_existing_event_ids(self) -> None:
         """Rebuild the idempotency set from what is already on disk.
