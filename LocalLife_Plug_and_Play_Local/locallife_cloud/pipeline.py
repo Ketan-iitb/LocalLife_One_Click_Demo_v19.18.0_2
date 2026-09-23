@@ -53,7 +53,8 @@ from .coordinates import clip_to_region, frame_consistency, restore_mask
 from .logitech_factor import LogitechVolumeFactors, geometry_group
 from .logitech_volume import axis_aligned_plane, fit_plane_alignment, metric_object_volume, stable_volume
 from .vocabulary import object_type as canonical_object_type
-from .shape_geometry import CYLINDER, CYLINDER_REJECTIONS, UNCERTAIN, GeometryLock, ShapeGeometry, measure_shape
+from .shape_geometry import (CYLINDER, CYLINDER_REJECTIONS, UNCERTAIN, GeometryLock,
+                             ObjectSignature, ShapeGeometry, measure_shape)
 from .types import BoxVolumeMeasurement, CameraIntrinsics, DepthCalibration, Detection, FrameAnalysis
 from .volume import (
     ReferencePlane,
@@ -384,6 +385,84 @@ def summarize_depth_signal(depth_m: np.ndarray | None) -> dict[str, Any]:
     }
 
 
+
+def _object_signature(detection: Detection, camera_id: str) -> ObjectSignature:
+    """A coarse identity for the detection this frame.
+
+    Track ids restart at 1 after a reset and are handed out again once a track
+    expires, so the shape frozen for one object could be returned for the next
+    one holding that id -- which is how a bottle's 89 x 89 x 181 mm reappeared
+    on a backpack, a carton and on background. The signature travels with the
+    frozen shape, and a different object starts its own measurement.
+    """
+    x1, y1, x2, y2 = (float(value) for value in detection.box)
+    width, height = max(x2 - x1, 1.0), max(y2 - y1, 1.0)
+    area = float(np.count_nonzero(detection.mask)) if detection.mask is not None else width * height
+    family = (detection.accepted_class or (detection.label or "").split()[-1:] or [""])[0]
+    return ObjectSignature(
+        camera=camera_id, label=str(family).lower(),
+        centre_x=(x1 + x2) / 2.0, centre_y=(y1 + y2) / 2.0,
+        area=max(area, 1.0), aspect=min(width, height) / max(width, height),
+    )
+
+
+def _tracked_component(mask: np.ndarray, box: tuple[int, int, int, int]) -> np.ndarray:
+    """Keep the island the tracked detection sits on.
+
+    Two objects that touch, or an object joined to the floor by a shadow,
+    arrive as one mask; integrating all of it reports their sum as this
+    object's volume. Only the component under the detection's own box is
+    measured -- the detector's mask itself is untouched.
+    """
+    import cv2
+
+    count, labels = cv2.connectedComponents(mask.astype(np.uint8), connectivity=8)
+    if count <= 2:
+        return mask
+    x1, y1, x2, y2 = (int(value) for value in box)
+    centre_y, centre_x = (y1 + y2) // 2, (x1 + x2) // 2
+    chosen = 0
+    if 0 <= centre_y < labels.shape[0] and 0 <= centre_x < labels.shape[1]:
+        chosen = int(labels[centre_y, centre_x])
+    if chosen == 0:
+        # The centre fell in a hole (a handle, a bottle's neck): take the
+        # island holding most of the box instead.
+        inside = labels[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
+        values, counts = np.unique(inside[inside > 0], return_counts=True)
+        if values.size == 0:
+            return mask
+        chosen = int(values[int(counts.argmax())])
+    return labels == chosen
+
+
+def _spans_the_background(mask: np.ndarray, region: np.ndarray | None) -> bool:
+    """Is this mask the room rather than an object placed in it?"""
+    pixels = int(np.count_nonzero(mask))
+    if pixels < 500:
+        return False
+    rows, columns = np.nonzero(mask)
+    if region is not None and np.any(region):
+        region_rows, region_columns = np.nonzero(region)
+        top, bottom = int(region_rows.min()), int(region_rows.max())
+        left, right = int(region_columns.min()), int(region_columns.max())
+        available = int(np.count_nonzero(region))
+    else:
+        top, left, available = 0, 0, mask.size
+        bottom, right = mask.shape[0] - 1, mask.shape[1] - 1
+    margin = max(2, int(0.01 * max(bottom - top, right - left)))
+    borders = sum((
+        int(rows.min()) <= top + margin, int(rows.max()) >= bottom - margin,
+        int(columns.min()) <= left + margin, int(columns.max()) >= right - margin,
+    ))
+    share = pixels / max(available, 1)
+    across = (int(columns.max()) - int(columns.min())) / max(right - left, 1)
+    down = (int(rows.max()) - int(rows.min())) / max(bottom - top, 1)
+    # Running off three sides of the measurement area, or reaching corner to
+    # corner across it, is what the floor, a wall and a sofa do -- an object
+    # standing in the area does neither.
+    return (borders >= 3 and share >= 0.5) or (across >= 0.9 and down >= 0.9 and share >= 0.3)
+
+
 class VisionPipeline:
     def __init__(
         self,
@@ -581,6 +660,9 @@ class VisionPipeline:
         self._uncalibrated_plane = None
         # Frames each track has waited for a stable volume (Logitech timeout).
         self._measurement_frames: dict[int, int] = {}
+        # What each live track looked like last frame, so a reused id cannot
+        # inherit the previous object's measurements (shape_geometry.py).
+        self._track_signatures: dict[int, ObjectSignature] = {}
         # Frames each confirmed track has waited for finalisation (non-waste modes).
         self._unfinalised_frames: dict[int, int] = {}
         # Detector / foreground / final / rejected masks of the latest Logitech
@@ -795,6 +877,7 @@ class VisionPipeline:
             self._box_measurement_history.clear()
             self._box_frames_considered.clear()
             self._geometry_lock.clear()
+            self._track_signatures.clear()
             self._color_history.clear()
             self._material_history.clear()
             self._material_frame_counts.clear()
@@ -1822,6 +1905,15 @@ class VisionPipeline:
             ):
                 if self.camera_id == "logitech":
                     volume_mask = clip_to_region(restore_mask(instance_mask, frame.shape[:2]), bin_region)
+                    volume_mask = _tracked_component(volume_mask, detection.box)
+                    if _spans_the_background(volume_mask, bin_region):
+                        # A mask filling the measurement area and running off
+                        # several of its edges is the floor, a sofa or a wall.
+                        # Measuring it produced the 13 L "objects"; it is
+                        # refused here, after detection, so nothing about the
+                        # detector or its masks changes.
+                        detection.volume_rejection_reason = "background_region_not_measurable"
+                        continue
                     problems = frame_consistency(
                         frame, volume_mask, calibrated_prediction, measure_intrinsics,
                         region=bin_region,
@@ -2067,8 +2159,10 @@ class VisionPipeline:
             "points": pending_points,
         }
         for detection in detections:
+            self._verify_track_identity(detection)
             detection.shape_geometry = self._geometry_lock.update(
                 detection.track_id, pending_shapes.get(id(detection)),
+                _object_signature(detection, self.camera_id),
             )
             self._apply_cylinder_geometry(detection)
             detection.canonical_type = canonical_object_type(detection.label, detection.confidence)
@@ -2390,6 +2484,7 @@ class VisionPipeline:
             self._box_measurement_history.clear()
             self._box_frames_considered.clear()
             self._geometry_lock.clear()
+            self._track_signatures.clear()
             self._color_history.clear()
             self._material_history.clear()
             self._material_frame_counts.clear()
@@ -2443,6 +2538,7 @@ class VisionPipeline:
             self._box_measurement_history.clear()
             self._box_frames_considered.clear()
             self._geometry_lock.clear()
+            self._track_signatures.clear()
             self._color_history.clear()
             self._material_history.clear()
             self._material_frame_counts.clear()
@@ -2477,6 +2573,7 @@ class VisionPipeline:
             self._box_measurement_history.clear()
             self._box_frames_considered.clear()
             self._geometry_lock.clear()
+            self._track_signatures.clear()
             self._color_history.clear()
             self._material_history.clear()
             self._material_frame_counts.clear()
@@ -2935,6 +3032,7 @@ class VisionPipeline:
             self._box_measurement_history.clear()
             self._box_frames_considered.clear()
             self._geometry_lock.clear()
+            self._track_signatures.clear()
             return record
 
     def state(self) -> dict[str, Any]:
@@ -3338,6 +3436,23 @@ class VisionPipeline:
         elif not moved and not self._calibration_valid:
             self._calibration_valid = True
 
+    def _verify_track_identity(self, detection: Detection) -> None:
+        """Drop this track's histories when the id has changed hands.
+
+        The tracker reuses integer ids, and every smoother in the pipeline is
+        keyed by one. Without this check a new object inherits the previous
+        holder's volume samples, colour votes and frozen geometry, which is
+        what repeated one object's dimensions on the next.
+        """
+        track_id = detection.track_id
+        if track_id is None:
+            return
+        signature = _object_signature(detection, self.camera_id)
+        known = self._track_signatures.get(track_id)
+        if known is not None and not known.matches(signature, tolerance=2.0):
+            self._release_expired_track_state([track_id])
+        self._track_signatures[track_id] = signature
+
     def _release_expired_track_state(self, expired_ids: list[int]) -> None:
         """Drop every per-track buffer belonging to a track the tracker closed.
 
@@ -3365,6 +3480,7 @@ class VisionPipeline:
             self._material_history.pop(track_id, None)
             self._material_frame_counts.pop(track_id, None)
             self._bin_total_before_track.pop(track_id, None)
+            self._track_signatures.pop(track_id, None)
 
     def _record_added_volume(
         self,
@@ -3547,11 +3663,14 @@ class VisionPipeline:
             else:
                 detection.realsense_volume_l = volume
         elif shape.geometry_method == UNCERTAIN and shape.rejection_reason in CYLINDER_REJECTIONS:
-            if logitech:
-                detection.monocular_volume_l = None
-            else:
-                detection.realsense_volume_l = None
-            detection.volume_rejection_reason = shape.rejection_reason
+            measured = detection.monocular_volume_l if logitech else detection.realsense_volume_l
+            if measured is None:
+                # Nothing was measured by any other means, so the rejection is
+                # the whole story.
+                detection.volume_rejection_reason = shape.rejection_reason
+            # Otherwise the height-map litres already on the detection stand:
+            # refusing a cylinder fit says the object is not a cylinder, not
+            # that it could not be measured.
 
     def _full_metric_ready(
         self, calibrated_depth: np.ndarray | None, intrinsics: CameraIntrinsics | None,

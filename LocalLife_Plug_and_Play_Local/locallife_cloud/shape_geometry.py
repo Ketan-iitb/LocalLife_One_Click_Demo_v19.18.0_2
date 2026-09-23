@@ -70,7 +70,14 @@ _CYLINDER_WORDS = {
     "can", "cans", "tin", "bottle", "bottles", "jar", "cup", "mug", "tube", "canister",
     "flask", "cream", "balm", "lotion", "container", "cylinder", "cylindrical", "soda", "beverage",
 }
-_FLEXIBLE_WORDS = {"bag", "bags", "sack", "pillow", "cushion", "backpack", "textile", "cloth", "toy", "plush"}
+# Classes that have no rigid shape to fit: whatever the points say this
+# frame, they say something else the next, so these are measured by their
+# height map and never by an analytic solid.
+_FLEXIBLE_WORDS = {
+    "bag", "bags", "sack", "pillow", "cushion", "backpack", "rucksack", "handbag", "purse",
+    "textile", "fabric", "cloth", "clothing", "clothes", "garment", "shirt", "jacket",
+    "towel", "blanket", "toy", "plush",
+}
 
 MIN_POINTS = 50
 MIN_DIMENSION_MM = 5.0
@@ -89,10 +96,15 @@ MAX_CYLINDER_RESIDUAL = 0.10
 CYLINDER_NOISE_FLOOR_M = 0.005
 MIN_ARC_COVERAGE_DEG = 110.0
 MIN_CYLINDER_FIT_CONFIDENCE = 0.35
+# A fitted cylinder is only believed when it is close to the volume the points
+# actually occupy; further apart, the height map is the honest answer.
+MIN_CYLINDER_MESH_RATIO = 0.55
+MAX_CYLINDER_MESH_RATIO = 1.8
 # Reasons a cylinder candidate is held pending instead of measured.
 CYLINDER_REJECTIONS = frozenset({
     "cylinder_fit_residual_too_high", "insufficient_arc_coverage",
     "cylinder_fit_low_confidence", "implausible_cylinder_diameter",
+    "cylinder_disagrees_with_height_map",
 })
 
 
@@ -405,7 +417,7 @@ def measure_shape(
     cylinder_rejection: list[str] = []
 
     def _cylinder(fit: CircleFit, axis_m: float, orientation: str,
-                  flags: tuple[str, ...]) -> ShapeGeometry | None:
+                  flags: tuple[str, ...], check_mesh: bool = True) -> ShapeGeometry | None:
         """A fitted cylinder, or None when the fit is not trustworthy.
 
         A rejected fit falls through to the existing height-map result
@@ -426,6 +438,13 @@ def measure_shape(
             cylinder_rejection.append(reason)
             return None
         volume = _litres(math.pi * fit.radius ** 2 * axis_m)
+        if check_mesh and mesh is not None and mesh > 0 and not (
+            MIN_CYLINDER_MESH_RATIO <= volume / mesh <= MAX_CYLINDER_MESH_RATIO
+        ):
+            # The fitted solid and the measured height map disagree: the fit is
+            # describing something the object is not.
+            cylinder_rejection.append("cylinder_disagrees_with_height_map")
+            return None
         if orientation == "upright":
             dims = dict(length_mm=diameter_m * 1000.0, width_mm=diameter_m * 1000.0, height_mm=axis_m * 1000.0)
         else:
@@ -451,20 +470,34 @@ def measure_shape(
     # top is a dome or a cone, and calling it a cylinder over-counted it by
     # about half, so the flat-top evidence is part of the test.
     flat_enough = flat_top >= FLAT_TOP_MIN or (profile is not None and profile >= CURVED_PROFILE_MAX)
+    words = set(label.lower().replace("_", " ").replace("-", " ").split())
     disc = aspect >= 0.85 and DISC_FILL_RANGE[0] <= rect_fill <= DISC_FILL_RANGE[1] and residual is not None \
         and residual <= MAX_CIRCLE_RESIDUAL and flat_enough
-    shell = column_fill < 0.55 and aspect < 0.85
-    words = set(label.lower().replace("_", " ").replace("-", " ").split())
+    # A thin sliver of mask is not a cylinder seen from the side: it is a
+    # fragment. Require enough points and a footprint worth fitting.
+    shell = (
+        column_fill < 0.55 and aspect < 0.85 and points >= 2 * min_points
+        and length_m * width_m >= 4.0 * (0.005 ** 2) and not (words & _FLEXIBLE_WORDS)
+    )
     # A labelled can/bottle seen obliquely shows its top disc plus the front
     # shell, whose projection lands on the same circle: the union is a disc
     # that need not pass the strict disc test, so the label admits the fit.
-    labelled = bool(words & _CYLINDER_WORDS) and aspect >= 0.6 and flat_enough
+    # A label alone never makes an object a cylinder: a milk carton says
+    # "beverage" and a cream jar says "container" while their points say box.
+    # The label only widens the *fit* to a round-enough footprint that the
+    # strict disc test would have skipped -- the fit still has to succeed.
+    labelled = (
+        bool(words & _CYLINDER_WORDS) and not (words & _FLEXIBLE_WORDS)
+        and aspect >= 0.75 and flat_enough
+        and rect_fill <= DISC_FILL_RANGE[1] + 0.03
+        and residual is not None and residual <= MAX_CIRCLE_RESIDUAL * 1.5
+    )
     # Height along the vertical axis: the near-top of the points, not the p95
     # used for general objects (a side-seen shell is uniform in height).
     # A side-seen shell has uniformly spread heights (no plateau), so its top
     # is its extreme; a visible top disc is a plateau, where p98 avoids noise.
     axis_top_m = float(np.percentile(heights, 99.5 if shell else 98.0)) if height_mm is None else top_m
-    if disc or shell or labelled:
+    if (disc or shell or labelled) and not (words & _FLEXIBLE_WORDS):
         # Arc coverage and residual (inside _cylinder) guard against an
         # extrapolated fit; the rectangle's chord is not used, because a few
         # stray points widen it without changing the circle. A filled footprint
@@ -473,7 +506,11 @@ def measure_shape(
         fit = robust_circle_fit(footprint) if shell else _edge_corrected_fit(footprint)
         if fit is not None:
             flag = "disc_footprint" if disc else "arc_reconstructed_diameter" if shell else "labelled_cylinder_fit"
-            fitted = _cylinder(fit, axis_top_m, "upright", (flag,))
+            # A shell seen from the side leaves an arc, not a footprint: its
+            # height map covers a sliver of the object, so comparing the two is
+            # meaningless. Every fit whose footprint does cover the object is
+            # required to agree with the height map.
+            fitted = _cylinder(fit, axis_top_m, "upright", (flag,), check_mesh=not shell)
             if fitted is not None:
                 return fitted
 
@@ -519,6 +556,8 @@ def measure_shape(
     flexible = bool(words & _FLEXIBLE_WORDS)
     confidence = 0.6 if mesh <= bbox_l * 1.05 else 0.35
     rejected = tuple(f"cylinder_fit_rejected:{reason}" for reason in cylinder_rejection)
+    if rejected:
+        rejected += ("height_map_fallback",)
     return ShapeGeometry(
         geometry_method=FLEXIBLE_OR_UNKNOWN if flexible else IRREGULAR_RIGID,
         geometry_confidence=confidence, selected_volume_litres=mesh,
@@ -626,13 +665,60 @@ def aggregate_shapes(results: list[ShapeGeometry]) -> ShapeGeometry:
     )
 
 
+def _diameters_agree(items: list[ShapeGeometry], tolerance: float = 0.25) -> bool:
+    """Did the fitted diameter hold still across the frames that voted?"""
+    values = [item.cylinder_diameter_mm for item in items if item.cylinder_diameter_mm]
+    if len(values) < 3:
+        return False
+    middle = sorted(values)[len(values) // 2]
+    return middle > 0 and all(abs(value - middle) <= tolerance * middle for value in values)
+
+
+@dataclass(frozen=True)
+class ObjectSignature:
+    """What makes this detection *this* object, coarsely.
+
+    A frozen shape used to be returned for whatever detection carried the same
+    integer track id. Ids restart at 1 after a reset and are reused after a
+    track expires, so one fitted cylinder could reappear as the dimensions of
+    the next backpack, carton or background blob. The signature is compared
+    before a frozen result is handed back, and a materially different object
+    starts its own vote.
+    """
+
+    camera: str = ""
+    label: str = ""
+    centre_x: float = 0.0
+    centre_y: float = 0.0
+    area: float = 0.0
+    aspect: float = 0.0
+
+    def matches(self, other: "ObjectSignature", tolerance: float = 1.0) -> bool:
+        """Is `other` still the same object? `tolerance` widens every bound.
+
+        The geometry freeze uses the strict form; the volume and colour
+        smoothers use a wider one, because an object being lowered into the bin
+        legitimately grows in the frame while a reused id does not.
+        """
+        if self.camera != other.camera or self.label != other.label:
+            return False
+        scale = max(math.sqrt(max(self.area, 1.0)), 1.0)
+        distance = math.hypot(self.centre_x - other.centre_x, self.centre_y - other.centre_y)
+        if distance > 2.0 * tolerance * scale:
+            return False
+        larger, smaller = max(self.area, other.area), max(min(self.area, other.area), 1.0)
+        if larger / smaller > 2.5 * tolerance:
+            return False
+        return abs(self.aspect - other.aspect) <= min(0.35 * tolerance, 0.9)
+
+
 class GeometryLock:
-    """Per-track method voting, then a permanent freeze.
+    """Per-object method voting, then a freeze that belongs to that object.
 
     A method is accepted once it wins `required_frames` of the last
     `window` frames. Until then the provisional answer is the latest frame's.
-    After acceptance the aggregated result is returned unchanged for the
-    rest of the track's life, so a completed measurement cannot flip method.
+    After acceptance the aggregated result is returned unchanged for as long
+    as the detection still looks like the same object (`ObjectSignature`).
     """
 
     def __init__(self, required_frames: int = 5, window: int = 9) -> None:
@@ -640,10 +726,20 @@ class GeometryLock:
         self.window = max(self.required_frames, int(window))
         self._history: dict[int, deque[ShapeGeometry]] = {}
         self._frozen: dict[int, ShapeGeometry] = {}
+        self._signatures: dict[int, ObjectSignature] = {}
 
-    def update(self, track_id: int | None, result: ShapeGeometry | None) -> ShapeGeometry | None:
+    def update(
+        self, track_id: int | None, result: ShapeGeometry | None,
+        signature: ObjectSignature | None = None,
+    ) -> ShapeGeometry | None:
         if track_id is None:
             return result
+        if signature is not None:
+            known = self._signatures.get(track_id)
+            if known is not None and not known.matches(signature):
+                # Same id, different object: nothing of the old one carries over.
+                self.forget(track_id)
+            self._signatures[track_id] = signature
         frozen = self._frozen.get(track_id)
         if frozen is not None:
             return frozen
@@ -656,6 +752,11 @@ class GeometryLock:
             method, count = votes.most_common(1)[0]
             if count >= self.required_frames:
                 chosen = [item for item in history if item.geometry_method == method]
+                if method == CYLINDER and not _diameters_agree(chosen):
+                    # The fit is still moving between frames, so it is not
+                    # describing a fixed object yet. Keep the provisional
+                    # answer and let the vote continue.
+                    return result
                 final = replace(aggregate_shapes(chosen), frozen=True)
                 self._frozen[track_id] = final
                 self._history.pop(track_id, None)
@@ -668,7 +769,9 @@ class GeometryLock:
     def forget(self, track_id: int | None) -> None:
         self._history.pop(track_id, None)
         self._frozen.pop(track_id, None)
+        self._signatures.pop(track_id, None)
 
     def clear(self) -> None:
         self._history.clear()
         self._frozen.clear()
+        self._signatures.clear()
