@@ -66,6 +66,52 @@ def ray_plane_distance(
     return height_m * np.sqrt(1.0 + x * x + y * y)
 
 
+def _trimmed_fit(source: np.ndarray, expected: np.ndarray, required: int) -> tuple[float, float]:
+    """Least squares with three rounds of MAD trimming."""
+    scale, offset = 1.0, 0.0
+    for _ in range(3):
+        design = np.column_stack((source, np.ones_like(source)))
+        solution, *_ = np.linalg.lstsq(design, expected, rcond=None)
+        scale, offset = float(solution[0]), float(solution[1])
+        residual = scale * source + offset - expected
+        limit = 3.0 * 1.4826 * float(np.median(np.abs(residual - np.median(residual))) or 1e-4)
+        keep = np.abs(residual) <= limit
+        if keep.all() or int(keep.sum()) < max(required // 2, 8):
+            break
+        source, expected = source[keep], expected[keep]
+    return scale, offset
+
+
+def _mapping_error(
+    source: np.ndarray, expected: np.ndarray, *, inverse: bool, required: int, seed: int = 0,
+) -> tuple[float, float, float]:
+    """Held-out RMSE of one mapping, plus the coefficients it fitted.
+
+    Half the pixels fit, the other half score: a mapping that only looks good
+    on the points it was fitted to is not the one to ship.
+    """
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(source.size)
+    half = source.size // 2
+    fit_index, test_index = order[:half], order[half:]
+    # The inverse form is fitted the way DepthCalibration.apply evaluates it:
+    # 1/Z = a*d + b, so the target is inverted, not the prediction.
+    targets = np.where(expected > 1e-6, 1.0 / expected, np.nan) if inverse else expected
+    finite = np.isfinite(targets) & np.isfinite(source)
+    fit_index = fit_index[finite[fit_index]]
+    test_index = test_index[finite[test_index]]
+    if fit_index.size < 8 or test_index.size < 8:
+        return float("inf"), 1.0, 0.0
+    scale, offset = _trimmed_fit(source[fit_index], targets[fit_index], required)
+    mapped = scale * source[test_index] + offset
+    predicted = np.where(mapped > 1e-6, 1.0 / mapped, np.nan) if inverse else mapped
+    error = predicted - expected[test_index]
+    error = error[np.isfinite(error)]
+    if error.size < 8:
+        return float("inf"), scale, offset
+    return float(np.sqrt(np.mean(error ** 2))), scale, offset
+
+
 def fit_plane_alignment(
     predicted: np.ndarray,
     region: np.ndarray,
@@ -76,8 +122,10 @@ def fit_plane_alignment(
 ) -> tuple[DepthCalibration | None, dict[str, Any]]:
     """Scale and offset that map an empty-scene prediction onto the known plane.
 
-    Trimmed least squares over the ROI: the empty scene is one plane, so a
-    handful of leftover objects or depth spikes must not tilt the fit.
+    Both candidate mappings -- metric_depth = a*d + b and the inverse-depth
+    form -- are fitted on half the ROI and scored on the other half, and the
+    one with the lower held-out error is kept. `inverse` is only the model's
+    own hint; the data decides.
     """
     target = ray_plane_distance(predicted.shape[:2], intrinsics, height_m)
     usable = region & np.isfinite(predicted) & (predicted > 0)
@@ -92,28 +140,45 @@ def fit_plane_alignment(
     if diagnostics["plane_pixels"] < required:
         return None, {**diagnostics, "reason": "too_few_empty_plane_pixels"}
     source = predicted[usable].astype(np.float64)
-    if inverse:
-        source = np.where(source > 1e-6, 1.0 / source, np.nan)
-        usable_values = np.isfinite(source)
-        source = source[usable_values]
-        expected = target[usable][usable_values]
-    else:
-        expected = target[usable]
+    expected = target[usable]
     diagnostics["predicted_median_on_plane"] = float(np.median(source))
-    scale, offset = 1.0, 0.0
-    for _ in range(3):
-        design = np.column_stack((source, np.ones_like(source)))
-        solution, *_ = np.linalg.lstsq(design, expected, rcond=None)
-        scale, offset = float(solution[0]), float(solution[1])
-        residual = scale * source + offset - expected
-        limit = 3.0 * 1.4826 * float(np.median(np.abs(residual - np.median(residual))) or 1e-4)
-        keep = np.abs(residual) <= limit
-        if keep.all() or int(keep.sum()) < required // 2:
-            break
-        source, expected = source[keep], expected[keep]
+    linear_error, linear_scale, linear_offset = _mapping_error(
+        source, expected, inverse=False, required=required)
+    inverse_error, inverse_scale, inverse_offset = _mapping_error(
+        source, expected, inverse=True, required=required)
+    use_inverse = inverse_error < linear_error
+    diagnostics.update({
+        "held_out_rmse_linear_m": None if not np.isfinite(linear_error) else round(linear_error, 5),
+        "held_out_rmse_inverse_m": None if not np.isfinite(inverse_error) else round(inverse_error, 5),
+        "mapping": "inverse_depth" if use_inverse else "linear_depth",
+        "model_hint_inverse": bool(inverse),
+    })
+    spread = float(np.percentile(source, 95) - np.percentile(source, 5))
+    if spread < 0.005 * max(abs(float(np.median(source))), 1e-6):
+        # The prediction is flat across the ROI: a plane at one predicted value
+        # fixes the scale and says nothing about an offset, so only the scale
+        # is fitted rather than letting least squares invent a pair.
+        scale = float(np.median(expected) / max(np.median(source), 1e-9))
+        diagnostics.update({"scale": scale, "offset_m": 0.0, "plane_rmse_m": 0.0,
+                            "fitted_pixels": int(source.size), "mapping": "scale_only",
+                            "reason_note": "constant_prediction_over_plane"})
+        return DepthCalibration(
+            scale=scale, offset_m=0.0, rmse_m=0.0, sample_pixels=int(source.size),
+            method="empty-plane-ray-alignment", reference_distance_m=float(height_m),
+            sample_count=1, resolution=(int(predicted.shape[1]), int(predicted.shape[0])),
+            inverse=False,
+        ), diagnostics
+    inverse = use_inverse
+    targets = np.where(expected > 1e-6, 1.0 / expected, np.nan) if inverse else expected
+    finite = np.isfinite(targets) & np.isfinite(source)
+    source, targets, expected = source[finite], targets[finite], expected[finite]
+    scale, offset = _trimmed_fit(source, targets, required)
     if not np.isfinite(scale) or scale <= 0:
         return None, {**diagnostics, "reason": "unstable_monocular_scale"}
-    rmse = float(np.sqrt(np.mean((scale * source + offset - expected) ** 2)))
+    mapped = scale * source + offset
+    metric = np.where(mapped > 1e-6, 1.0 / mapped, np.nan) if inverse else mapped
+    residual = (metric - expected)[np.isfinite(metric)]
+    rmse = float(np.sqrt(np.mean(residual ** 2)))
     diagnostics.update({"scale": scale, "offset_m": offset, "plane_rmse_m": rmse,
                         "fitted_pixels": int(source.size)})
     return DepthCalibration(
