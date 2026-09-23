@@ -19,6 +19,7 @@ from . import __version__
 from .comparison import DualCameraCoordinator, infer_camera_id
 from .config import AppConfig
 from .dashboard import DUAL_DASHBOARD
+from .measurement_zone import quadrilateral_is_sane
 from .operator_dashboard import OPERATOR_DASHBOARD
 from .pipeline import VisionPipeline
 from .storage import BucketSync
@@ -771,6 +772,63 @@ def create_app(
         except (TypeError, ValueError) as exc:
             return jsonify(error=str(exc)), 400
         return jsonify(ok=True, **updated)
+
+    @app.post("/api/cameras/<camera_id>/measurement-zone")
+    @protected
+    def set_measurement_zone(camera_id: str) -> Any:
+        """Draw this camera's deposit mat, and optionally give it its real size.
+
+        Each camera sees the mat from its own place, so the four corners are
+        stored per camera together with the resolution they were drawn at. The
+        mat's width and depth in metres are optional: with them the station
+        also gets its floor scale, which is what makes a footprint in
+        centimetres mean the same at the front and the back of the mat.
+        """
+        payload = request.get_json(silent=True) or {}
+        corners = payload.get("corners")
+        if not isinstance(corners, list) or len(corners) != 4:
+            return jsonify(error="Provide corners as four [x, y] image points"), 400
+        try:
+            station = manager.camera(camera_id)
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 404
+        frame = station.latest_processed_frame
+        shape = payload.get("resolution")
+        if isinstance(shape, list) and len(shape) == 2:
+            frame_shape = (int(shape[1]), int(shape[0]))
+        elif frame is not None:
+            frame_shape = frame.shape[:2]
+        else:
+            return jsonify(error="No frame has arrived yet; send resolution as [width, height]"), 400
+        if not quadrilateral_is_sane(corners):
+            return jsonify(error="The four corners must form a convex quadrilateral"), 400
+        try:
+            zone = station.set_measurement_zone(
+                [(float(x), float(y)) for x, y in corners], frame_shape,
+                near_edge_m=float(payload.get("near_edge_m", 0) or 0),
+                depth_edge_m=float(payload.get("depth_edge_m", 0) or 0),
+            )
+        except (TypeError, ValueError) as exc:
+            return jsonify(error=str(exc)), 400
+        return jsonify(ok=True, measurement_zone=zone)
+
+    @app.delete("/api/cameras/<camera_id>/measurement-zone")
+    @protected
+    def clear_measurement_zone(camera_id: str) -> Any:
+        try:
+            manager.camera(camera_id).clear_measurement_zone()
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 404
+        return jsonify(ok=True)
+
+    @app.get("/api/cameras/<camera_id>/measurement-readiness")
+    @protected
+    def measurement_readiness(camera_id: str) -> Any:
+        try:
+            station = manager.camera(camera_id)
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 404
+        return jsonify(station.state()["measurement_readiness"])
 
     @app.get("/video/latest")
     @app.get("/video/cameras/<camera_id>")

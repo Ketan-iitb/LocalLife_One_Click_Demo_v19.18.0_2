@@ -53,6 +53,12 @@ from .coordinates import clip_to_region, frame_consistency, restore_mask
 from .logitech_factor import LogitechVolumeFactors, geometry_group
 from .logitech_volume import axis_aligned_plane, fit_plane_alignment, metric_object_volume, stable_volume
 from .vocabulary import object_type as canonical_object_type
+from .deposit_state import DepositStateMachine, FrameObservation
+from .logitech_calibration import METRIC_OUTPUT, depth_output_kind
+from .measurement_mask import (BACKGROUND_REASONS, FOREGROUND_COMPONENT, deposit_component,
+                               looks_like_background, rgb_change)
+from .measurement_zone import MeasurementZone, MeasurementZoneStore
+from .readiness import MeasurementReadiness
 from .shape_geometry import (CYLINDER, CYLINDER_REJECTIONS, UNCERTAIN, GeometryLock,
                              ObjectSignature, ShapeGeometry, measure_shape)
 from .types import BoxVolumeMeasurement, CameraIntrinsics, DepthCalibration, Detection, FrameAnalysis
@@ -437,30 +443,9 @@ def _tracked_component(mask: np.ndarray, box: tuple[int, int, int, int]) -> np.n
 
 def _spans_the_background(mask: np.ndarray, region: np.ndarray | None) -> bool:
     """Is this mask the room rather than an object placed in it?"""
-    pixels = int(np.count_nonzero(mask))
-    if pixels < 500:
+    if int(np.count_nonzero(mask)) < 500:
         return False
-    rows, columns = np.nonzero(mask)
-    if region is not None and np.any(region):
-        region_rows, region_columns = np.nonzero(region)
-        top, bottom = int(region_rows.min()), int(region_rows.max())
-        left, right = int(region_columns.min()), int(region_columns.max())
-        available = int(np.count_nonzero(region))
-    else:
-        top, left, available = 0, 0, mask.size
-        bottom, right = mask.shape[0] - 1, mask.shape[1] - 1
-    margin = max(2, int(0.01 * max(bottom - top, right - left)))
-    borders = sum((
-        int(rows.min()) <= top + margin, int(rows.max()) >= bottom - margin,
-        int(columns.min()) <= left + margin, int(columns.max()) >= right - margin,
-    ))
-    share = pixels / max(available, 1)
-    across = (int(columns.max()) - int(columns.min())) / max(right - left, 1)
-    down = (int(rows.max()) - int(rows.min())) / max(bottom - top, 1)
-    # Running off three sides of the measurement area, or reaching corner to
-    # corner across it, is what the floor, a wall and a sofa do -- an object
-    # standing in the area does neither.
-    return (borders >= 3 and share >= 0.5) or (across >= 0.9 and down >= 0.9 and share >= 0.3)
+    return looks_like_background(mask, region) is not None
 
 
 class VisionPipeline:
@@ -663,6 +648,17 @@ class VisionPipeline:
         # What each live track looked like last frame, so a reused id cannot
         # inherit the previous object's measurements (shape_geometry.py).
         self._track_signatures: dict[int, ObjectSignature] = {}
+        # The mat this camera measures on. Each camera sees it from its own
+        # place, so the zone is stored per camera and never shared.
+        self.zones = MeasurementZoneStore(config.results_dir / "calibration")
+        self.measurement_zone: MeasurementZone | None = self.zones.get(camera_id)
+        self.zone_source = "saved-zone" if self.measurement_zone is not None else "configured-roi"
+        # Where this camera is in the deposit it is watching (deposit_state.py).
+        self.deposit_state = DepositStateMachine(settle_frames=max(2, config.settle_frames))
+        # The last frame's measurement-mask decision, for the diagnostics bundle.
+        self.last_measurement_mask: dict[str, Any] = {}
+        # Set when a relative-depth checkpoint could not be scaled to metres.
+        self.relative_depth_reason: str | None = None
         # Frames each confirmed track has waited for finalisation (non-waste modes).
         self._unfinalised_frames: dict[int, int] = {}
         # Detector / foreground / final / rejected masks of the latest Logitech
@@ -1158,7 +1154,7 @@ class VisionPipeline:
             if predicted_depth is not None and self.calibration is not None
             else predicted_depth
         )
-        bin_region = fixed_bin_mask(frame.shape, self.config.roi, self.config.bin_polygon)
+        bin_region = self._measurement_region(frame.shape)
         minimum_height_m = (
             self.config.geometry_validation_min_object_height_m
             if self.config.operating_mode == "geometry_validation" and self.camera_id != "logitech"
@@ -1218,6 +1214,7 @@ class VisionPipeline:
                 if calibrated_prediction is not None and calibrated_prediction.shape == predicted_depth.shape
                 else predicted_depth
             )
+            source_depth = self._metric_from_relative(source_depth, bin_region)
             plane_values = source_depth[bin_region & np.isfinite(source_depth) & (source_depth > 0.1)]
             uncalibrated_logitech = measure_intrinsics is not None and plane_values.size >= 100
             if uncalibrated_logitech:
@@ -1463,6 +1460,9 @@ class VisionPipeline:
         # contaminate in that case). `combined_mask()` safely returns an
         # all-False mask for an empty list, and `estimate_volume()` rejects
         # an all-False mask via its own pixel-count floor.
+        deposit_change, deposit_rise = self._committed_scene_change(
+            frame, depth_m, calibrated_prediction,
+        )
         measurement_masks: dict[int, np.ndarray] = {}
         recovered_measurement_ids: set[int] = set()
         if (
@@ -1672,6 +1672,13 @@ class VisionPipeline:
         for detection in detections:
             instance_mask = measurement_masks.get(
                 id(detection), combined_mask([detection], frame.shape[:2]),
+            )
+            # The detector says what this is; the change since the committed
+            # scene says where it ends. A mask that spilled across the floor,
+            # a second carton and a chair is cut back to the island that was
+            # actually deposited, and background is refused outright.
+            instance_mask = self._deposit_measurement_mask(
+                detection, instance_mask, bin_region, deposit_change, deposit_rise,
             )
             logitech_height_coherent = True
             if depth_m is not None:
@@ -2376,6 +2383,7 @@ class VisionPipeline:
                     self.persist_measurement_event(detection, timestamp)
                     self.ledger.deposit(detection, timestamp=timestamp)
                     self._committed_scene = scene_grid
+                    self.deposit_state.committed()
                     newly_deposited.append(detection)
         # This frame's occupancy becomes the "before" state that whatever
         # appears next will be measured against.
@@ -2442,6 +2450,7 @@ class VisionPipeline:
                     "logitech": self.logitech_diagnostics() if self.camera_id == "logitech" else None,
                 },
             )
+        self._observe_deposit_state(detections, deposit_change, bin_region)
         self.latest_analysis = analysis
         self.latest_processed_frame = frame.copy()
         self.latest_analysis_timestamp = float(timestamp)
@@ -3040,9 +3049,17 @@ class VisionPipeline:
             hardware = summarize_depth_signal(self.latest_depth)
             monocular = summarize_depth_signal(self.latest_monocular_depth)
             volume_status = self._volume_status(hardware)
+            readiness = self._measurement_readiness()
             return {
                 "camera_id": self.camera_id,
                 "camera_name": "Intel RealSense D435" if self.camera_id == "realsense" else "Logitech C920",
+                # Every prerequisite, one field each, with the next action.
+                "measurement_readiness": readiness.to_dict(),
+                "measurement_zone": (
+                    None if self.measurement_zone is None else self.measurement_zone.describe()
+                ),
+                "measurement_zone_source": self.zone_source,
+                "deposit_state": self.deposit_state.describe(),
                 # How many objects this session has finalised into
                 # measurements.csv. A download that comes back with only a
                 # header is almost always this being zero because no empty-bin
@@ -3435,6 +3452,193 @@ class VisionPipeline:
             )
         elif not moved and not self._calibration_valid:
             self._calibration_valid = True
+
+    def _measurement_region(self, shape: tuple[int, ...]) -> np.ndarray:
+        """The pixels this camera is allowed to measure inside.
+
+        The drawn mat if one was calibrated for *this* camera at a resolution
+        that still matches, and the configured ROI otherwise. A zone drawn at
+        another aspect ratio is not stretched onto the frame: it would measure
+        a different part of the room, so it is reported as a mismatch and the
+        configuration stands in.
+        """
+        zone = self.measurement_zone
+        if zone is not None:
+            mask = zone.mask(shape)
+            if mask is not None and np.any(mask):
+                self.zone_source = "saved-zone"
+                return mask
+            self.zone_source = "zone_resolution_mismatch"
+        elif self.config.bin_polygon:
+            self.zone_source = "configured-polygon"
+        else:
+            self.zone_source = "configured-roi"
+        return fixed_bin_mask(shape, self.config.roi, self.config.bin_polygon)
+
+    def set_measurement_zone(
+        self, corners, shape: tuple[int, ...], *,
+        near_edge_m: float = 0.0, depth_edge_m: float = 0.0,
+    ) -> dict[str, Any]:
+        """Store this camera's mat outline and, with its real size, its floor scale."""
+        zone = MeasurementZone(
+            camera=self.camera_id, corners=tuple(corners),
+            width_px=int(shape[1]), height_px=int(shape[0]),
+            near_edge_m=float(near_edge_m or 0.0), depth_edge_m=float(depth_edge_m or 0.0),
+        )
+        with self.lock:
+            self.measurement_zone = self.zones.save(zone)
+            self.zone_source = "saved-zone"
+            # The zone defines what may be measured, so anything fitted or
+            # smoothed under the previous one is no longer about this scene.
+            self._geometry_lock.clear()
+            self._track_signatures.clear()
+            self.deposit_state.reset()
+        return self.measurement_zone.describe()
+
+    def clear_measurement_zone(self) -> None:
+        with self.lock:
+            self.zones.forget(self.camera_id)
+            self.measurement_zone = None
+            self.zone_source = "configured-roi"
+
+    def _metric_from_relative(self, predicted: np.ndarray, region: np.ndarray) -> np.ndarray:
+        """A relative checkpoint's output, scaled onto the one distance we know.
+
+        A relative model reports an ordering, not metres: its numbers depend on
+        whatever else is in the scene, so using them directly makes an object's
+        height a function of the furniture behind it. When the configured
+        checkpoint is relative, the prediction is scaled so that the floor of
+        the measurement zone sits at the measured camera-to-floor distance, and
+        the mode says the result is an estimate. Without that distance nothing
+        can be scaled, and the reason is recorded rather than papered over.
+        """
+        self.relative_depth_reason = None
+        if depth_output_kind(self.config.depth_model) == METRIC_OUTPUT:
+            return predicted
+        distance = float(self.config.logitech_reference_distance_m or 0.0)
+        usable = region & np.isfinite(predicted) & (predicted > 1e-6)
+        values = predicted[usable]
+        if distance <= 0 or values.size < 100:
+            self.relative_depth_reason = "relative_depth_without_reference_distance"
+            return predicted
+        # Relative Depth Anything V2 outputs inverse depth: larger is nearer,
+        # so the floor's own value fixes the constant in Z = k / d.
+        constant = float(np.median(values)) * distance
+        scaled = np.full(predicted.shape, np.nan, dtype=np.float32)
+        np.divide(constant, predicted, out=scaled, where=usable | (np.isfinite(predicted) & (predicted > 1e-6)))
+        self.relative_depth_reason = "relative_depth_scaled_to_measured_floor_distance"
+        self.calibration_mode = "relative-depth-estimate"
+        return scaled
+
+    def _minimum_rise_m(self) -> float:
+        """How far above the committed scene something must stand to be an object.
+
+        Half of the height the measurement itself demands, and for the same
+        reason the mask stage uses a smaller pixel floor: the real threshold is
+        applied once, on the measurement. Gating twice would throw away a thin
+        object that the measurement would have accepted, while a shadow -- which
+        raises nothing at all -- still fails this one.
+        """
+        if self.camera_id == "logitech":
+            return 0.5 * float(self.config.logitech_min_object_height_m)
+        threshold = (
+            self.config.geometry_validation_min_object_height_m
+            if self.config.operating_mode == "geometry_validation"
+            else self.config.min_object_height_m
+        )
+        return 0.5 * float(threshold)
+
+    def _committed_scene_change(
+        self, frame: np.ndarray, depth_m: np.ndarray | None, monocular_depth: np.ndarray | None,
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """What has changed since the scene was last committed, and by how much.
+
+        The reference is advanced every time a deposit is committed, so this is
+        the difference against everything already counted -- the mat, the
+        furniture behind it and the carton deposited a minute ago. Colour finds
+        what moved; depth says how far it stands above what was there, which is
+        what tells an object from a shadow.
+        """
+        change = rgb_change(frame, self.reference_rgb, self.config.foreground_threshold)
+        depth = monocular_depth if self.camera_id == "logitech" else depth_m
+        reference = self.reference_monocular if self.camera_id == "logitech" else self.reference_realsense
+        rise = None
+        if depth is not None and reference is not None and depth.shape == reference.shape:
+            rise = (reference.astype(np.float32) - depth.astype(np.float32))
+            rise[~np.isfinite(rise)] = 0.0
+            risen = rise >= self._minimum_rise_m()
+            change = risen if change is None else (change | risen)
+        return change, rise
+
+    def _deposit_measurement_mask(
+        self, detection: Detection, instance_mask: np.ndarray, region: np.ndarray,
+        change: np.ndarray | None, rise: np.ndarray | None,
+    ) -> np.ndarray:
+        """The mask this detection is measured with, or an empty one with a reason.
+
+        An empty mask leaves the object detected, tracked, classified and drawn
+        -- only its volume is withheld, with the reason on the detection, which
+        is what the operator needs to see.
+        """
+        # The floor here only sweeps away speckle: how large an object has to
+        # be to count is decided downstream, on the measurement itself, and
+        # applying that threshold twice would drop small objects entirely.
+        speckle = max(4, min(self.config.min_component_pixels, self.config.logitech_min_object_pixels) // 8)
+        choice = deposit_component(
+            instance_mask, change, region, rise_m=rise,
+            min_pixels=speckle, min_height_rise_m=self._minimum_rise_m(),
+        )
+        self.last_measurement_mask = {
+            "label": detection.label, "track_id": detection.track_id,
+            "source": choice.source, "reason": choice.reason, **choice.diagnostics,
+        }
+        if choice.reason:
+            self.stage_counters[f"measurement_mask_rejected_{choice.reason}"] += 1
+        if choice.measurable:
+            return choice.mask if choice.source == FOREGROUND_COMPONENT else instance_mask
+        detection.volume_rejection_reason = choice.reason
+        return np.zeros_like(instance_mask)
+
+    def _observe_deposit_state(
+        self, detections: list[Detection], change: np.ndarray | None, region: np.ndarray,
+    ) -> None:
+        """Tell the deposit machine what this frame saw."""
+        available = max(int(np.count_nonzero(region)), 1)
+        changed = 0.0 if change is None else int(np.count_nonzero(change & region)) / available
+        measured = [
+            self._detection_volume(item) for item in detections
+            if self._detection_volume(item) is not None
+        ]
+        self.deposit_state.observe(FrameObservation(
+            changed_fraction=changed,
+            tracked_objects=sum(1 for item in detections if item.track_id is not None),
+            measured_volume_l=measured[0] if measured else None,
+            stable=bool(measured) and not any(
+                item.volume_rejection_reason for item in detections
+            ),
+        ))
+
+    def _measurement_readiness(self) -> MeasurementReadiness:
+        """Each prerequisite for a metric measurement, ready or missing."""
+        zone = self.measurement_zone
+        logitech = self.camera_id == "logitech"
+        mapping = True
+        if logitech:
+            mapping = self.calibration is not None and self.calibration_rejected_reason is None
+        reason = self.relative_depth_reason or self.calibration_rejected_reason or ""
+        if not reason and self.last_measurement_mask.get("reason"):
+            reason = str(self.last_measurement_mask["reason"])
+        return MeasurementReadiness(
+            camera=self.camera_id,
+            measurement_zone=zone is not None or bool(self.config.bin_polygon),
+            empty_baseline=self.reference_rgb is not None,
+            intrinsics=self.latest_intrinsics is not None,
+            floor_scale=bool(zone is not None and zone.has_floor_scale),
+            metric_depth_mapping=bool(mapping),
+            method=self.calibration_mode or getattr(self, "measurement_method", "") or "",
+            reason=reason,
+            depth_output=depth_output_kind(self.config.depth_model) if logitech else "hardware_depth",
+        )
 
     def _verify_track_identity(self, detection: Detection) -> None:
         """Drop this track's histories when the id has changed hands.
