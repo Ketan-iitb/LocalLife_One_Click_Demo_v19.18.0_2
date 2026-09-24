@@ -17,7 +17,8 @@ READY = "ready"
 MISSING = "missing"
 
 # In the order an operator would set them up.
-STEPS = ("measurement_zone", "empty_baseline", "intrinsics", "floor_scale", "metric_depth_mapping")
+STEPS = ("measurement_zone", "empty_baseline", "intrinsics", "floor_scale", "metric_depth_mapping",
+         "camera_floor_distance", "height_calibration")
 
 INSTRUCTIONS = {
     "measurement_zone": "Draw the four corners of the deposit mat for this camera "
@@ -28,6 +29,10 @@ INSTRUCTIONS = {
     "floor_scale": "Enter the deposit mat's real width and depth in metres with its corners.",
     "metric_depth_mapping": "Capture a few Logitech calibration samples at known distances, "
                             "or set the measured camera-to-floor distance.",
+    "camera_floor_distance": "Measure the camera's optical centre to the empty floor and enter it "
+                             "in centimetres (Camera setup).",
+    "height_calibration": "Measure two or three rigid objects with a ruler, add each as a "
+                          "calibration sample, then fit and freeze the height calibration.",
 }
 
 
@@ -41,9 +46,16 @@ class MeasurementReadiness:
     intrinsics: bool = False
     floor_scale: bool = False
     metric_depth_mapping: bool = False
+    # Both default to ready: a camera with hardware depth needs neither, and
+    # the Logitech pipeline sets them explicitly from its own metric store.
+    camera_floor_distance: bool = True
+    height_calibration: bool = True
     method: str = ""
     reason: str = ""
     depth_output: str = ""
+    calibration_samples: int = 0
+    calibration_samples_required: int = 0
+    calibration_status: str = ""
 
     @property
     def fully_calibrated(self) -> bool:
@@ -66,6 +78,9 @@ class MeasurementReadiness:
         }
         payload.update({
             "camera": self.camera,
+            "calibration_samples": f"{self.calibration_samples}/{self.calibration_samples_required}"
+            if self.calibration_samples_required else "",
+            "calibration_status": self.calibration_status,
             "fully_calibrated": self.fully_calibrated,
             "measurement_method": self.method,
             "reason": self.reason,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 import time
 from collections import Counter, defaultdict, deque
@@ -57,6 +58,10 @@ from .deposit_state import DepositStateMachine, FrameObservation
 from .logitech_calibration import METRIC_OUTPUT, depth_output_kind
 from .measurement_mask import (BACKGROUND_REASONS, FOREGROUND_COMPONENT, deposit_component,
                                looks_like_background, rgb_change)
+from .logitech_metric import (CALIBRATION_SET, EVALUATION_SET, RECOMMENDED_SAMPLES, CameraSetup,
+                              HeightSample, LogitechMetricStore, fit_height_calibration,
+                              integrate_volume_l, robust_height_cm, stable_statistics,
+                              zone_signature)
 from .measurement_zone import MeasurementZone, MeasurementZoneStore
 from .readiness import MeasurementReadiness
 from .shape_geometry import (CYLINDER, CYLINDER_REJECTIONS, UNCERTAIN, GeometryLock,
@@ -645,6 +650,8 @@ class VisionPipeline:
         self._uncalibrated_plane = None
         # Frames each track has waited for a stable volume (Logitech timeout).
         self._measurement_frames: dict[int, int] = {}
+        # The spread statistics behind each track's current answer.
+        self._stability: dict[int, dict[str, Any]] = {}
         # What each live track looked like last frame, so a reused id cannot
         # inherit the previous object's measurements (shape_geometry.py).
         self._track_signatures: dict[int, ObjectSignature] = {}
@@ -659,6 +666,14 @@ class VisionPipeline:
         self.last_measurement_mask: dict[str, Any] = {}
         # Set when a relative-depth checkpoint could not be scaled to metres.
         self.relative_depth_reason: str | None = None
+        # The Logitech's own metric layer: the installation it was calibrated
+        # in, the ruler-measured samples and the fitted height mapping.
+        self.metric_store = LogitechMetricStore(config.results_dir / "calibration")
+        self.height_calibration = self.metric_store.calibration if camera_id == "logitech" else None
+        self.height_calibration_reason: str | None = None
+        # What the last measured frame saw, so a calibration sample can be
+        # captured from the object standing in the zone right now.
+        self.last_metric_context: dict[str, Any] = {}
         # Frames each confirmed track has waited for finalisation (non-waste modes).
         self._unfinalised_frames: dict[int, int] = {}
         # Detector / foreground / final / rejected masks of the latest Logitech
@@ -1910,6 +1925,8 @@ class VisionPipeline:
                 # which is labelled as such everywhere it appears.
                 and (detection.source != DETECTOR_ONLY_SOURCE or uncalibrated_logitech)
             ):
+                metric_mask: np.ndarray | None = None
+                metric_result: Any = None
                 if self.camera_id == "logitech":
                     volume_mask = clip_to_region(restore_mask(instance_mask, frame.shape[:2]), bin_region)
                     volume_mask = _tracked_component(volume_mask, detection.box)
@@ -2030,6 +2047,7 @@ class VisionPipeline:
                         detection.dimension_method = "logitech_support_plane_footprint"
                         detection.dimension_confidence = round(
                             float(min(0.6, result.measurement.coverage_ratio)), 4)
+                    metric_mask, metric_result = volume_mask, result
                 else:
                     individual_mono = estimate_volume(
                     calibrated_prediction,
@@ -2071,6 +2089,13 @@ class VisionPipeline:
                             detection.height_above_baseline_cm = round(
                                 individual_mono.height_p90_m * 100.0, 1
                             )
+                if metric_mask is not None:
+                    # Last, so the calibrated centimetres are what survives:
+                    # the provisional height and litres are computed above and
+                    # stay on the detection for comparison.
+                    self._apply_metric_calibration(
+                        detection, metric_mask, calibrated_prediction, metric_result,
+                    )
             if (
                 self.camera_id == "logitech"
                 and detection.monocular_volume_l is not None
@@ -2288,7 +2313,23 @@ class VisionPipeline:
                     # its answer; the id and the method do not change.
                     stable = True
                     detection.measurement_quality = "median-after-stability-timeout"
-                if not stable:
+                statistics = stable_statistics(
+                    smoothing_window, min_frames=required,
+                    tolerance=max(0.15, self.config.settle_volume_tolerance),
+                )
+                self._stability[detection.track_id] = statistics
+                if not stable and len(recent) >= required and statistics.get("median") is not None:
+                    # Valid numbers that will not sit still are still numbers.
+                    # Blanking them is how a measured object ended up showing
+                    # nothing at all; the median is shown and marked instead.
+                    stabilized = round(float(statistics["median"]), 6)
+                    if self.camera_id == "logitech":
+                        detection.monocular_volume_l = stabilized
+                    else:
+                        detection.realsense_volume_l = stabilized
+                    detection.stable_volume_l = stabilized
+                    detection.measurement_quality = "low-confidence-unstable-median"
+                elif not stable:
                     if self.camera_id == "logitech":
                         detection.monocular_volume_l = None
                     else:
@@ -3059,6 +3100,7 @@ class VisionPipeline:
                     None if self.measurement_zone is None else self.measurement_zone.describe()
                 ),
                 "measurement_zone_source": self.zone_source,
+                "logitech_metric": self.metric_status(),
                 "deposit_state": self.deposit_state.describe(),
                 # How many objects this session has finalised into
                 # measurements.csv. A download that comes back with only a
@@ -3628,6 +3670,10 @@ class VisionPipeline:
         reason = self.relative_depth_reason or self.calibration_rejected_reason or ""
         if not reason and self.last_measurement_mask.get("reason"):
             reason = str(self.last_measurement_mask["reason"])
+        samples = len(self.metric_store.samples(CALIBRATION_SET)) if logitech else 0
+        height_ready = not logitech or self.height_calibration is not None
+        if logitech and self.height_calibration_reason:
+            reason = reason or self.height_calibration_reason
         return MeasurementReadiness(
             camera=self.camera_id,
             measurement_zone=zone is not None or bool(self.config.bin_polygon),
@@ -3635,10 +3681,313 @@ class VisionPipeline:
             intrinsics=self.latest_intrinsics is not None,
             floor_scale=bool(zone is not None and zone.has_floor_scale),
             metric_depth_mapping=bool(mapping),
+            camera_floor_distance=not logitech or bool(self.config.logitech_reference_distance_m),
+            height_calibration=bool(height_ready),
             method=self.calibration_mode or getattr(self, "measurement_method", "") or "",
             reason=reason,
             depth_output=depth_output_kind(self.config.depth_model) if logitech else "hardware_depth",
+            calibration_samples=samples,
+            calibration_samples_required=RECOMMENDED_SAMPLES if logitech else 0,
+            calibration_status=(
+                "missing" if not logitech or self.height_calibration is None
+                else self.height_calibration.status
+            ),
         )
+
+    # ------------------------------------------------ the Logitech metric layer
+    def _camera_setup(self, shape: tuple[int, ...] | None = None) -> CameraSetup:
+        """The installation this camera is in right now."""
+        if shape is None:
+            frame = self.latest_frame if self.latest_frame is not None else self.latest_processed_frame
+            shape = (0, 0) if frame is None else frame.shape[:2]
+        saved = self.metric_store.setup
+        return CameraSetup(
+            camera=self.camera_id, width_px=int(shape[1]), height_px=int(shape[0]),
+            camera_floor_distance_cm=float(self.config.logitech_reference_distance_m or 0.0) * 100.0,
+            zone_signature=zone_signature(self.measurement_zone),
+            setup_id="" if saved is None else saved.setup_id,
+            note="" if saved is None else saved.note,
+        )
+
+    def save_camera_setup(
+        self, *, camera_floor_distance_cm: float, setup_id: str = "", note: str = "",
+        shape: tuple[int, ...] | None = None,
+    ) -> dict[str, Any]:
+        """Record the physical setup a calibration will belong to.
+
+        The distance is from the camera's optical centre straight down to the
+        empty measurement floor. It is part of the calibration's identity: move
+        the camera and the mapping fitted under the old height is no longer
+        about this scene.
+        """
+        distance = float(camera_floor_distance_cm)
+        if not math.isfinite(distance) or distance <= 0:
+            raise ValueError("Measure the camera-to-floor distance in centimetres")
+        with self.lock:
+            self.config.logitech_reference_distance_m = distance / 100.0
+            setup = self._camera_setup(shape)
+            setup = replace(setup, camera_floor_distance_cm=distance,
+                            setup_id=setup_id or setup.setup_id, note=note or setup.note)
+            stored = self.metric_store.save_setup(setup)
+            self._validate_height_calibration(stored)
+        return stored.to_dict()
+
+    def _validate_height_calibration(self, setup: CameraSetup | None = None) -> None:
+        """Refuse a calibration that belongs to another installation."""
+        if self.camera_id != "logitech":
+            return
+        calibration = self.metric_store.calibration
+        if calibration is None:
+            self.height_calibration, self.height_calibration_reason = None, None
+            return
+        current = setup or self._camera_setup()
+        # Judged against the installation the mapping was *fitted* in, not the
+        # one saved a moment ago: saving a new setup is exactly the event that
+        # should invalidate an older calibration.
+        recorded = self.metric_store.setup
+        if calibration.setup_snapshot:
+            try:
+                recorded = CameraSetup.from_dict(calibration.setup_snapshot)
+            except (KeyError, TypeError, ValueError):
+                pass
+        difference = current.difference(recorded)
+        if difference and difference != "no_saved_camera_setup":
+            self.height_calibration = None
+            self.height_calibration_reason = f"calibration_invalidated_{difference}"
+            return
+        self.height_calibration, self.height_calibration_reason = calibration, None
+
+    def _metric_signal(
+        self, mask: np.ndarray, prediction: np.ndarray | None,
+    ) -> np.ndarray | None:
+        """How far each object pixel stands above the empty floor, before calibration.
+
+        The difference between the empty-scene prediction and this frame's, in
+        the model's own units read as centimetres. It is a *signal*, not a
+        height: turning it into centimetres of real object is exactly what the
+        calibration does.
+        """
+        reference = self.reference_monocular
+        if prediction is None or reference is None or prediction.shape != reference.shape:
+            return None
+        if mask.shape != prediction.shape:
+            return None
+        signal = (reference.astype(np.float32) - prediction.astype(np.float32)) * 100.0
+        signal[~np.isfinite(signal)] = 0.0
+        return signal
+
+    def _apply_metric_calibration(
+        self, detection: Detection, mask: np.ndarray, prediction: np.ndarray | None, result: Any,
+    ) -> None:
+        """Report calibrated centimetres, and keep the provisional numbers beside them.
+
+        Length and width come from the mat's homography -- the mask warped to a
+        bird's-eye view and fitted with an oriented rectangle -- so an object at
+        the back of the mat is not reported smaller than the same object at the
+        front. Height comes from the fitted mapping, and the volume is the
+        per-pixel integral of the two.
+        """
+        if self.camera_id != "logitech":
+            return
+        signal = self._metric_signal(mask, prediction)
+        if signal is None or not np.any(mask):
+            return
+        zone = self.measurement_zone
+        area_cm2 = None
+        if zone is not None and zone.has_floor_scale:
+            metres = zone.pixel_area_m2(mask.shape)
+            area_cm2 = None if metres is None else metres * 10000.0
+        raw = robust_height_cm(signal[mask])
+        footprint = None if zone is None else zone.footprint_m(mask)
+        self.last_metric_context = {
+            "signal_cm": float(raw.get("top_cm", 0.0)),
+            "signal_mean_cm": float(raw.get("mean_cm", 0.0)),
+            "mask_pixels": int(np.count_nonzero(mask)),
+            "length_cm": None if footprint is None else round(footprint[0] * 100.0, 2),
+            "width_cm": None if footprint is None else round(footprint[1] * 100.0, 2),
+            "mask": mask.copy(), "signal_map": signal, "prediction": prediction,
+            "label": detection.label, "track_id": detection.track_id,
+        }
+        # Whatever the provisional path produced, kept for comparison.
+        detection.uncalibrated_length_mm = detection.footprint_length_mm
+        detection.uncalibrated_width_mm = detection.footprint_width_mm
+        detection.uncalibrated_height_mm = detection.physical_height_mm
+        detection.uncalibrated_volume_l = detection.monocular_volume_l
+
+        if footprint is not None:
+            # The mat's own scale, so the same object measures the same at the
+            # front and the back of the perspective view.
+            detection.footprint_length_mm = round(footprint[0] * 1000.0, 2)
+            detection.footprint_width_mm = round(footprint[1] * 1000.0, 2)
+            detection.dimension_method = "logitech_homography_footprint"
+
+        calibration = self.height_calibration
+        if calibration is None:
+            detection.calibration_version = None
+            if detection.measurement_quality in (None, "", "measured"):
+                detection.measurement_quality = self.calibration_mode or "uncalibrated-estimate"
+            return
+
+        heights_cm = np.asarray(calibration.apply(signal), dtype=np.float64)
+        heights_cm = np.where(mask, heights_cm, 0.0)
+        ceiling_cm = max(20.0, float(self.config.logitech_reference_distance_m or 0.0) * 100.0)
+        statistics = robust_height_cm(heights_cm[mask], max_cm=ceiling_cm)
+        if "top_cm" not in statistics:
+            return
+        detection.physical_height_mm = round(float(statistics["top_cm"]) * 10.0, 2)
+        detection.height_above_baseline_cm = round(float(statistics["top_cm"]), 1)
+        detection.dimension_method = (
+            "logitech_calibrated_homography" if footprint is not None else "logitech_calibrated_height"
+        )
+        detection.calibration_version = f"{calibration.mapping}:{calibration.setup_id or 'setup'}"
+        litres = integrate_volume_l(np.clip(heights_cm, 0.0, ceiling_cm), area_cm2, mask)
+        if litres is not None and litres > 0:
+            detection.monocular_volume_l = round(litres, 6)
+            detection.measurement_method = "logitech_calibrated_height_map"
+            detection.measurement_quality = (
+                "calibrated" if calibration.frozen else "provisional-calibration"
+            )
+        self.last_metric_context.update({
+            "height_cm": float(statistics["top_cm"]),
+            "volume_l": detection.monocular_volume_l,
+        })
+
+    # -------------------------------------------------- operator calibration steps
+    def capture_empty_zone(self) -> dict[str, Any]:
+        """Capture the empty measurement zone, or say exactly why it was refused.
+
+        A baseline taken while something is still in the zone poisons every
+        later measurement -- that object becomes part of the floor. The checks
+        are therefore explicit, and the baseline itself is the temporal median
+        the existing capture already builds rather than one noisy frame.
+        """
+        with self.lock:
+            frame = self.latest_frame
+            if frame is None:
+                return {"ok": False, "reason": "no_camera_frame_yet"}
+            region = self._measurement_region(frame.shape)
+            analysis = self.latest_analysis
+            inside = [
+                item for item in (analysis.detections if analysis is not None else [])
+                if item.track_id is not None and not _is_phantom_detection(item)
+            ]
+            if inside:
+                return {"ok": False, "reason": "object_inside_measurement_zone",
+                        "objects": [item.label for item in inside]}
+            depth = self.latest_monocular_depth if self.camera_id == "logitech" else self.latest_depth
+            if depth is None:
+                return {"ok": False, "reason": "no_depth_for_this_camera"}
+            if depth.shape == region.shape:
+                valid = np.isfinite(depth) & (depth > 0.05) & region
+                coverage = int(np.count_nonzero(valid)) / max(int(np.count_nonzero(region)), 1)
+                if coverage < 0.5:
+                    return {"ok": False, "reason": "insufficient_valid_depth_in_zone",
+                            "coverage": round(coverage, 3)}
+            frames = [item for item in self._recent_depth_frames if item.shape == depth.shape]
+            if len(frames) >= 3:
+                spread = float(np.median(np.std(np.stack(frames[-5:]), axis=0)))
+                if spread > max(0.05, 4.0 * float(self.config.depth_noise_m)):
+                    return {"ok": False, "reason": "scene_not_stable", "spread_m": round(spread, 4)}
+        captured = self.set_baseline()
+        self._validate_height_calibration()
+        return {"ok": True, "baseline": captured, "samples": len(self._recent_depth_frames)}
+
+    def add_height_sample(
+        self, *, name: str, true_length_cm: float, true_width_cm: float, true_height_cm: float,
+        true_volume_l: float | None = None, kind: str = CALIBRATION_SET,
+    ) -> dict[str, Any]:
+        """Record the object standing in the zone, with the size a ruler says it is."""
+        context = dict(self.last_metric_context)
+        if not context or not context.get("signal_cm"):
+            raise ValueError("Place the object in the measurement zone and wait for a measurement")
+        if float(true_height_cm) <= 0:
+            raise ValueError("The object's true height in centimetres is required")
+        setup = self.metric_store.setup
+        sample = HeightSample(
+            name=str(name or context.get("label") or "object"),
+            true_length_cm=float(true_length_cm or 0.0), true_width_cm=float(true_width_cm or 0.0),
+            true_height_cm=float(true_height_cm), true_volume_l=true_volume_l,
+            signal_cm=float(context["signal_cm"]), signal_mean_cm=float(context.get("signal_mean_cm", 0.0)),
+            measured_length_cm=float(context.get("length_cm") or 0.0),
+            measured_width_cm=float(context.get("width_cm") or 0.0),
+            measured_height_cm=float(context.get("height_cm") or context["signal_cm"]),
+            mask_pixels=int(context.get("mask_pixels", 0)),
+            setup_id="" if setup is None else setup.setup_id,
+            kind=kind if kind in (CALIBRATION_SET, EVALUATION_SET) else CALIBRATION_SET,
+            artefacts=self._save_sample_artefacts(name, context),
+        )
+        stored = self.metric_store.add_sample(sample)
+        return {"sample": stored.to_dict(), **self.metric_status()}
+
+    def _save_sample_artefacts(self, name: str, context: dict[str, Any]) -> dict[str, str]:
+        """Keep the evidence behind a calibration sample, so a fit can be audited."""
+        directory = self.config.results_dir / "calibration" / "samples"
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        folder = directory / f"{stamp}_{''.join(ch for ch in str(name) if ch.isalnum() or ch in '-_')[:40]}"
+        artefacts: dict[str, str] = {}
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            frame = self.latest_processed_frame
+            if frame is not None:
+                import cv2
+
+                cv2.imwrite(str(folder / "frame.png"), frame)
+                artefacts["frame"] = str(folder / "frame.png")
+            for key, array in (("mask", context.get("mask")),
+                               ("prediction", context.get("prediction")),
+                               ("baseline_relative", context.get("signal_map"))):
+                if array is not None:
+                    np.save(folder / f"{key}.npy", np.asarray(array))
+                    artefacts[key] = str(folder / f"{key}.npy")
+        except (OSError, ValueError, ImportError) as exc:  # pragma: no cover - disk/codec issues
+            LOGGER.warning("Could not save calibration artefacts (%s)", exc)
+        return artefacts
+
+    def fit_height_calibration(self) -> dict[str, Any]:
+        """Fit the mapping from the ruler-measured samples and keep the best."""
+        samples = self.metric_store.samples(CALIBRATION_SET)
+        setup = self.metric_store.setup
+        calibration, reason = fit_height_calibration(
+            samples, setup_id="" if setup is None else setup.setup_id, setup=setup,
+        )
+        if calibration is None:
+            return {"ok": False, "reason": reason, **self.metric_status()}
+        self.metric_store.save_calibration(calibration)
+        self._validate_height_calibration()
+        return {"ok": True, **self.metric_status()}
+
+    def freeze_height_calibration(self) -> dict[str, Any]:
+        """Freeze the mapping, so evaluation objects are measured by a fixed rule."""
+        frozen = self.metric_store.freeze()
+        self._validate_height_calibration()
+        return {"ok": frozen is not None, **self.metric_status()}
+
+    def reset_height_calibration(self, *, samples: bool = False) -> dict[str, Any]:
+        with self.lock:
+            self.metric_store.save_calibration(None)
+            if samples:
+                self.metric_store.clear_samples()
+            self.height_calibration, self.height_calibration_reason = None, None
+        return self.metric_status()
+
+    def metric_status(self) -> dict[str, Any]:
+        """Everything the calibration panel shows for this camera."""
+        if self.camera_id != "logitech":
+            return {"camera": self.camera_id, "applies": False}
+        status = self.metric_store.status(required=RECOMMENDED_SAMPLES)
+        zone = self.measurement_zone
+        status.update({
+            "camera": self.camera_id, "applies": True,
+            "measurement_zone": None if zone is None else zone.describe(),
+            "floor_dimensions": "ready" if zone is not None and zone.has_floor_scale else "missing",
+            "camera_floor_distance_cm": round(
+                float(self.config.logitech_reference_distance_m or 0.0) * 100.0, 1) or None,
+            "empty_baseline": "ready" if self.reference_monocular is not None else "missing",
+            "active": None if self.height_calibration is None else self.height_calibration.to_dict(),
+            "invalidated_reason": self.height_calibration_reason,
+            "measurement_method": getattr(self, "measurement_method", "") or "",
+        })
+        return status
 
     def _verify_track_identity(self, detection: Detection) -> None:
         """Drop this track's histories when the id has changed hands.
@@ -3679,6 +4028,7 @@ class VisionPipeline:
             self._unfinalised_frames.pop(track_id, None)
             self._logitech_volume_samples.pop(track_id, None)
             self._measurement_frames.pop(track_id, None)
+            self._stability.pop(track_id, None)
             self._logitech_volume_spread.pop(track_id, None)
             self._color_history.pop(track_id, None)
             self._material_history.pop(track_id, None)

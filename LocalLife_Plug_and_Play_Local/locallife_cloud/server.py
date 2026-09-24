@@ -821,6 +821,107 @@ def create_app(
             return jsonify(error=str(exc)), 404
         return jsonify(ok=True)
 
+    def _camera(camera_id: str):
+        return manager.camera(camera_id)
+
+    @app.post("/api/cameras/<camera_id>/camera-setup")
+    @protected
+    def save_camera_setup(camera_id: str) -> Any:
+        """Step 2 of the wizard: the physical installation this camera is in.
+
+        The distance is measured from the camera's optical centre straight down
+        to the empty measurement floor. It becomes part of the calibration's
+        identity, so moving the camera invalidates the mapping rather than
+        silently reporting wrong heights.
+        """
+        payload = request.get_json(silent=True) or {}
+        try:
+            station = _camera(camera_id)
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 404
+        try:
+            setup = station.save_camera_setup(
+                camera_floor_distance_cm=float(payload.get("camera_floor_distance_cm", 0) or 0),
+                setup_id=str(payload.get("setup_id", "") or ""),
+                note=str(payload.get("note", "") or ""),
+            )
+        except (TypeError, ValueError) as exc:
+            return jsonify(error=str(exc)), 400
+        return jsonify(ok=True, camera_setup=setup, status=station.metric_status())
+
+    @app.post("/api/cameras/<camera_id>/empty-zone")
+    @protected
+    def capture_empty_zone(camera_id: str) -> Any:
+        """Step 3: capture the empty measurement zone, with its own checks."""
+        try:
+            result = _camera(camera_id).capture_empty_zone()
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 404
+        return jsonify(**result), (200 if result.get("ok") else 409)
+
+    @app.post("/api/cameras/<camera_id>/height-samples")
+    @protected
+    def add_height_sample(camera_id: str) -> Any:
+        """Step 4: the object in the zone, with the size a ruler says it is."""
+        payload = request.get_json(silent=True) or {}
+        try:
+            station = _camera(camera_id)
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 404
+        try:
+            result = station.add_height_sample(
+                name=str(payload.get("name", "") or ""),
+                true_length_cm=float(payload.get("true_length_cm", 0) or 0),
+                true_width_cm=float(payload.get("true_width_cm", 0) or 0),
+                true_height_cm=float(payload.get("true_height_cm", 0) or 0),
+                true_volume_l=(None if payload.get("true_volume_l") in (None, "")
+                               else float(payload["true_volume_l"])),
+                kind=str(payload.get("kind", "calibration") or "calibration"),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            return jsonify(error=str(exc)), 400
+        return jsonify(ok=True, **result)
+
+    @app.post("/api/cameras/<camera_id>/height-calibration/fit")
+    @protected
+    def fit_height_calibration(camera_id: str) -> Any:
+        try:
+            result = _camera(camera_id).fit_height_calibration()
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 404
+        return jsonify(**result), (200 if result.get("ok") else 409)
+
+    @app.post("/api/cameras/<camera_id>/height-calibration/freeze")
+    @protected
+    def freeze_height_calibration(camera_id: str) -> Any:
+        try:
+            result = _camera(camera_id).freeze_height_calibration()
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 404
+        return jsonify(**result), (200 if result.get("ok") else 409)
+
+    @app.post("/api/cameras/<camera_id>/height-calibration/reset")
+    @protected
+    def reset_height_calibration(camera_id: str) -> Any:
+        payload = request.get_json(silent=True) or {}
+        try:
+            status = _camera(camera_id).reset_height_calibration(
+                samples=bool(payload.get("samples", False)),
+            )
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 404
+        return jsonify(ok=True, **status)
+
+    @app.get("/api/cameras/<camera_id>/metric-status")
+    @protected
+    def metric_status(camera_id: str) -> Any:
+        try:
+            station = _camera(camera_id)
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 404
+        return jsonify(status=station.metric_status(),
+                       readiness=station.state()["measurement_readiness"])
+
     @app.get("/api/cameras/<camera_id>/measurement-readiness")
     @protected
     def measurement_readiness(camera_id: str) -> Any:

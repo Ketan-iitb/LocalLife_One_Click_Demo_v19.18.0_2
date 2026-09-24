@@ -136,6 +136,14 @@ class Detection:
     dimension_confidence: float | None = None
     dimension_flags: tuple[str, ...] = ()
     dimension_method: str | None = None
+    # What the same frame measured *before* the Logitech height calibration
+    # was applied, kept beside the calibrated answer so the dashboard can show
+    # both and a reader can see what the calibration actually changed.
+    uncalibrated_length_mm: float | None = None
+    uncalibrated_width_mm: float | None = None
+    uncalibrated_height_mm: float | None = None
+    uncalibrated_volume_l: float | None = None
+    calibration_version: str | None = None
     # Shape-aware geometry (shape_geometry.ShapeGeometry): the method the
     # object's points support, its dimensions and bounding-box / shape /
     # mesh volumes. Frozen once the track's method is accepted.
@@ -207,6 +215,13 @@ class Detection:
             "dimension_confidence": self.dimension_confidence,
             "dimension_flags": list(self.dimension_flags),
             "dimension_method": self.dimension_method,
+            "uncalibrated_dimensions_mm": None if self.uncalibrated_length_mm is None else {
+                "footprint_length": round(float(self.uncalibrated_length_mm), 2),
+                "footprint_width": round(float(self.uncalibrated_width_mm or 0.0), 2),
+                "height": round(float(self.uncalibrated_height_mm or 0.0), 2),
+            },
+            "uncalibrated_volume_l": self.uncalibrated_volume_l,
+            "calibration_version": self.calibration_version,
             "shape_geometry": None if self.shape_geometry is None else self.shape_geometry.to_dict(),
         }
 
