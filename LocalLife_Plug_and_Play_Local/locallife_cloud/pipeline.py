@@ -48,6 +48,7 @@ from .logitech_footprint import FootprintResult, measure_footprint
 from .logitech_autocal import BaselineLearner, camera_height_from_plane
 from .logitech_bin import (
     envelope_fill,
+    implausible_aspect_reason,
     merged_neighbour_reason,
     publish_decision,
     shape_model_for,
@@ -69,6 +70,12 @@ from .coordinates import clip_to_region, frame_consistency, restore_mask
 from .logitech_factor import LogitechVolumeFactors, geometry_group
 from .logitech_volume import axis_aligned_plane, fit_plane_alignment, metric_object_volume, stable_volume
 from .vocabulary import object_type as canonical_object_type
+from .bin_occupancy import (
+    NO_OCCUPANCY,
+    BinOccupancyTracker,
+    DepositObservation,
+    OccupancyReading,
+)
 from .deposit_state import DepositStateMachine, FrameObservation
 from .logitech_calibration import METRIC_OUTPUT, depth_output_kind
 from .measurement_mask import (BACKGROUND_REASONS, DETECTOR_MASK, FOREGROUND_COMPONENT,
@@ -691,6 +698,12 @@ class VisionPipeline:
         self.zone_source = "saved-zone" if self.measurement_zone is not None else "configured-roi"
         # Where this camera is in the deposit it is watching (deposit_state.py).
         self.deposit_state = DepositStateMachine(settle_frames=max(2, config.settle_frames))
+        # How full this camera sees the bin, before and after each deposit.
+        self.bin_occupancy = BinOccupancyTracker(
+            camera_id, required_stable_frames=max(2, config.settle_frames),
+        )
+        self.last_scene_grid: HeightMapVolume | None = None
+        self.last_occupancy_absolute = False
         # The last frame's measurement-mask decision, for the diagnostics bundle.
         self.last_measurement_mask: dict[str, Any] = {}
         # Set when a relative-depth checkpoint could not be scaled to metres.
@@ -1649,17 +1662,33 @@ class VisionPipeline:
         # logic below. It is the same computation `bin_total` already performs,
         # kept as a grid so a committed scene can be differenced against it.
         scene_grid = None
+        # Each camera measures the bin's waste surface from its own depth, its
+        # own intrinsics and its own floor plane. This is the occupancy reading
+        # the before/after event is built on, and it is why the Logitech now
+        # computes one too: the thesis needs the change in how full the bin is,
+        # not only the size of the bag in front of the lens. No value crosses
+        # between the two cameras.
+        if self.camera_id == "logitech":
+            occupancy_plane = (
+                measurement_plane
+                if measurement_plane is not None and measurement_plane.coefficients is not None
+                else self._logitech_plane_cache[1] if self._logitech_plane_cache else None
+            )
+            occupancy_depth = calibrated_prediction
+        else:
+            occupancy_plane, occupancy_depth = measurement_plane, depth_m
+        occupancy_intrinsics = measure_intrinsics if self.camera_id == "logitech" else intrinsics
         if (
-            self.camera_id != "logitech"
-            and depth_m is not None
-            and intrinsics is not None
-            and measurement_plane is not None
-            and measurement_plane.coefficients is not None
+            occupancy_depth is not None
+            and occupancy_intrinsics is not None
+            and occupancy_plane is not None
+            and occupancy_plane.coefficients is not None
+            and occupancy_depth.shape == bin_region.shape
         ):
             scene_grid = integrate_height_map(
-                depth_m,
-                intrinsics,
-                plane_coefficients=measurement_plane.coefficients,
+                occupancy_depth,
+                occupancy_intrinsics,
+                plane_coefficients=occupancy_plane.coefficients,
                 mask=bin_region,
                 settings=HeightMapSettings(
                     grid_size_m=self.config.volume_grid_size_m,
@@ -1671,6 +1700,16 @@ class VisionPipeline:
                     max_fill_fraction=1.0,
                 ),
             )
+        self.last_scene_grid = scene_grid
+        # Absolute occupancy is only meaningful when the plane under the waste
+        # is the *empty bin's* floor, saved when the installation was set up. A
+        # plane fitted through whatever is in the bin right now measures change
+        # honestly and cannot say how full the bin is.
+        self.last_occupancy_absolute = bool(
+            occupancy_plane is not None
+            and getattr(occupancy_plane, "coefficients", None) is not None
+            and self.support_plane_source in ("captured-baseline", "empty_baseline")
+        )
         if hardware_total is not None and hardware_total.coverage_ratio < self.config.minimum_depth_coverage:
             warnings.append(
                 f"Only {hardware_total.coverage_ratio * 100:.0f}% of the bag has valid depth; "
@@ -1894,7 +1933,17 @@ class VisionPipeline:
                 )
                 if id(detection) in recovered_measurement_ids:
                     extra_dimension_flags += ("support_plane_mask_recovered",)
-                detection.dimension_flags = tuple(dimensions.flags) + extra_dimension_flags
+                # A label, never a deletion: the numbers still go out unchanged,
+                # so nothing that worked stops working, but a reader can see
+                # that the system does not believe a 572 mm column 71 mm wide
+                # is a bag sitting in a bin.
+                aspect = implausible_aspect_reason(
+                    smoothed_length, smoothed_width, smoothed_height,
+                )
+                detection.dimension_flags = (
+                    tuple(dimensions.flags) + extra_dimension_flags
+                    + ((aspect,) if aspect else ())
+                )
                 detection.dimension_method = dimensions.method
                 # Use the same plane-relative, elevated-point height shown in
                 # the dimension triplet, not a camera-Z mask median.
@@ -3277,6 +3326,10 @@ class VisionPipeline:
                 "measurement_zone_source": self.zone_source,
                 "logitech_metric": self.metric_status(),
                 "deposit_state": self.deposit_state.describe(),
+                # The thesis measurement: how full the bin was before this
+                # deposit, how full after, and the difference. Separate from
+                # any single object's own envelope.
+                "bin_occupancy": self.bin_occupancy.describe(),
                 # How many objects this session has finalised into
                 # measurements.csv. A download that comes back with only a
                 # header is almost always this being zero because no empty-bin
@@ -4040,6 +4093,58 @@ class VisionPipeline:
                 item.volume_rejection_reason for item in detections
             ),
         ))
+        self._observe_bin_occupancy(detections, changed)
+
+    def _observe_bin_occupancy(self, detections: list[Detection], changed: float) -> None:
+        """Feed this frame's bin surface to the before/after event tracker.
+
+        The occupancy reading is the whole bin's waste surface, not the object
+        in front of the lens: the thesis measures what the bin gained, and a
+        bag that slides into a gap raises the surface by less than its own
+        size while one that compresses the pile can lower it. The bag's own
+        envelope travels alongside as a separate quantity and is never added to
+        the occupancy change.
+        """
+        grid = self.last_scene_grid
+        reading = OccupancyReading(
+            litres=None if grid is None else float(grid.liters),
+            valid_fraction=0.0 if grid is None else float(grid.valid_depth_fraction),
+            absolute=self.last_occupancy_absolute,
+            reason=None if grid is not None else NO_OCCUPANCY,
+        )
+        newest = next(
+            (item for item in detections
+             if item.track_id is not None and not _is_phantom_detection(item)),
+            None,
+        )
+        envelope = None
+        if newest is not None and newest.footprint_length_mm and newest.physical_height_mm:
+            envelope = (
+                float(newest.footprint_length_mm), float(newest.footprint_width_mm or 0.0),
+                float(newest.physical_height_mm),
+            )
+        event = self.bin_occupancy.observe(DepositObservation(
+            reading=reading,
+            changed_fraction=changed,
+            tracked_objects=sum(1 for item in detections if item.track_id is not None),
+            # A hand reaching in covers the bin without being a deposit: the
+            # surface it hides is not the waste surface, and an event measured
+            # across it is not a before/after pair.
+            obstructed=bool(grid is not None and grid.valid_depth_fraction < 0.35),
+            label=None if newest is None else newest.label,
+            color=None if newest is None else newest.color,
+            track_id=None if newest is None else newest.track_id,
+            envelope_mm=envelope,
+        ))
+        if event is not None:
+            self.store.save_json(
+                f"occupancy/{event.event_id}.json", event.to_dict(),
+            )
+            LOGGER.info(
+                "%s occupancy event %s: before=%s L after=%s L delta=%s L (%s)",
+                self.camera_id, event.event_id, event.occupied_before_l,
+                event.occupied_after_l, event.delta_occupancy_l, event.status,
+            )
 
     def _measurement_readiness(self) -> MeasurementReadiness:
         """Each prerequisite for a metric measurement, ready or missing."""

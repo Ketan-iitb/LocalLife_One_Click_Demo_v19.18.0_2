@@ -169,6 +169,9 @@ class GeometryStabiliser:
         self.minimum_frames = max(1, int(minimum_frames))
         self.tolerance = float(tolerance)
         self._samples: dict[int, list[tuple[float, float, float, float | None]]] = {}
+        # A track's finalised triplet, kept so overlay, table and export can
+        # never show three different sizes for one object.
+        self._latched: dict[int, StableGeometry] = {}
 
     def update(
         self, track_id: int | None, *, length_mm: float, width_mm: float, height_mm: float,
@@ -176,6 +179,15 @@ class GeometryStabiliser:
     ) -> StableGeometry:
         if track_id is None:
             return StableGeometry(length_mm, width_mm, height_mm, volume_l, 1, False, float("inf"))
+        latched = self._latched.get(int(track_id))
+        if latched is not None:
+            # Once a track has settled, its published size stops moving. The
+            # overlay is drawn from one frame and the table read from another,
+            # so a triplet that keeps drifting shows two different sizes for
+            # one object in the same glance -- 329 x 214 x 99 on the picture
+            # beside 329 x 212 x 91 in the row. The finalised answer is one
+            # answer, and this is where it becomes one.
+            return latched
         samples = self._samples.setdefault(int(track_id), [])
         samples.append((float(length_mm), float(width_mm), float(height_mm), volume_l))
         if len(samples) > self.window:
@@ -190,19 +202,24 @@ class GeometryStabiliser:
             if centre > 0:
                 spread = max(spread, (max(values) - min(values)) / centre)
         settled = len(samples) >= self.minimum_frames and spread <= self.tolerance
-        return StableGeometry(
+        result = StableGeometry(
             length_mm=round(median(lengths), 2), width_mm=round(median(widths), 2),
             height_mm=round(median(heights), 2),
             volume_l=None if not volumes else round(median(volumes), 6),
             samples=len(samples), settled=settled, spread=round(spread, 4),
         )
+        if settled:
+            self._latched[int(track_id)] = result
+        return result
 
     def forget(self, track_id: int | None) -> None:
         if track_id is not None:
             self._samples.pop(int(track_id), None)
+            self._latched.pop(int(track_id), None)
 
     def clear(self) -> None:
         self._samples.clear()
+        self._latched.clear()
 
 
 def unclaimed_foreground_islands(

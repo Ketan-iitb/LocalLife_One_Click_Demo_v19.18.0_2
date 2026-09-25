@@ -133,6 +133,33 @@ def envelope_fill(
     return EnvelopeFill(envelope, fill, shape_model, True, None)
 
 
+IMPLAUSIBLE_ASPECT = "height_implausible_for_this_footprint"
+# A bag resting in a bin is wider than it is tall, or close to it. A triplet
+# whose height is several times its own longest ground side is a mask that ran
+# up a wall or a depth reading that escaped the bin -- the field screenshots
+# show 163 x 71 x 572 mm and 415 x 225 x 537 mm for bags about 150 mm high.
+MAX_HEIGHT_TO_FOOTPRINT = 3.0
+
+
+def implausible_aspect_reason(
+    length_mm: float | None, width_mm: float | None, height_mm: float | None,
+    *, limit: float = MAX_HEIGHT_TO_FOOTPRINT,
+) -> str | None:
+    """Is this triplet a shape an object in a bin can have?
+
+    Deliberately a label and not a deletion: the dimensions still go out, so
+    nothing that worked stops working, but a reader can see that the system
+    itself does not believe them. A free-standing 572 mm column 71 mm wide does
+    not sit in a waste bin; a mask that climbed the bin wall does.
+    """
+    if not length_mm or not width_mm or not height_mm:
+        return None
+    longest = max(float(length_mm), float(width_mm))
+    if longest <= 0:
+        return None
+    return IMPLAUSIBLE_ASPECT if float(height_mm) > limit * longest else None
+
+
 def merged_neighbour_reason(
     mask: np.ndarray,
     other_masks: list[np.ndarray],
