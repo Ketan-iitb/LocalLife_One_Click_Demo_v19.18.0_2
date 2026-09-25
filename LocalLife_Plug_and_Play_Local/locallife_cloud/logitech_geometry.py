@@ -51,8 +51,11 @@ from typing import Any
 import numpy as np
 
 
-# The upper percentile of the object's own cells that represents its top.
-TOP_HEIGHT_PERCENTILE = 98.0
+# A height counts as the object's when this much of its own footprint reaches
+# it -- never fewer than MIN_TOP_CELLS, so a small object is not measured by a
+# single cell.
+MIN_TOP_AREA_FRACTION = 0.03
+MIN_TOP_CELLS = 4
 
 # A mask covering more of the measurement zone than this is the scene, not a
 # deposit standing in it.
@@ -69,19 +72,34 @@ CHANGE_RECOVERED_SOURCE = "logitech-foreground-change-object"
 
 
 def robust_object_height_m(
-    heights: np.ndarray, *, percentile: float = TOP_HEIGHT_PERCENTILE, noise_floor_m: float = 0.004,
+    heights: np.ndarray, *, noise_floor_m: float = 0.004,
+    min_area_fraction: float = MIN_TOP_AREA_FRACTION, min_cells: int = MIN_TOP_CELLS,
 ) -> float | None:
-    """The object's top, from its own cells rather than from every cell.
+    """The highest level a real part of the object actually reaches.
 
-    The spike gate upstream has already removed the monocular outliers, so an
-    upper percentile here is the top surface and not a depth artefact. Values
-    at or below the sensor's noise floor are not a height at all.
+    Not a percentile chosen by taste. A height is believed when enough of the
+    object's own footprint reaches it: at least `min_area_fraction` of its cells
+    and never fewer than `min_cells`, whichever is larger. That single rule
+    handles both failures that a plain percentile could not handle together.
+
+    A bottle's neck is a twelfth of its footprint and 50 mm above its body, so
+    it clears the bar and the bottle measures 203 mm rather than its body's
+    150 mm. A handful of monocular depth spikes over a flat, shiny bag is a
+    fraction of a percent of a large footprint, does not clear it, and cannot
+    turn a 78 mm bag into a 228 mm one. On a small object, where three per cent
+    of the footprint is less than a cell, `min_cells` takes over and the height
+    still needs several cells to agree.
+
+    Values at or below the sensor's noise floor are not a height at all.
     """
     values = np.asarray(heights, dtype=np.float64)
     values = values[np.isfinite(values) & (values > noise_floor_m)]
     if values.size == 0:
         return None
-    return float(np.percentile(values, percentile))
+    needed = max(int(min_cells), int(np.ceil(min_area_fraction * values.size)))
+    needed = min(needed, values.size)
+    # The needed-th largest value: the level that many cells reach or exceed.
+    return float(np.sort(values)[-needed])
 
 
 def geometry_consistency(

@@ -45,6 +45,7 @@ from . import __version__
 from .stable_identity import Observation, StabilitySettings, StableObjectRegistry, observations_from
 from .footprint import DimensionSmoother
 from .logitech_footprint import FootprintResult, measure_footprint
+from .logitech_autocal import BaselineLearner, camera_height_from_plane
 from .logitech_geometry import (
     CHANGE_RECOVERED_SOURCE,
     GeometryStabiliser,
@@ -701,10 +702,20 @@ class VisionPipeline:
         # The fixed camera's floor plane, fitted once per resolution.
         self._logitech_plane_cache: tuple[tuple[int, int], Any] | None = None
         self._logitech_plane_reason: str | None = None
+        self._logitech_plane_source = "none"
         # Rolling median of each Logitech track's dimensions and volume.
         self._logitech_geometry = GeometryStabiliser(
             window=9, minimum_frames=3, tolerance=0.25,
         )
+        # Where the camera height came from, and the empty scene it learned by
+        # itself -- both shown in the diagnostics so a derived value is never
+        # mistaken for a measured one.
+        self.logitech_distance_source = (
+            "operator_measured" if config.logitech_reference_distance_m else "none"
+        )
+        self.logitech_derived_distance_m: float | None = None
+        self._baseline_learner = BaselineLearner(depth_noise_m=config.depth_noise_m)
+        self.auto_baseline_state: dict[str, Any] = {}
         # Frames each confirmed track has waited for finalisation (non-waste modes).
         self._unfinalised_frames: dict[int, int] = {}
         # Detector / foreground / final / rejected masks of the latest Logitech
@@ -1297,6 +1308,16 @@ class VisionPipeline:
                 debug=mask_debug,
             )
             self.logitech_mask_debug = {"frame": frame, **mask_debug}
+            # Startup, without asking the operator for anything: the floor plane
+            # gives the camera height, and a still, empty view gives the
+            # baseline. Both run every frame and both are cheap -- the plane is
+            # cached, and the learner only counts.
+            self._auto_camera_height(self._logitech_floor_plane(
+                calibrated_prediction, measure_intrinsics, None, bin_region,
+            ))
+            self._maybe_learn_empty_baseline(
+                frame, calibrated_prediction, bin_region, detections,
+            )
             detections.extend(self._recovered_foreground_detections(
                 frame, detections, mask_debug.get("foreground"), bin_region,
             ))
@@ -2041,7 +2062,8 @@ class VisionPipeline:
                         max_height_m=self.config.max_object_height_m,
                         min_pixels=min(25, self.config.logitech_min_object_pixels),
                         cell_size_m=self.config.logitech_height_map_cell_m,
-                        camera_height_m=self.config.logitech_reference_distance_m or None,
+                        # Measured or derived: geometry only needs the number.
+                        camera_height_m=self.camera_height_m(),
                     )
                     individual_mono = result.measurement
                     prediction_values = (
@@ -3174,11 +3196,21 @@ class VisionPipeline:
                 "warning": "Validate accuracy using separate objects not used to fit this factor.",
             }
             self.store.save_json("calibration/volume.json", record)
+            # The factor changed, so litres measured under the old one are
+            # stale and their history goes.
             self._volume_history.clear()
             self._box_measurement_history.clear()
             self._box_frames_considered.clear()
-            self._geometry_lock.clear()
-            self._track_signatures.clear()
+            if self.camera_id != "logitech":
+                self._geometry_lock.clear()
+                self._track_signatures.clear()
+            else:
+                # A Logitech object's geometry is measured in metres and does
+                # not depend on this factor at all, so throwing away its shape
+                # lock and its track signatures only sent every object on
+                # screen back to "not settled" with no dimensions -- which is
+                # what entering a known volume looked like from the dashboard.
+                record["geometry_preserved"] = True
             return record
 
     def state(self) -> dict[str, Any]:
@@ -3686,6 +3718,93 @@ class VisionPipeline:
         )
         return 0.5 * float(threshold)
 
+    def note_manual_reference_distance(self, distance_m: float) -> None:
+        """Record an operator-measured camera height without disturbing anything.
+
+        The height is derived from the fitted floor plane during normal use, so
+        a typed value is a cross-check rather than a prerequisite. It is stored
+        beside the derived one and the two are compared in the diagnostics; it
+        never clears a baseline, a track, a calibration or a committed scene.
+        """
+        with self.lock:
+            self.config.logitech_reference_distance_m = float(distance_m)
+            self.logitech_distance_source = "operator_measured"
+
+    def _auto_camera_height(self, plane: Any) -> float | None:
+        """The camera's height above the floor, from the floor it just fitted.
+
+        A tape measure was the only way to get this, and until it was typed in
+        the readiness panel reported the camera-to-floor distance missing. The
+        fitted plane already contains it: the perpendicular distance from the
+        camera to that plane is the height.
+        """
+        if plane is None or getattr(plane, "coefficients", None) is None:
+            return None
+        height = camera_height_from_plane(plane.coefficients)
+        if height is None:
+            return None
+        if self.logitech_derived_distance_m is None:
+            LOGGER.info(
+                "Logitech camera height derived from the fitted floor: %.3f m", height,
+            )
+        self.logitech_derived_distance_m = height
+        # Deliberately NOT written into config.logitech_reference_distance_m.
+        # That field means "an operator measured this installation", and the
+        # research modes, the auto-deposit gate and the calibration-mode label
+        # all key off it. A height this code derived from its own depth cannot
+        # verify the installation, so it stays in its own field and is used for
+        # geometry only. Conflating the two would have let a derived number be
+        # reported as an independently measured distance.
+        if not self.config.logitech_reference_distance_m:
+            self.logitech_distance_source = "derived_from_floor_plane"
+        return height
+
+    def camera_height_m(self) -> float | None:
+        """The camera's height above the floor, measured or derived.
+
+        Geometry needs a number; provenance decides what may be claimed from
+        it. This is the number.
+        """
+        measured = float(self.config.logitech_reference_distance_m or 0.0)
+        if measured > 0:
+            return measured
+        return self.logitech_derived_distance_m
+
+    def _maybe_learn_empty_baseline(
+        self, frame: np.ndarray, depth: np.ndarray | None, region: np.ndarray | None,
+        detections: list[Detection],
+    ) -> None:
+        """Capture the empty scene by itself, once the view is still and empty.
+
+        Plug-and-play means the operator does not have to know that a baseline
+        exists, let alone press a button at the right moment. What must never
+        happen is capturing one with an object in the zone, so the learner only
+        says yes after a run of consecutive frames that are both empty and
+        still, and names which condition failed the rest of the time.
+        """
+        if self.camera_id != "logitech" or not self.config.logitech_auto_baseline:
+            return
+        if self.reference_rgb is not None and self.reference_monocular is not None:
+            return
+        inside = [
+            item for item in detections
+            if not _is_phantom_detection(item)
+            and (region is None or bool(np.any(item.mask & region)))
+        ]
+        decision = self._baseline_learner.observe(
+            depth=depth, region=region, objects_in_zone=len(inside),
+        )
+        self.auto_baseline_state = decision.to_dict()
+        if not decision.capture:
+            return
+        self.set_baseline(frame=frame)
+        self._baseline_learner.reset()
+        self.stage_counters["logitech_auto_baseline_captured"] += 1
+        LOGGER.info(
+            "Logitech empty scene learned automatically after %s still frames",
+            decision.stable_frames,
+        )
+
     def _recovered_foreground_detections(
         self, frame: np.ndarray, detections: list[Detection],
         change: np.ndarray | None, region: np.ndarray | None,
@@ -3742,21 +3861,29 @@ class VisionPipeline:
         if self.camera_id != "logitech" or depth_m is None or intrinsics is None:
             return None
         shape = tuple(int(value) for value in depth_m.shape[:2])
+        baseline = self.reference_monocular
+        has_baseline = baseline is not None and baseline.shape == depth_m.shape
         cached = self._logitech_plane_cache
         if cached is not None and cached[0] == shape:
-            return cached[1]
+            # A plane fitted from a live frame was fitted around whatever was
+            # in the scene. Once an empty baseline exists it is the better
+            # surface, so that one provisional fit is replaced exactly once.
+            if self._logitech_plane_source == "empty_baseline" or not has_baseline:
+                return cached[1]
         plane = None
-        baseline = self.reference_monocular
-        if baseline is not None and baseline.shape == depth_m.shape:
+        if has_baseline:
             plane = fit_reference_plane(baseline, intrinsics, mask=region)
+        source = "empty_baseline"
         if not reference_plane_is_usable(plane):
             plane = fit_support_plane_from_background(
                 depth_m, intrinsics, object_mask=object_mask, region_mask=region,
             )
+            source = "live_frame_background"
         if not reference_plane_is_usable(plane):
             self._logitech_plane_reason = "no_coherent_floor_plane_in_logitech_depth"
-            return None
+            return None if cached is None else cached[1]
         self._logitech_plane_reason = None
+        self._logitech_plane_source = source
         self._logitech_plane_cache = (shape, plane)
         LOGGER.info(
             "Logitech floor plane fitted: tilt=%.1f deg rmse=%.4f m inliers=%s",
@@ -3888,7 +4015,12 @@ class VisionPipeline:
             intrinsics=self.latest_intrinsics is not None,
             floor_scale=bool(zone is not None and zone.has_floor_scale),
             metric_depth_mapping=bool(mapping),
-            camera_floor_distance=not logitech or bool(self.config.logitech_reference_distance_m),
+            # Satisfied by a height derived from the fitted floor as well as by
+            # a measured one, so normal use never waits on a tape measure. The
+            # source is reported separately, and the modes that require an
+            # independently measured installation still check the config field
+            # itself rather than this flag.
+            camera_floor_distance=not logitech or bool(self.camera_height_m()),
             height_calibration=bool(height_ready),
             method=self.calibration_mode or getattr(self, "measurement_method", "") or "",
             reason=reason,
@@ -4022,7 +4154,7 @@ class VisionPipeline:
         # see logitech_footprint.py for the geometry.
         measured = measure_footprint(
             zone, mask,
-            camera_height_m=self.config.logitech_reference_distance_m or None,
+            camera_height_m=self.camera_height_m(),
             zone_limits_m=_zone_limits_m(zone),
         )
         footprint = (
@@ -4307,6 +4439,18 @@ class VisionPipeline:
             "active": None if self.height_calibration is None else self.height_calibration.to_dict(),
             "invalidated_reason": self.height_calibration_reason,
             "measurement_method": getattr(self, "measurement_method", "") or "",
+            # Normal use needs neither of these entered by hand. The panel says
+            # where each came from, so a derived value is never read as a
+            # measured one, and an operator's tape measure is visibly a
+            # cross-check rather than a prerequisite.
+            "camera_floor_distance_source": self.logitech_distance_source,
+            "camera_floor_distance_derived_cm": (
+                None if self.logitech_derived_distance_m is None
+                else round(self.logitech_derived_distance_m * 100.0, 1)
+            ),
+            "floor_plane_source": self._logitech_plane_source,
+            "floor_plane_reason": self._logitech_plane_reason,
+            "auto_baseline": self.auto_baseline_state,
         })
         return status
 

@@ -468,6 +468,14 @@ def metric_object_volume(
         # which is the value that under-read every standing object.
         "height_p90_m": float(object_height_m or np.percentile(cell_heights, 90)),
         "height_p90_cells_m": float(np.percentile(cell_heights, 90)),
+        # How far above the floor fit's own residual noise this height stands.
+        # A height only a couple of times the plane's RMSE is not distinguishable
+        # from the floor being slightly wrong, whatever the number says.
+        "height_over_plane_noise": (
+            None if plane.residual_rmse_m is None or not np.isfinite(plane.residual_rmse_m)
+            or plane.residual_rmse_m <= 0 or object_height_m is None
+            else round(float(object_height_m) / float(plane.residual_rmse_m), 2)
+        ),
         "height_max_m": float(cell_heights.max()),
         "spike_limit_m": float(spike_limit),
         "integrated_pixels": int(plane_heights.size),

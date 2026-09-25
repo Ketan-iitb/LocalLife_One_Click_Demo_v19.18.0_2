@@ -752,10 +752,26 @@ def create_app(
                 raise ValueError("Measured Logitech reference distance must be a finite positive value")
             station = manager.camera("logitech")
             station.config.logitech_reference_distance_m = distance
-            baseline = station.set_baseline()
+            # This used to call station.set_baseline(), which recaptures the
+            # empty-scene reference from whatever is in front of the camera at
+            # that moment -- and the moment an operator types a distance is
+            # exactly the moment an object is standing in the zone. That object
+            # became part of the floor, nothing ever differed from the
+            # reference again, and every later measurement was refused for lack
+            # of a foreground change: detection kept running and everything
+            # read "pending". The distance and the baseline are separate
+            # settings and are no longer wired together. Capturing a baseline
+            # is /api/cameras/logitech/capture-empty-zone, which first checks
+            # that the zone really is empty.
+            station.note_manual_reference_distance(distance)
             station.store.save_json("calibration/reference_distance.json",
                                     {"distance_m": distance, "captured_at": time.time()})
-            return jsonify(ok=True, distance_m=distance, baseline=baseline)
+            return jsonify(
+                ok=True, distance_m=distance,
+                baseline_preserved=station.reference_rgb is not None,
+                note="The empty-scene baseline was left as it is. Capture it separately "
+                     "if the zone has changed.",
+            )
         except (KeyError, TypeError, ValueError) as exc:
             return jsonify(error=str(exc)), 400
 

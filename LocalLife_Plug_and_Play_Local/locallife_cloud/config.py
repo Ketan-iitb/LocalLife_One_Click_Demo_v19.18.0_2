@@ -346,6 +346,9 @@ class AppConfig:
     logitech_min_object_height_m: float = 0.010
     # Support-plane cell size for the Logitech height map (metres).
     logitech_height_map_cell_m: float = 0.005
+    # Learn the empty-scene baseline from still, empty startup frames instead
+    # of waiting for an operator to press capture at the right moment.
+    logitech_auto_baseline: bool = True
     # Measure a foreground island the detector never proposed, as an unknown
     # object. A small can is a plain change against the empty scene even when
     # no detector box is offered for it.
@@ -695,6 +698,8 @@ class AppConfig:
                 "LOCALLIFE_LOGITECH_VOLUME_ERODE_PX", defaults.logitech_volume_erode_px)),
             logitech_height_map_cell_m=float(os.environ.get(
                 "LOCALLIFE_LOGITECH_HEIGHT_MAP_CELL_M", defaults.logitech_height_map_cell_m)),
+            logitech_auto_baseline=_bool_env(
+                "LOCALLIFE_LOGITECH_AUTO_BASELINE", defaults.logitech_auto_baseline),
             logitech_recover_unclaimed=_bool_env(
                 "LOCALLIFE_LOGITECH_RECOVER_UNCLAIMED", defaults.logitech_recover_unclaimed),
             logitech_recovered_confidence=float(os.environ.get(
