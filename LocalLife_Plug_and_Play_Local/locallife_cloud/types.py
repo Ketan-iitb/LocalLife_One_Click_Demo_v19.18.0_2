@@ -92,6 +92,10 @@ class Detection:
     # Logitech: the live per-frame volume stays in monocular_volume_l; this is
     # the trimmed median once several frames agree (logitech_volume.py).
     stable_volume_l: float | None = None
+    # The finalised event this detection's published measurement belongs to.
+    # Set once the deposit is recorded, so overlay, table and export can be
+    # shown to be quoting the same immutable record.
+    finalized_event_id: str | None = None
     # Set when the detector's class and the material classifier disagree (a
     # folded cloth called "cardboard box"): reported, and geometry is not forced.
     classification_note: str | None = None
@@ -182,6 +186,7 @@ class Detection:
             "displaced_volume_l": self.displaced_volume_l,
             "volume_rejection_reason": self.volume_rejection_reason,
             "stable_volume_l": self.stable_volume_l,
+            "finalized_event_id": self.finalized_event_id,
             "classification_note": self.classification_note,
             "canonical_type": self.canonical_type,
             "raw_volume_l": self.raw_volume_l,

@@ -62,6 +62,8 @@ from .logitech_geometry import (
 )
 from .diagnostics import HardwareDiagnostics
 from .event_log import MeasurementEventLog, STATUS_ACCEPTED, STATUS_REJECTED, resolve_event_id
+from .duplicate_detections import drop_unclassified_duplicates
+from .finalized_record import FinalizedRegistry
 from .storage import ResultStore
 from .tracking import ObjectTracker
 from .box_templates import load_box_templates, match_box_template
@@ -617,6 +619,10 @@ class VisionPipeline:
         # detector track id -> permanent event id, for the frames after the
         # detector renumbers an object that is already committed.
         self._permanent_event_ids: dict[int, int] = {}
+        # Every finalised measurement this camera has published. Overlay,
+        # table, history and export all read from here, so one deposit has one
+        # answer instead of one per surface.
+        self.finalized = FinalizedRegistry(camera_id)
         self.identities = StableObjectRegistry(
             StabilitySettings(
                 window_frames=config.stability_window_frames,
@@ -1425,6 +1431,15 @@ class VisionPipeline:
             # still touch). Collapse those before tracking so one bag is
             # never counted or displayed twice.
             detections = deduplicate_overlapping_detections(detections, frame.shape[:2])
+            # That collapse compares masks of the same kind. It does not catch
+            # the case the bin screenshots show: one red bag wearing "#10 test
+            # object (filled plastic waste bag)" and "#11 unclassified object"
+            # at once, because the bridge fired on a frame where the detector
+            # had not actually dropped the bag. The classified detection is
+            # always the one kept, so the bag count cannot fall.
+            detections, duplicates = drop_unclassified_duplicates(detections)
+            if duplicates:
+                counters["unclassified_duplicates_dropped"] += duplicates
             if scene_objects and not original_count and (
                 self.config.allow_unclassified_foreground
                 or self.tracker.counted_track_boxes()
@@ -2674,6 +2689,15 @@ class VisionPipeline:
         display_detections = detections + self.tracker.predicted_detections(
             self.config.tracker_live_prediction_frames
         )
+        # Everything downstream of here -- the overlay, the live table, the
+        # state endpoint -- reads `display_detections`. A deposit that has been
+        # finalised republishes the values its record was written with, so the
+        # picture, the row and the exported file cannot show three different
+        # sizes for one bag.
+        for item in display_detections:
+            self.finalized.republish(
+                item, self._permanent_event_ids.get(item.track_id),
+            )
         analysis = FrameAnalysis(
             timestamp=float(timestamp),
             source=source,
@@ -3561,6 +3585,16 @@ class VisionPipeline:
             suffix=status if permanent is None else f"{status}-permanent",
         )
         row = self._measurement_row(detection, timestamp, event_id, status, status_reason)
+        # The values this row was written with become the published answer for
+        # this deposit. The pipeline keeps re-measuring afterwards and what it
+        # measures keeps moving, which is why the overlay, the table and the
+        # history row could each show a different size for one bag: three
+        # honest readings of three different frames. From here they read one
+        # record.
+        self.finalized.remember(
+            detection, event_id=event_id, timestamp=timestamp,
+            status=status, reason=status_reason, permanent_id=permanent,
+        )
         result = self.event_log.record(row)
         if result.written:
             self.stage_counters["finalised_measurements"] += 1
@@ -4647,6 +4681,12 @@ class VisionPipeline:
             self._measurement_frames.pop(track_id, None)
             self._stability.pop(track_id, None)
             self._deposit_refusals.pop(track_id, None)
+            self._logitech_geometry.forget(track_id)
+            # A finalised record is keyed on the permanent event identity where
+            # one exists, and those survive. Only the ones keyed on this bare
+            # track number go, so the next object to be given it cannot inherit
+            # a finished deposit's dimensions.
+            self.finalized.release(track_id)
             self._logitech_volume_spread.pop(track_id, None)
             self._color_history.pop(track_id, None)
             self._material_history.pop(track_id, None)
