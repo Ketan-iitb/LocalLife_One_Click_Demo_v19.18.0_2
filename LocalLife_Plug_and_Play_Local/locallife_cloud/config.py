@@ -346,6 +346,13 @@ class AppConfig:
     logitech_min_object_height_m: float = 0.010
     # Support-plane cell size for the Logitech height map (metres).
     logitech_height_map_cell_m: float = 0.005
+    # Measure a foreground island the detector never proposed, as an unknown
+    # object. A small can is a plain change against the empty scene even when
+    # no detector box is offered for it.
+    logitech_recover_unclaimed: bool = True
+    # ... carried at this confidence, so it reads as weaker evidence than a
+    # classified detection everywhere it appears.
+    logitech_recovered_confidence: float = 0.25
     # Pixels trimmed from the Logitech mask before volume only: monocular depth
     # bleeds across an object's rim, and that rim is floor.
     logitech_volume_erode_px: int = 2
@@ -688,6 +695,10 @@ class AppConfig:
                 "LOCALLIFE_LOGITECH_VOLUME_ERODE_PX", defaults.logitech_volume_erode_px)),
             logitech_height_map_cell_m=float(os.environ.get(
                 "LOCALLIFE_LOGITECH_HEIGHT_MAP_CELL_M", defaults.logitech_height_map_cell_m)),
+            logitech_recover_unclaimed=_bool_env(
+                "LOCALLIFE_LOGITECH_RECOVER_UNCLAIMED", defaults.logitech_recover_unclaimed),
+            logitech_recovered_confidence=float(os.environ.get(
+                "LOCALLIFE_LOGITECH_RECOVERED_CONFIDENCE", defaults.logitech_recovered_confidence)),
             logitech_min_object_height_m=float(os.environ.get(
                 "LOCALLIFE_LOGITECH_MIN_OBJECT_HEIGHT_M", defaults.logitech_min_object_height_m)),
             logitech_min_object_pixels=int(os.environ.get(

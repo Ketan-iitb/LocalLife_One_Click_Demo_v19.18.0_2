@@ -39,6 +39,7 @@ from typing import Any
 import numpy as np
 
 from .footprint import estimate_extents
+from .logitech_geometry import geometry_consistency, robust_object_height_m
 from .types import CameraIntrinsics, DepthCalibration, VolumeMeasurement
 from .volume import ReferencePlane, _plane_perpendicular_height
 
@@ -362,11 +363,25 @@ def metric_object_volume(
     depth = depth_m.astype(np.float64, copy=False)
     plane = reference_plane if reference_plane is not None and reference_plane.coefficients is not None else None
     if plane is None and camera_height_m:
-        # No plane fitted yet: the fixed installation's own geometry still is.
+        # No floor plane fitted: fall back to a plane perpendicular to the
+        # optical axis at the calibrated camera height. That is only the floor
+        # for a camera pointing straight down. On a tilted mount every height
+        # measured against it is the true height times the cosine of the tilt
+        # -- which is why a 203 mm bottle read 137 mm and a 124 mm box read
+        # 89 mm on a camera tilted about 45 degrees. The fallback still
+        # produces a number, but it is named here so it can never be mistaken
+        # for a floor-relative measurement.
         plane = axis_aligned_plane(intrinsics, camera_height_m)
-        diagnostics["plane_source"] = "calibrated_camera_height"
-    else:
+        diagnostics["plane_source"] = "optical_axis_plane_not_floor"
+    elif plane is not None:
         diagnostics["plane_source"] = "fitted_support_plane"
+    if plane is not None and plane.coefficients is not None:
+        # z = a*x + b*y + c with a = b = 0 is perpendicular to the optical
+        # axis. Whatever produced it, it is the floor only for a camera
+        # pointing straight down, and every height measured against it on a
+        # tilted mount is short by the cosine of that tilt.
+        gradient_a, gradient_b, _ = plane.coefficients
+        diagnostics["plane_is_floor"] = bool(abs(gradient_a) > 1e-6 or abs(gradient_b) > 1e-6)
     if plane is None:
         return HeightMapResult(None, diagnostics, "no_support_plane")
     plane_coefficients = plane.coefficients
@@ -412,6 +427,13 @@ def metric_object_volume(
     cells, cell_heights = cell_height_map(footprint, plane_heights, cell_size_m=cell_size_m)
     measured_cells = int(cells.shape[0])
     cells, cell_heights, dropped_cells = object_plane_component(cells, cell_heights)
+    # The object's cells before the spike gate. The gate exists to protect the
+    # integral, and it is right to be aggressive there -- but a bottle's neck
+    # is a real part of the object that sits far above its body's median, and
+    # clipping it is how a 203 mm bottle came back 150 mm tall. The height is
+    # therefore a percentile of this population: high enough that a handful of
+    # monocular spikes cannot reach it, low enough to keep a narrow neck.
+    unclipped_heights = cell_heights.copy()
     # Now that only the object's own cells remain, a median/MAD gate removes
     # the monocular depth spikes that used to dominate the integral.
     median = float(np.median(cell_heights))
@@ -421,20 +443,31 @@ def metric_object_volume(
     spike_cells = int((~within).sum())
     if int(within.sum()) >= 4:
         cells, cell_heights = cells[within], cell_heights[within]
+    # Dimensions and height both come from the cells that actually received
+    # points, before the convex completion adds cells whose height was copied
+    # from a neighbour. Those filled cells belong in the volume -- they are the
+    # far side one camera cannot see -- but they are not measured geometry, and
+    # letting them into a percentile is what pulled the reported height below
+    # the object's real top.
+    measured_centres = (cells.astype(np.float64) + 0.5) * cell_size_m
+    object_height_m = robust_object_height_m(unclipped_heights, noise_floor_m=min_height_m)
     if fill_occlusion:
         cells, cell_heights, filled = fill_occluded_cells(cells, cell_heights)
     else:
         filled = 0
     cell_area = cell_size_m * cell_size_m
     litres = float(np.sum(cell_heights) * cell_area * 1000.0)
-    # Dimensions come from the same cells the volume did: the object's own
-    # footprint on the plane, after leakage and spikes were removed.
-    cell_centres = (cells.astype(np.float64) + 0.5) * cell_size_m
-    extents = estimate_extents(cell_centres - cell_centres.mean(axis=0))
+    extents = estimate_extents(measured_centres - measured_centres.mean(axis=0))
+    diagnostics["dimension_method"] = "logitech_floor_plane_footprint"
     diagnostics.update({
+        "object_height_m": object_height_m,
         "height_median_m": median,
         "height_mad_m": mad,
-        "height_p90_m": float(np.percentile(cell_heights, 90)),
+        # The reported height. `height_p90_cells_m` is what it used to be: the
+        # percentile across every footprint cell, hull-filled ones included,
+        # which is the value that under-read every standing object.
+        "height_p90_m": float(object_height_m or np.percentile(cell_heights, 90)),
+        "height_p90_cells_m": float(np.percentile(cell_heights, 90)),
         "height_max_m": float(cell_heights.max()),
         "spike_limit_m": float(spike_limit),
         "integrated_pixels": int(plane_heights.size),
@@ -451,6 +484,15 @@ def metric_object_volume(
         "width_mm": None if extents is None else extents.width_mm,
         "raw_volume_l": litres,
     })
+    # Do the dimensions and the litres describe the same solid? A footprint
+    # that is too large and a height that is too small multiply back to roughly
+    # the right volume, and that is not a measurement, it is a coincidence.
+    diagnostics.update(geometry_consistency(
+        length_m=None if extents is None else extents.length_m,
+        width_m=None if extents is None else extents.width_m,
+        height_m=object_height_m, litres=litres,
+        shape="cylinder" if extents is not None and extents.occlusion_corrected else "box",
+    ))
     coverage = plane_heights.size / max(1, diagnostics["mask_pixels"])
     measurement = VolumeMeasurement(
         liters=litres,

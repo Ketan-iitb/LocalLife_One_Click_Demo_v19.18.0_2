@@ -45,6 +45,13 @@ from . import __version__
 from .stable_identity import Observation, StabilitySettings, StableObjectRegistry, observations_from
 from .footprint import DimensionSmoother
 from .logitech_footprint import FootprintResult, measure_footprint
+from .logitech_geometry import (
+    CHANGE_RECOVERED_SOURCE,
+    GeometryStabiliser,
+    minimum_object_pixels,
+    static_background_reason,
+    unclaimed_foreground_islands,
+)
 from .diagnostics import HardwareDiagnostics
 from .event_log import MeasurementEventLog, STATUS_ACCEPTED, STATUS_REJECTED, resolve_event_id
 from .storage import ResultStore
@@ -691,6 +698,13 @@ class VisionPipeline:
         self.last_metric_context: dict[str, Any] = {}
         # Why the last Logitech footprint measured or refused, for diagnostics.
         self.last_footprint_result: FootprintResult | None = None
+        # The fixed camera's floor plane, fitted once per resolution.
+        self._logitech_plane_cache: tuple[tuple[int, int], Any] | None = None
+        self._logitech_plane_reason: str | None = None
+        # Rolling median of each Logitech track's dimensions and volume.
+        self._logitech_geometry = GeometryStabiliser(
+            window=9, minimum_frames=3, tolerance=0.25,
+        )
         # Frames each confirmed track has waited for finalisation (non-waste modes).
         self._unfinalised_frames: dict[int, int] = {}
         # Detector / foreground / final / rejected masks of the latest Logitech
@@ -1269,7 +1283,12 @@ class VisionPipeline:
                 self.reference_rgb,
                 detections,
                 bin_region,
-                min_pixels=min(self.config.min_component_pixels, self.config.logitech_min_object_pixels),
+                # Scaled to the frame, so a small can is not filtered out as
+                # speckle by a pixel count chosen for a larger sensor.
+                min_pixels=minimum_object_pixels(
+                    frame.shape[:2],
+                    min(self.config.min_component_pixels, self.config.logitech_min_object_pixels),
+                ),
                 foreground_threshold=self.config.foreground_threshold,
                 max_scene_fraction=self.config.logitech_max_scene_fraction,
                 max_expansion=self.config.logitech_max_mask_expansion,
@@ -1278,6 +1297,9 @@ class VisionPipeline:
                 debug=mask_debug,
             )
             self.logitech_mask_debug = {"frame": frame, **mask_debug}
+            detections.extend(self._recovered_foreground_detections(
+                frame, detections, mask_debug.get("foreground"), bin_region,
+            ))
             counters["valid_masks"] += len(detections)
             counters["detector_only_masks"] += int(mask_debug.get("detector_only_masks", 0))
             for reason in mask_debug.get("reasons") or []:
@@ -1955,6 +1977,19 @@ class VisionPipeline:
                         # detector or its masks changes.
                         detection.volume_rejection_reason = "background_region_not_measurable"
                         continue
+                    static_reason = static_background_reason(
+                        volume_mask, bin_region, change=deposit_change,
+                    )
+                    if static_reason is not None:
+                        # The bed, the table and the floor strip are detected
+                        # like anything else. A stale baseline used to let one
+                        # through as a 35 L "deposit"; a mask that covers or
+                        # spans the measurement zone is the room, not an object
+                        # standing in it.
+                        detection.volume_rejection_reason = static_reason
+                        detection.measurement_quality = static_reason
+                        self.stage_counters[f"logitech_static_background_{static_reason}"] += 1
+                        continue
                     problems = frame_consistency(
                         frame, volume_mask, calibrated_prediction, measure_intrinsics,
                         region=bin_region,
@@ -1984,8 +2019,19 @@ class VisionPipeline:
                         if int(np.count_nonzero(eroded)) >= self.config.logitech_min_object_pixels:
                             volume_mask = eroded
                     plane_for_volume = measurement_plane
-                    if uncalibrated_logitech and (plane_for_volume is None
-                                                  or plane_for_volume.coefficients is None):
+                    if plane_for_volume is None or plane_for_volume.coefficients is None:
+                        # The floor this camera actually looks at, fitted from
+                        # its own calibrated depth over the part of the zone no
+                        # object stands on. Without it the fallback is a plane
+                        # perpendicular to the optical axis, which is the floor
+                        # only for a camera pointing straight down: on a tilted
+                        # mount it reports every height times the cosine of the
+                        # tilt. Fitting it here is what makes a floor-relative
+                        # height and a floor-plane footprint possible at all.
+                        plane_for_volume = self._logitech_floor_plane(
+                            calibrated_prediction, measure_intrinsics, object_mask, bin_region,
+                        )
+                    if plane_for_volume is None or plane_for_volume.coefficients is None:
                         plane_for_volume = self._uncalibrated_plane
                     result = metric_object_volume(
                         calibrated_prediction, measure_intrinsics, volume_mask, plane_for_volume,
@@ -2036,6 +2082,17 @@ class VisionPipeline:
                         },
                         "live_volume_l": None if result.measurement is None else round(result.measurement.liters, 6),
                         "stable_volume_l": detection.stable_volume_l,
+                        # The measurement chain for this one object, end to
+                        # end, so a wrong number can be traced to the link that
+                        # produced it without reading every frame's log.
+                        "detection_box": list(detection.box),
+                        "detector_mask_pixels": int(np.count_nonzero(instance_mask)),
+                        "change_mask_pixels": (
+                            0 if deposit_change is None
+                            else int(np.count_nonzero(deposit_change & bin_region))
+                        ),
+                        "measurement_mask_pixels": int(np.count_nonzero(volume_mask)),
+                        "measurement_mask_source": (self.last_measurement_mask or {}).get("source"),
                     }
                     if uncalibrated_logitech and result.measurement is not None:
                         detection.measurement_quality = self.calibration_mode
@@ -2055,13 +2112,34 @@ class VisionPipeline:
                     if result.reason is not None:
                         detection.volume_rejection_reason = result.reason
                     elif result.diagnostics.get("length_mm"):
-                        # Logitech dimensions come from the same plane-projected
-                        # footprint the volume was integrated over.
-                        detection.footprint_length_mm = round(float(result.diagnostics["length_mm"]), 2)
-                        detection.footprint_width_mm = round(float(result.diagnostics["width_mm"]), 2)
-                        detection.physical_height_mm = round(
-                            float(result.diagnostics["height_p90_m"]) * 1000.0, 2)
-                        detection.dimension_method = "logitech_support_plane_footprint"
+                        # Logitech dimensions are the object's own cross-section
+                        # in floor coordinates, measured from the same point
+                        # cloud the volume was integrated over. A short rolling
+                        # median follows, so a settled object stops changing
+                        # size every frame.
+                        stable = self._logitech_geometry.update(
+                            detection.track_id,
+                            length_mm=float(result.diagnostics["length_mm"]),
+                            width_mm=float(result.diagnostics["width_mm"]),
+                            height_mm=float(result.diagnostics["height_p90_m"]) * 1000.0,
+                            volume_l=None if result.measurement is None else result.measurement.liters,
+                        )
+                        detection.footprint_length_mm = stable.length_mm
+                        detection.footprint_width_mm = stable.width_mm
+                        detection.physical_height_mm = stable.height_mm
+                        detection.dimension_method = str(
+                            result.diagnostics.get("dimension_method")
+                            or "logitech_support_plane_footprint"
+                        )
+                        detection.dimension_flags = tuple(detection.dimension_flags or ()) + tuple(
+                            flag for flag in (
+                                None if result.diagnostics.get("plane_is_floor", True)
+                                else "height_not_floor_relative",
+                                None if result.diagnostics.get("geometry_consistent", True) is not False
+                                else "volume_disagrees_with_dimensions",
+                                None if stable.settled else "geometry_not_settled",
+                            ) if flag is not None
+                        )
                         detection.dimension_confidence = round(
                             float(min(0.6, result.measurement.coverage_ratio)), 4)
                     metric_mask, metric_result = volume_mask, result
@@ -3608,6 +3686,84 @@ class VisionPipeline:
         )
         return 0.5 * float(threshold)
 
+    def _recovered_foreground_detections(
+        self, frame: np.ndarray, detections: list[Detection],
+        change: np.ndarray | None, region: np.ndarray | None,
+    ) -> list[Detection]:
+        """Objects the detector missed but the empty-scene change did not.
+
+        The small can is visible, changes against the baseline and stands above
+        the floor, yet no detector box is proposed for it, so nothing measured
+        it. This adds one unknown-object detection per unclaimed island, with a
+        low confidence so it reads as weaker evidence than a classified one.
+        Nothing about the detector, its vocabulary or its masks changes: this
+        only ever appends where the detector proposed nothing.
+        """
+        if self.camera_id != "logitech" or not self.config.logitech_recover_unclaimed:
+            return []
+        claimed = combined_mask(detections, frame.shape[:2]) if detections else None
+        islands = unclaimed_foreground_islands(
+            change, region, claimed,
+            min_pixels=minimum_object_pixels(
+                frame.shape[:2],
+                min(self.config.min_component_pixels, self.config.logitech_min_object_pixels),
+            ),
+        )
+        recovered: list[Detection] = []
+        for island in islands:
+            rows, columns = np.nonzero(island)
+            recovered.append(Detection(
+                label="unknown object",
+                confidence=self.config.logitech_recovered_confidence,
+                box=(int(columns.min()), int(rows.min()),
+                     int(columns.max()) + 1, int(rows.max()) + 1),
+                mask=island,
+                source=CHANGE_RECOVERED_SOURCE,
+                color=classify_color(frame, island)[0],
+            ))
+        if recovered:
+            self.stage_counters["logitech_foreground_recovered_objects"] += len(recovered)
+        return recovered
+
+    def _logitech_floor_plane(
+        self, depth_m: np.ndarray | None, intrinsics: Any, object_mask: np.ndarray | None,
+        region: np.ndarray | None,
+    ) -> Any:
+        """The floor this fixed camera looks at, fitted from its own depth.
+
+        Every Logitech height and footprint is measured relative to a plane. If
+        that plane is the one perpendicular to the optical axis -- the fallback
+        the calibrated camera height gives -- then on a tilted mount a height
+        comes out multiplied by the cosine of the tilt, and the "footprint" is a
+        frontal projection rather than a floor one. The camera does not move, so
+        the plane is fitted once from the empty baseline where there is one, or
+        from this frame's own background, and then reused.
+        """
+        if self.camera_id != "logitech" or depth_m is None or intrinsics is None:
+            return None
+        shape = tuple(int(value) for value in depth_m.shape[:2])
+        cached = self._logitech_plane_cache
+        if cached is not None and cached[0] == shape:
+            return cached[1]
+        plane = None
+        baseline = self.reference_monocular
+        if baseline is not None and baseline.shape == depth_m.shape:
+            plane = fit_reference_plane(baseline, intrinsics, mask=region)
+        if not reference_plane_is_usable(plane):
+            plane = fit_support_plane_from_background(
+                depth_m, intrinsics, object_mask=object_mask, region_mask=region,
+            )
+        if not reference_plane_is_usable(plane):
+            self._logitech_plane_reason = "no_coherent_floor_plane_in_logitech_depth"
+            return None
+        self._logitech_plane_reason = None
+        self._logitech_plane_cache = (shape, plane)
+        LOGGER.info(
+            "Logitech floor plane fitted: tilt=%.1f deg rmse=%.4f m inliers=%s",
+            plane.tilt_degrees, plane.residual_rmse_m, plane.inlier_pixels,
+        )
+        return plane
+
     def _committed_scene_change(
         self, frame: np.ndarray, depth_m: np.ndarray | None, monocular_depth: np.ndarray | None,
     ) -> tuple[np.ndarray | None, np.ndarray | None]:
@@ -3667,11 +3823,24 @@ class VisionPipeline:
                 # standing there. Refusing it for ever is how a detected
                 # object stayed "pending" with no height and no litres, so it
                 # is measured from its own mask and the reason is recorded.
+                fallback = clean(instance_mask & region, max(4, self.config.min_component_pixels // 8))
+                candidate = fallback if np.any(fallback) else instance_mask
+                # Furniture reaches this branch by the same road an object
+                # present at baseline capture does: it never changes, so its
+                # refusals accumulate. The difference is physical -- a deposit
+                # sits inside the zone and has an outside, the bed and the
+                # floor reach the zone's own edges. Without this the fallback
+                # measured the bed as a 35 L "unclassified object".
+                static_reason = static_background_reason(candidate, region)
+                if static_reason is not None:
+                    detection.volume_rejection_reason = static_reason
+                    detection.measurement_quality = static_reason
+                    self.stage_counters[f"measurement_mask_static_{static_reason}"] += 1
+                    return np.zeros_like(instance_mask)
                 detection.measurement_quality = "baseline-contains-object"
                 detection.volume_rejection_reason = None
                 self.stage_counters["measurement_mask_baseline_contains_object"] += 1
-                fallback = clean(instance_mask & region, max(4, self.config.min_component_pixels // 8))
-                return fallback if np.any(fallback) else instance_mask
+                return candidate
         detection.volume_rejection_reason = choice.reason
         # The live table shows the measurement quality, so the precise reason
         # belongs there too: "pending - reference distance estimate" named the
@@ -3886,12 +4055,23 @@ class VisionPipeline:
             detection.volume_rejection_reason = measured.reason
             if detection.measurement_quality in (None, "", "measured"):
                 detection.measurement_quality = measured.reason
-        if footprint is not None:
+        # The metric 3-D path measures a cross-section of the object in floor
+        # coordinates; this one warps the mat. Where both ran, the 3-D one is
+        # the measurement and this stays a cross-check, so its numbers are not
+        # written over the better ones.
+        has_metric_geometry = bool(
+            result is not None and getattr(result, "diagnostics", None)
+            and result.diagnostics.get("length_mm")
+        )
+        if footprint is not None and not has_metric_geometry:
             # The mat's own scale, so the same object measures the same at the
             # front and the back of the perspective view.
             detection.footprint_length_mm = round(footprint[0] * 1000.0, 2)
             detection.footprint_width_mm = round(footprint[1] * 1000.0, 2)
             detection.dimension_method = measured.method or "logitech_contact_band_footprint"
+        elif footprint is not None:
+            self.last_metric_context["homography_length_cm"] = round(footprint[0] * 100.0, 2)
+            self.last_metric_context["homography_width_cm"] = round(footprint[1] * 100.0, 2)
 
         calibration = self.height_calibration
         if calibration is None:
@@ -3908,9 +4088,11 @@ class VisionPipeline:
             return
         detection.physical_height_mm = round(float(statistics["top_cm"]) * 10.0, 2)
         detection.height_above_baseline_cm = round(float(statistics["top_cm"]), 1)
-        detection.dimension_method = (
-            "logitech_calibrated_homography" if footprint is not None else "logitech_calibrated_height"
-        )
+        if not has_metric_geometry:
+            detection.dimension_method = (
+                "logitech_calibrated_homography" if footprint is not None
+                else "logitech_calibrated_height"
+            )
         detection.calibration_version = f"{calibration.mapping}:{calibration.setup_id or 'setup'}"
         refusal = self._implausible_measurement(detection, float(statistics["top_cm"]), zone)
         if refusal:

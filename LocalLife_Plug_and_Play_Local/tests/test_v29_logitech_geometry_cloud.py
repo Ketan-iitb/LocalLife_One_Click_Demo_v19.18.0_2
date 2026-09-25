@@ -109,7 +109,11 @@ class SupportPlaneVolumeTests(unittest.TestCase):
         with_height = metric_object_volume(depth, CAMERA, mask, None, min_height_m=0.01, min_pixels=50,
                                            camera_height_m=PLANE_DISTANCE_M)
         self.assertIsNone(with_height.reason)
-        self.assertEqual(with_height.diagnostics["plane_source"], "calibrated_camera_height")
+        # V35 renamed this fallback. It is a plane perpendicular to the optical
+        # axis, which is the floor only for a camera pointing straight down, and
+        # the name now says so rather than implying a calibrated floor.
+        self.assertEqual(with_height.diagnostics["plane_source"], "optical_axis_plane_not_floor")
+        self.assertFalse(with_height.diagnostics["plane_is_floor"])
 
 
 class CloudStartupGateTests(unittest.TestCase):
