@@ -28,9 +28,9 @@ from pathlib import Path
 import numpy as np
 
 from locallife_cloud.footprint import estimate_extents
+from locallife_cloud.logitech_bin import envelope_fill
 from locallife_cloud.logitech_geometry import (
     GeometryStabiliser,
-    geometry_consistency,
     minimum_object_pixels,
     robust_object_height_m,
     static_background_reason,
@@ -429,20 +429,33 @@ class SmallObjectTests(unittest.TestCase):
 class ConsistencyTests(unittest.TestCase):
     """Test 12, 13: one geometry behind both numbers, and a settled one."""
 
-    def test_the_reported_shoe_box_error_cancellation_is_caught(self) -> None:
-        # What the hardware showed: 540 x 360 x 89 mm alongside 13.60 L.
-        report = geometry_consistency(
-            length_m=0.540, width_m=0.360, height_m=0.089, litres=13.60, shape="box",
-        )
-        self.assertFalse(report["geometry_consistent"])
-        # Its own dimensions imply 17.3 L, not the 13.6 L it printed.
-        self.assertGreater(report["volume_from_dimensions_l"], 17.0)
+    def test_a_volume_larger_than_its_own_envelope_is_impossible(self) -> None:
+        """B36 replaced the cuboid test this used to make.
 
-    def test_a_coherent_box_passes(self) -> None:
-        report = geometry_consistency(
-            length_m=0.338, width_m=0.253, height_m=0.124, litres=10.0, shape="box",
+        A symmetric tolerance around length x width x height called every bag
+        in a real bin inconsistent and passed a RealSense reading whose volume
+        was 21 % larger than the box containing it. The physical bound catches
+        that one and leaves a bag alone.
+        """
+        report = envelope_fill(
+            length_m=0.317, width_m=0.196, height_m=0.120, litres=9.013,
         )
-        self.assertTrue(report["geometry_consistent"])
+        self.assertFalse(report.plausible)
+        self.assertEqual(report.reason, "volume_exceeds_its_own_envelope")
+        self.assertGreater(report.fill_fraction, 1.0)
+
+    def test_a_sagging_bag_is_not_a_geometry_failure(self) -> None:
+        for name, length, width, height, litres in (
+            ("red bag", 0.437, 0.272, 0.251, 20.092),
+            ("brown bag", 0.340, 0.277, 0.069, 3.442),
+        ):
+            with self.subTest(bag=name):
+                report = envelope_fill(
+                    length_m=length, width_m=width, height_m=height, litres=litres,
+                )
+                self.assertTrue(report.plausible, report.reason)
+                self.assertGreater(report.fill_fraction, 0.4)
+                self.assertLess(report.fill_fraction, 0.8)
 
     def test_the_volume_and_the_dimensions_come_from_one_measurement(self) -> None:
         depth, empty, mask = _shoe_box()

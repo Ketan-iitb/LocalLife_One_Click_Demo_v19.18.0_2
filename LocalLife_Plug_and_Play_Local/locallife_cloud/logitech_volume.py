@@ -33,13 +33,14 @@ RealSense keeps its own, unchanged volume path: nothing here is used for it.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
 
 from .footprint import estimate_extents
-from .logitech_geometry import geometry_consistency, robust_object_height_m
+from .logitech_bin import envelope_fill, shape_model_for
+from .logitech_geometry import robust_object_height_m
 from .types import CameraIntrinsics, DepthCalibration, VolumeMeasurement
 from .volume import ReferencePlane, _plane_perpendicular_height
 
@@ -443,13 +444,10 @@ def metric_object_volume(
     spike_cells = int((~within).sum())
     if int(within.sum()) >= 4:
         cells, cell_heights = cells[within], cell_heights[within]
-    # Dimensions and height both come from the cells that actually received
-    # points, before the convex completion adds cells whose height was copied
-    # from a neighbour. Those filled cells belong in the volume -- they are the
-    # far side one camera cannot see -- but they are not measured geometry, and
-    # letting them into a percentile is what pulled the reported height below
-    # the object's real top.
-    measured_centres = (cells.astype(np.float64) + 0.5) * cell_size_m
+    # The height comes from the cells that actually received points: the convex
+    # completion copies a neighbour's height into the cells it adds, and letting
+    # those into a percentile is what pulled the reported height below the
+    # object's real top.
     object_height_m = robust_object_height_m(unclipped_heights, noise_floor_m=min_height_m)
     if fill_occlusion:
         cells, cell_heights, filled = fill_occluded_cells(cells, cell_heights)
@@ -457,7 +455,25 @@ def metric_object_volume(
         filled = 0
     cell_area = cell_size_m * cell_size_m
     litres = float(np.sum(cell_heights) * cell_area * 1000.0)
-    extents = estimate_extents(measured_centres - measured_centres.mean(axis=0))
+    # The dimensions describe the same cells the volume was integrated over,
+    # completion included. Measuring them over the cells the volume did not see
+    # left the two describing different objects, and a volume can then come out
+    # larger than the envelope reported around it -- which is impossible, and
+    # which is what an envelope check has to be able to trust.
+    #
+    # A cell is a square of `cell_size_m`, not a point: a rectangle fitted to
+    # the cell *centres* stops half a cell short on each side. That is nothing
+    # across a bag of several hundred cells and a quarter of the answer on a
+    # small object of sixteen, so the extent of the cells is used, not their
+    # midpoints.
+    cell_centres = (cells.astype(np.float64) + 0.5) * cell_size_m
+    extents = estimate_extents(cell_centres - cell_centres.mean(axis=0))
+    if extents is not None:
+        extents = replace(
+            extents,
+            length_m=extents.length_m + cell_size_m,
+            width_m=extents.width_m + cell_size_m,
+        )
     diagnostics["dimension_method"] = "logitech_floor_plane_footprint"
     diagnostics.update({
         "object_height_m": object_height_m,
@@ -492,15 +508,21 @@ def metric_object_volume(
         "width_mm": None if extents is None else extents.width_mm,
         "raw_volume_l": litres,
     })
-    # Do the dimensions and the litres describe the same solid? A footprint
-    # that is too large and a height that is too small multiply back to roughly
-    # the right volume, and that is not a measurement, it is a coincidence.
-    diagnostics.update(geometry_consistency(
+    # How much of its own envelope the object occupies. A cuboid test used to
+    # sit here and called every bag inconsistent: a filled bag fills about half
+    # to two thirds of the box around it, which is what a bag is, not an error.
+    # Only the physical bounds are enforced now -- see logitech_bin.
+    diagnostics.update(envelope_fill(
         length_m=None if extents is None else extents.length_m,
         width_m=None if extents is None else extents.width_m,
         height_m=object_height_m, litres=litres,
-        shape="cylinder" if extents is not None and extents.occlusion_corrected else "box",
-    ))
+        shape_model=shape_model_for(
+            None, occlusion_corrected=bool(extents is not None and extents.occlusion_corrected),
+        ),
+    ).to_dict())
+    diagnostics["occlusion_corrected"] = bool(
+        extents is not None and extents.occlusion_corrected
+    )
     coverage = plane_heights.size / max(1, diagnostics["mask_pixels"])
     measurement = VolumeMeasurement(
         liters=litres,

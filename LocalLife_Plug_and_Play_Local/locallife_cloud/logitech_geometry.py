@@ -25,11 +25,11 @@ What follows is what the plane repair does not cover:
   height, and taken before the spike gate that was clipping a bottle's neck
   off: the 203 mm bottle came back 150 mm tall, its body's height exactly,
   because the neck sat above median + 6 MAD and was discarded as an outlier.
-* `geometry_consistency` -- the shoe box read 540 x 360 x 89 mm and 13.60 L
-  against RealSense's 338 x 253 x 124 mm and 13.71 L. The litres agreed only
-  because an oversized footprint and an underestimated height cancelled, so
-  the integrated volume is compared with what the reported dimensions imply
-  and the disagreement is published rather than hidden.
+* the envelope check that used to live here has moved to `logitech_bin`,
+  where it compares the measured volume with the envelope containing it
+  instead of assuming every object is a cuboid. The cuboid form called every
+  bag in a real bin inconsistent while passing a volume 21 % larger than its
+  own bounding box.
 * `static_background_reason` -- the bed and the floor were being measured as
   35 L deposits. A deposit sits inside the zone and has an outside; a piece of
   the room reaches the zone's own edges.
@@ -62,10 +62,6 @@ MIN_TOP_CELLS = 4
 MAX_ZONE_COVERAGE = 0.35
 # ... and one reaching two opposite edges of the zone has no outside.
 BORDER_TOLERANCE_PX = 2
-# How far the volume implied by the reported dimensions may sit from the
-# integrated volume before the pair is called inconsistent.
-CONSISTENCY_TOLERANCE = 0.20
-
 # An object the detector never proposed is still an object, and it is marked so
 # nothing mistakes it for a classified detection.
 CHANGE_RECOVERED_SOURCE = "logitech-foreground-change-object"
@@ -100,44 +96,6 @@ def robust_object_height_m(
     needed = min(needed, values.size)
     # The needed-th largest value: the level that many cells reach or exceed.
     return float(np.sort(values)[-needed])
-
-
-def geometry_consistency(
-    *, length_m: float | None, width_m: float | None, height_m: float | None,
-    litres: float | None, shape: str = "box",
-    tolerance: float = CONSISTENCY_TOLERANCE,
-) -> dict[str, Any]:
-    """Do the reported dimensions and the reported volume describe one solid?
-
-    An oversized footprint and an underestimated height multiply back to
-    roughly the right number of litres, which is how 540 x 360 x 89 mm passed
-    for a 338 x 253 x 124 mm shoe box. Comparing the integrated volume with
-    what the dimensions imply exposes exactly that.
-    """
-    report: dict[str, Any] = {
-        "consistency_shape": shape, "volume_from_dimensions_l": None,
-        "volume_ratio": None, "geometry_consistent": None,
-    }
-    if not length_m or not width_m or not height_m or not litres or litres <= 0:
-        return report
-    if shape == "cylinder":
-        diameter = 0.5 * (length_m + width_m)
-        implied = np.pi * (diameter / 2.0) ** 2 * height_m
-    elif shape == "sphere":
-        radius = 0.25 * (length_m + width_m)
-        implied = 4.0 / 3.0 * np.pi * radius ** 3
-    elif shape == "ellipsoid":
-        implied = 4.0 / 3.0 * np.pi * (length_m / 2.0) * (width_m / 2.0) * (height_m / 2.0)
-    else:
-        implied = length_m * width_m * height_m
-    implied_l = float(implied * 1000.0)
-    ratio = implied_l / float(litres)
-    report.update({
-        "volume_from_dimensions_l": round(implied_l, 4),
-        "volume_ratio": round(ratio, 4),
-        "geometry_consistent": bool(abs(ratio - 1.0) <= tolerance),
-    })
-    return report
 
 
 def static_background_reason(

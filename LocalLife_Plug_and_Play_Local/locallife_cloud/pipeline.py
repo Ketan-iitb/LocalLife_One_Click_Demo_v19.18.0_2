@@ -46,6 +46,12 @@ from .stable_identity import Observation, StabilitySettings, StableObjectRegistr
 from .footprint import DimensionSmoother
 from .logitech_footprint import FootprintResult, measure_footprint
 from .logitech_autocal import BaselineLearner, camera_height_from_plane
+from .logitech_bin import (
+    envelope_fill,
+    merged_neighbour_reason,
+    publish_decision,
+    shape_model_for,
+)
 from .logitech_geometry import (
     CHANGE_RECOVERED_SOURCE,
     GeometryStabiliser,
@@ -1987,6 +1993,8 @@ class VisionPipeline:
             ):
                 metric_mask: np.ndarray | None = None
                 metric_result: Any = None
+                logitech_publish: Any = None
+                merged_reason: str | None = None
                 if self.camera_id == "logitech":
                     volume_mask = clip_to_region(restore_mask(instance_mask, frame.shape[:2]), bin_region)
                     volume_mask = _tracked_component(volume_mask, detection.box)
@@ -1998,6 +2006,16 @@ class VisionPipeline:
                         # detector or its masks changes.
                         detection.volume_rejection_reason = "background_region_not_measurable"
                         continue
+                    # Bags in a bin lean on each other. A mask that has covered
+                    # most of the bag beside it is measuring two deposits as
+                    # one, and a confident volume for that pair is worse than
+                    # saying so.
+                    merged_reason = merged_neighbour_reason(
+                        volume_mask,
+                        [other.mask for other in detections
+                         if other is not detection and other.mask is not None
+                         and other.mask.shape == volume_mask.shape],
+                    )
                     static_reason = static_background_reason(
                         volume_mask, bin_region, change=deposit_change,
                     )
@@ -2153,15 +2171,36 @@ class VisionPipeline:
                             result.diagnostics.get("dimension_method")
                             or "logitech_support_plane_footprint"
                         )
-                        detection.dimension_flags = tuple(detection.dimension_flags or ()) + tuple(
-                            flag for flag in (
-                                None if result.diagnostics.get("plane_is_floor", True)
-                                else "height_not_floor_relative",
-                                None if result.diagnostics.get("geometry_consistent", True) is not False
-                                else "volume_disagrees_with_dimensions",
-                                None if stable.settled else "geometry_not_settled",
-                            ) if flag is not None
+                        # A bag is not a cuboid. Comparing the height-map volume
+                        # against length x width x height and complaining when
+                        # they differ by a fifth flagged every bag in the bin --
+                        # a filled bag occupies about half to two thirds of its
+                        # envelope, which is what a bag is. Only the physical
+                        # bounds are enforced now, and the fill fraction is
+                        # published so the number can be judged.
+                        fill = envelope_fill(
+                            length_m=stable.length_mm / 1000.0,
+                            width_m=stable.width_mm / 1000.0,
+                            height_m=stable.height_mm / 1000.0,
+                            litres=None if result.measurement is None else result.measurement.liters,
+                            shape_model=shape_model_for(
+                                detection.label,
+                                occlusion_corrected=bool(result.diagnostics.get("occlusion_corrected")),
+                            ),
                         )
+                        decision = publish_decision(
+                            settled=stable.settled,
+                            plane_is_floor=bool(result.diagnostics.get("plane_is_floor", True)),
+                            fill=fill,
+                            merged_reason=merged_reason,
+                        )
+                        logitech_publish = decision
+                        detection.dimension_flags = (
+                            tuple(detection.dimension_flags or ())
+                            + decision.labels
+                            + ((decision.reason,) if decision.reason else ())
+                        )
+                        result.diagnostics.update(decision.diagnostics)
                         detection.dimension_confidence = round(
                             float(min(0.6, result.measurement.coverage_ratio)), 4)
                     metric_mask, metric_result = volume_mask, result
@@ -2196,6 +2235,14 @@ class VisionPipeline:
                     foreground_fraction = individual_mono.valid_pixels / max(1, individual_mono.candidate_pixels)
                     if foreground_fraction < self.config.minimum_foreground_fraction:
                         detection.measurement_quality = "rejected-sparse-height-inside-mask"
+                    elif logitech_publish is not None and not logitech_publish.publish:
+                        # A volume that cannot be right is withheld: one
+                        # integrated over two bags at once, or one that does
+                        # not fit inside the envelope it was measured in. The
+                        # reason takes its place rather than a bare "pending".
+                        detection.volume_rejection_reason = logitech_publish.reason
+                        detection.measurement_quality = logitech_publish.reason
+                        self.stage_counters[f"logitech_withheld_{logitech_publish.reason}"] += 1
                     else:
                         detection.monocular_volume_l = round(individual_mono.liters, 6)
                         if self.camera_id == "logitech":
