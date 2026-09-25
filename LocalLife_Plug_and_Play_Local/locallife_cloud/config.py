@@ -353,6 +353,10 @@ class AppConfig:
     # after that the median of what it has is finalised rather than staying
     # pending for ever.
     logitech_measurement_timeout_frames: int = 12
+    # Frames a tracked object may show no change against the committed scene
+    # before it is measured from its own mask instead: past this, the baseline
+    # was captured with the object already in the zone.
+    baseline_contains_object_frames: int = 15
     # A confirmed object that has not settled after this many frames is
     # recorded once as rejected (unstable_volume / no_valid_measurement).
     finalise_max_frames: int = 45
@@ -676,6 +680,8 @@ class AppConfig:
             logitech_detector_confidence=float(os.environ.get(
                 "LOCALLIFE_LOGITECH_DETECTOR_CONFIDENCE",
                 os.environ.get("LOCALLIFE_DETECTOR_CONFIDENCE", defaults.logitech_detector_confidence))),
+            baseline_contains_object_frames=int(os.environ.get(
+                "LOCALLIFE_BASELINE_CONTAINS_OBJECT_FRAMES", defaults.baseline_contains_object_frames)),
             logitech_measurement_timeout_frames=int(os.environ.get(
                 "LOCALLIFE_LOGITECH_MEASUREMENT_TIMEOUT_FRAMES", defaults.logitech_measurement_timeout_frames)),
             logitech_volume_erode_px=int(os.environ.get(

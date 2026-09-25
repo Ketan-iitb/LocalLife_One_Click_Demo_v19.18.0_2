@@ -56,8 +56,9 @@ from .logitech_volume import axis_aligned_plane, fit_plane_alignment, metric_obj
 from .vocabulary import object_type as canonical_object_type
 from .deposit_state import DepositStateMachine, FrameObservation
 from .logitech_calibration import METRIC_OUTPUT, depth_output_kind
-from .measurement_mask import (BACKGROUND_REASONS, FOREGROUND_COMPONENT, deposit_component,
-                               looks_like_background, rgb_change)
+from .measurement_mask import (BACKGROUND_REASONS, DETECTOR_MASK, FOREGROUND_COMPONENT,
+                               NO_NEW_DEPOSIT, clean, deposit_component, looks_like_background,
+                               rgb_change)
 from .logitech_metric import (CALIBRATION_SET, EVALUATION_SET, RECOMMENDED_SAMPLES, CameraSetup,
                               HeightSample, LogitechMetricStore, fit_height_calibration,
                               integrate_volume_l, robust_height_cm, stable_statistics,
@@ -652,6 +653,10 @@ class VisionPipeline:
         self._measurement_frames: dict[int, int] = {}
         # The spread statistics behind each track's current answer.
         self._stability: dict[int, dict[str, Any]] = {}
+        # Consecutive frames a track was refused for showing no change.
+        self._deposit_refusals: dict[int, int] = {}
+        # The last readiness chain logged, so the line appears on a change.
+        self._last_chain: tuple[Any, ...] | None = None
         # What each live track looked like last frame, so a reused id cannot
         # inherit the previous object's measurements (shape_geometry.py).
         self._track_signatures: dict[int, ObjectSignature] = {}
@@ -2492,6 +2497,7 @@ class VisionPipeline:
                 },
             )
         self._observe_deposit_state(detections, deposit_change, bin_region)
+        self._log_measurement_chain()
         self.latest_analysis = analysis
         self.latest_processed_frame = frame.copy()
         self.latest_analysis_timestamp = float(timestamp)
@@ -3636,9 +3642,29 @@ class VisionPipeline:
         }
         if choice.reason:
             self.stage_counters[f"measurement_mask_rejected_{choice.reason}"] += 1
+        track = detection.track_id
         if choice.measurable:
+            if track is not None:
+                self._deposit_refusals.pop(track, None)
             return choice.mask if choice.source == FOREGROUND_COMPONENT else instance_mask
+        if choice.reason == NO_NEW_DEPOSIT and track is not None:
+            refusals = self._deposit_refusals[track] = self._deposit_refusals.get(track, 0) + 1
+            if refusals >= self.config.baseline_contains_object_frames:
+                # A tracked object that never differs from the committed scene
+                # is in that scene: the baseline was captured with it already
+                # standing there. Refusing it for ever is how a detected
+                # object stayed "pending" with no height and no litres, so it
+                # is measured from its own mask and the reason is recorded.
+                detection.measurement_quality = "baseline-contains-object"
+                detection.volume_rejection_reason = None
+                self.stage_counters["measurement_mask_baseline_contains_object"] += 1
+                fallback = clean(instance_mask & region, max(4, self.config.min_component_pixels // 8))
+                return fallback if np.any(fallback) else instance_mask
         detection.volume_rejection_reason = choice.reason
+        # The live table shows the measurement quality, so the precise reason
+        # belongs there too: "pending - reference distance estimate" named the
+        # cascade mode, never the thing that actually stopped the measurement.
+        detection.measurement_quality = str(choice.reason)
         return np.zeros_like(instance_mask)
 
     def _observe_deposit_state(
@@ -3730,6 +3756,15 @@ class VisionPipeline:
                             setup_id=setup_id or setup.setup_id, note=note or setup.note)
             stored = self.metric_store.save_setup(setup)
             self._validate_height_calibration(stored)
+            # The restore path reads this file at startup. Writing only the
+            # setup record left a station that had been given its distance
+            # asking for it again after every restart -- and measuring as an
+            # uncalibrated estimate until someone noticed.
+            try:
+                self.store.save_json("calibration/reference_distance.json",
+                                     {"distance_m": distance / 100.0, "captured_at": time.time()})
+            except (OSError, ValueError) as exc:  # pragma: no cover - disk issues
+                LOGGER.warning("Could not persist the Logitech reference distance: %s", exc)
         return stored.to_dict()
 
     def _validate_height_calibration(self, setup: CameraSetup | None = None) -> None:
@@ -3840,6 +3875,14 @@ class VisionPipeline:
             "logitech_calibrated_homography" if footprint is not None else "logitech_calibrated_height"
         )
         detection.calibration_version = f"{calibration.mapping}:{calibration.setup_id or 'setup'}"
+        refusal = self._implausible_measurement(detection, float(statistics["top_cm"]), zone)
+        if refusal:
+            detection.monocular_volume_l = None
+            detection.physical_height_mm = None
+            detection.height_above_baseline_cm = None
+            detection.volume_rejection_reason = refusal
+            detection.measurement_quality = refusal
+            return
         litres = integrate_volume_l(np.clip(heights_cm, 0.0, ceiling_cm), area_cm2, mask)
         if litres is not None and litres > 0:
             detection.monocular_volume_l = round(litres, 6)
@@ -3851,6 +3894,65 @@ class VisionPipeline:
             "height_cm": float(statistics["top_cm"]),
             "volume_l": detection.monocular_volume_l,
         })
+
+    def _implausible_measurement(
+        self, detection: Detection, height_cm: float, zone: MeasurementZone | None,
+    ) -> str:
+        """Refuse a number the installation makes impossible.
+
+        An object cannot be taller than the camera is high, wider than the mat
+        it stands on, or hold more than the zone could contain. Publishing such
+        a value and letting a reader notice later is worse than saying why.
+        """
+        distance_cm = float(self.config.logitech_reference_distance_m or 0.0) * 100.0
+        if distance_cm and height_cm > distance_cm:
+            return "height_exceeds_camera_floor_distance"
+        if height_cm <= 0:
+            return "no_positive_object_height"
+        if zone is not None and zone.has_floor_scale:
+            longest_cm = max(zone.near_edge_m, zone.depth_edge_m) * 100.0
+            for value in (detection.footprint_length_mm, detection.footprint_width_mm):
+                if value and value / 10.0 > 1.2 * longest_cm:
+                    return "dimension_larger_than_measurement_zone"
+            capacity_l = (zone.near_edge_m * zone.depth_edge_m
+                          * max(height_cm / 100.0, 0.01)) * 1000.0
+            if detection.monocular_volume_l and detection.monocular_volume_l > 1.5 * capacity_l:
+                return "volume_exceeds_measurement_zone_capacity"
+        return ""
+
+    def _log_measurement_chain(self) -> None:
+        """One line per state change, naming every link in the chain.
+
+        Printed when something in it changes rather than every frame, so a
+        session log shows the moment a calibration arrived or a resolution
+        moved -- which is what turns "pending" into a diagnosis.
+        """
+        if self.camera_id != "logitech":
+            return
+        readiness = self._measurement_readiness()
+        frame = self.latest_processed_frame
+        zone = self.measurement_zone
+        calibration = self.height_calibration
+        chain = (
+            self.camera_id,
+            None if frame is None else (int(frame.shape[1]), int(frame.shape[0])),
+            str(self.metric_store.directory), None if calibration is None else
+            f"{calibration.mapping}:{calibration.status}",
+            self.zone_source, None if zone is None else zone.has_floor_scale,
+            round(float(self.config.logitech_reference_distance_m or 0.0), 3),
+            self.reference_monocular is not None, self.config.depth_model,
+            readiness.depth_output, self.calibration_mode, readiness.fully_calibrated,
+            readiness.missing[:1], self.relative_depth_reason or self.height_calibration_reason or "",
+        )
+        if chain == self._last_chain:
+            return
+        self._last_chain = chain
+        LOGGER.info(
+            "Logitech chain: resolution=%s calibration_dir=%s height_calibration=%s zone=%s "
+            "floor_scale=%s camera_height_m=%s empty_baseline=%s depth_model=%s output=%s "
+            "mode=%s ready=%s missing=%s reason=%s",
+            *chain[1:],
+        )
 
     # -------------------------------------------------- operator calibration steps
     def capture_empty_zone(self) -> dict[str, Any]:
@@ -4029,6 +4131,7 @@ class VisionPipeline:
             self._logitech_volume_samples.pop(track_id, None)
             self._measurement_frames.pop(track_id, None)
             self._stability.pop(track_id, None)
+            self._deposit_refusals.pop(track_id, None)
             self._logitech_volume_spread.pop(track_id, None)
             self._color_history.pop(track_id, None)
             self._material_history.pop(track_id, None)
