@@ -44,6 +44,7 @@ from .sorting_rules import classify_sorting, mis_sort_family
 from . import __version__
 from .stable_identity import Observation, StabilitySettings, StableObjectRegistry, observations_from
 from .footprint import DimensionSmoother
+from .logitech_footprint import FootprintResult, measure_footprint
 from .diagnostics import HardwareDiagnostics
 from .event_log import MeasurementEventLog, STATUS_ACCEPTED, STATUS_REJECTED, resolve_event_id
 from .storage import ResultStore
@@ -454,6 +455,15 @@ def _spans_the_background(mask: np.ndarray, region: np.ndarray | None) -> bool:
     return looks_like_background(mask, region) is not None
 
 
+def _zone_limits_m(zone: Any) -> tuple[float, float] | None:
+    """The calibrated mat's own size: nothing standing on it can be larger."""
+    width = getattr(zone, "width_m", None)
+    depth = getattr(zone, "depth_m", None)
+    if width and depth:
+        return (float(width), float(depth))
+    return None
+
+
 class VisionPipeline:
     def __init__(
         self,
@@ -679,6 +689,8 @@ class VisionPipeline:
         # What the last measured frame saw, so a calibration sample can be
         # captured from the object standing in the zone right now.
         self.last_metric_context: dict[str, Any] = {}
+        # Why the last Logitech footprint measured or refused, for diagnostics.
+        self.last_footprint_result: FootprintResult | None = None
         # Frames each confirmed track has waited for finalisation (non-waste modes).
         self._unfinalised_frames: dict[int, int] = {}
         # Detector / foreground / final / rejected masks of the latest Logitech
@@ -3816,11 +3828,13 @@ class VisionPipeline:
     ) -> None:
         """Report calibrated centimetres, and keep the provisional numbers beside them.
 
-        Length and width come from the mat's homography -- the mask warped to a
-        bird's-eye view and fitted with an oriented rectangle -- so an object at
-        the back of the mat is not reported smaller than the same object at the
-        front. Height comes from the fitted mapping, and the volume is the
-        per-pixel integral of the two.
+        Length and width come from the object's contact with the mat, warped to
+        a bird's-eye view through the mat's homography, so an object at the back
+        of the mat is not reported smaller than the same object at the front.
+        Only the contact band is warped: the homography maps the floor plane and
+        nothing else, so warping a standing object's whole silhouette reports
+        its shadow instead of its base. Height comes from the fitted mapping,
+        and the volume is the per-pixel integral of the two.
         """
         if self.camera_id != "logitech":
             return
@@ -3833,7 +3847,20 @@ class VisionPipeline:
             metres = zone.pixel_area_m2(mask.shape)
             area_cm2 = None if metres is None else metres * 10000.0
         raw = robust_height_cm(signal[mask])
-        footprint = None if zone is None else zone.footprint_m(mask)
+        # Only the pixels that actually touch the floor may be warped through
+        # the mat homography. Warping the whole silhouette smeared a standing
+        # object into its own shadow and reported a 5 cm can as 11.5 cm wide;
+        # see logitech_footprint.py for the geometry.
+        measured = measure_footprint(
+            zone, mask,
+            camera_height_m=self.config.logitech_reference_distance_m or None,
+            zone_limits_m=_zone_limits_m(zone),
+        )
+        footprint = (
+            (measured.length_m, measured.width_m, measured.area_m2 or 0.0)
+            if measured.ok else None
+        )
+        self.last_footprint_result = measured
         self.last_metric_context = {
             "signal_cm": float(raw.get("top_cm", 0.0)),
             "signal_mean_cm": float(raw.get("mean_cm", 0.0)),
@@ -3842,6 +3869,12 @@ class VisionPipeline:
             "width_cm": None if footprint is None else round(footprint[1] * 100.0, 2),
             "mask": mask.copy(), "signal_map": signal, "prediction": prediction,
             "label": detection.label, "track_id": detection.track_id,
+            # How the footprint was obtained, so an operator can tell a real
+            # measurement from a refusal without reading the logs.
+            "footprint_method": measured.method or None,
+            "footprint_reason": measured.reason,
+            "footprint_contact_pixels": measured.contact_pixels,
+            "footprint_occlusion_corrected": measured.occlusion_corrected,
         }
         # Whatever the provisional path produced, kept for comparison.
         detection.uncalibrated_length_mm = detection.footprint_length_mm
@@ -3849,12 +3882,16 @@ class VisionPipeline:
         detection.uncalibrated_height_mm = detection.physical_height_mm
         detection.uncalibrated_volume_l = detection.monocular_volume_l
 
+        if footprint is None and measured.reason:
+            detection.volume_rejection_reason = measured.reason
+            if detection.measurement_quality in (None, "", "measured"):
+                detection.measurement_quality = measured.reason
         if footprint is not None:
             # The mat's own scale, so the same object measures the same at the
             # front and the back of the perspective view.
             detection.footprint_length_mm = round(footprint[0] * 1000.0, 2)
             detection.footprint_width_mm = round(footprint[1] * 1000.0, 2)
-            detection.dimension_method = "logitech_homography_footprint"
+            detection.dimension_method = measured.method or "logitech_contact_band_footprint"
 
         calibration = self.height_calibration
         if calibration is None:
