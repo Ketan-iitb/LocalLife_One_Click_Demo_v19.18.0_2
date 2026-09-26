@@ -95,11 +95,16 @@ def _annotate_frame(frame: np.ndarray, pipeline: VisionPipeline) -> np.ndarray:
         volume = f" | {active_volume:.2f} L" if active_volume is not None else ""
         visible_color = f" [{detection.color}]" if detection.color not in {"unknown", ""} else ""
         continuity = " (tracked)" if detection.source == "tracked-prediction" else ""
+        # The canonical name, not the detector's phrasing of the moment: one
+        # frame of the real bin showed identical bags captioned "filled plastic
+        # waste bag", "plastic garbage bag" and "plastic trash bag". The raw
+        # label is still on the detection and in every record.
+        shown_label = detection.canonical_type or detection.label
         display_type = (
-            f"test object ({detection.label})"
+            f"test object ({shown_label})"
             if detection.accepted_class == "measurement_object"
             else detection.accepted_class.replace("_", " ")
-            if detection.accepted_class is not None else detection.label
+            if detection.accepted_class is not None else shown_label
         )
         caption = f"#{detection.track_id or '?'} {display_type}{continuity}{visible_color}{distance}{height}{volume}"
         cv2.putText(output, caption, (x1, max(19, y1 - 7)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)

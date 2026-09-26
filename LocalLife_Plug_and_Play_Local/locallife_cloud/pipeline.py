@@ -29,7 +29,7 @@ from .geometry import (
     roi_mask,
 )
 from .inference import MetricDepthEstimator, create_segmenter
-from .material import MaterialClassifier
+from .material_siglip import create_material_classifier
 from .ledger import WastePlantLedger, waste_object_type
 from .logitech import DETECTOR_ONLY_SOURCE, bound_logitech_detections, stabilize_background_depth
 from .heightmap_volume import (
@@ -71,7 +71,7 @@ from .logitech_calibration import RELATIVE_ONLY_MESSAGE, LogitechCalibrationStor
 from .coordinates import clip_to_region, frame_consistency, restore_mask
 from .logitech_factor import LogitechVolumeFactors, geometry_group
 from .logitech_volume import axis_aligned_plane, fit_plane_alignment, metric_object_volume, stable_volume
-from .vocabulary import object_type as canonical_object_type
+from .waste_bag_names import object_type as canonical_object_type
 from .bin_occupancy import (
     NO_OCCUPANCY,
     BinOccupancyTracker,
@@ -511,7 +511,9 @@ class VisionPipeline:
             else None
         )
         self.material_classifier = material_classifier or (
-            MaterialClassifier(config, getattr(self.detector, "device", None))
+            # CLIP by default; SigLIP 2 when the configured model names it, with
+            # an automatic fallback to CLIP if it cannot load.
+            create_material_classifier(config, getattr(self.detector, "device", None))
             if config.enable_material_classification
             else None
         )
