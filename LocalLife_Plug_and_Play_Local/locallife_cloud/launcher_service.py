@@ -35,7 +35,7 @@ from .cloud_startup import (
 )
 from .config import AppConfig
 from .launcher_page import WELCOME_PAGE
-from .pi_discovery import resolve_pi, unreachable_message
+from .pi_discovery import default_cache_path, resolve_pi, unreachable_message
 
 RUN_MODES = ("local", "cloud", "auto")
 
@@ -146,7 +146,10 @@ class LaunchController:
         # multicast DNS, which showed up as "Not reachable" for a Pi that was
         # powered on and fine.
         pi_cache = self.config.results_dir / "pi-address.json"
-        pi = resolve_pi(self.config.pi_host, cache_path=pi_cache)
+        # Also the launcher script's cache: a Pi it found must not read as
+        # "Not reachable" here.
+        pi = resolve_pi(self.config.pi_host, cache_path=pi_cache,
+                        also_read=[default_cache_path()])
         internet = _port_open("8.8.8.8", 53, timeout=1.5)
         gcloud = shutil.which("gcloud") is not None
         return {

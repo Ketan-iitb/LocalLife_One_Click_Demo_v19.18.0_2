@@ -122,7 +122,11 @@ class ReadinessTests(unittest.TestCase):
         control = LaunchController(config)
         with mock.patch("locallife_cloud.pi_discovery._reachable",
                         side_effect=lambda h, p, t: h in reachable), \
-             mock.patch("locallife_cloud.launcher_service._port_open", return_value=False):
+             mock.patch("locallife_cloud.launcher_service._port_open", return_value=False), \
+             mock.patch("locallife_cloud.launcher_service.default_cache_path",
+                        return_value=Path(directory.name) / "shared-pi-address.json"), \
+             mock.patch("locallife_cloud.pi_discovery.neighbour_table", return_value=""), \
+             mock.patch.dict("os.environ", {"LOCALLIFE_PI_DISCOVERY": "0"}):
             return control.readiness()
 
     def test_a_pi_found_by_fallback_reads_as_reachable(self) -> None:
