@@ -71,6 +71,9 @@ from .logitech_calibration import RELATIVE_ONLY_MESSAGE, LogitechCalibrationStor
 from .coordinates import clip_to_region, frame_consistency, restore_mask
 from .logitech_factor import LogitechVolumeFactors, geometry_group
 from .colour_evidence import describe_colour
+from .depth_edges import drop_depth_edge_pixels
+from .shape_router import refine_shape
+from .logitech_pose import touches_frame_border
 from .material_evidence import reconcile_material
 from .logitech_pose import (AXIS_ALIGNMENT_MAX_TILT_DEG, FloorScaleTracker, PoseGuard, ViewChangeGuard,
                             floor_tilt_deg, plane_height_scale, result_record, sanity_flags)
@@ -93,7 +96,7 @@ from .logitech_metric import (CALIBRATION_SET, EVALUATION_SET, RECOMMENDED_SAMPL
                               zone_signature)
 from .measurement_zone import MeasurementZone, MeasurementZoneStore
 from .readiness import MeasurementReadiness
-from .shape_geometry import (CYLINDER, CYLINDER_REJECTIONS, UNCERTAIN, GeometryLock,
+from .shape_geometry import (CYLINDER, CYLINDER_REJECTIONS, SPHERE, UNCERTAIN, GeometryLock,
                              ObjectSignature, ShapeGeometry, measure_shape)
 from .types import BoxVolumeMeasurement, CameraIntrinsics, DepthCalibration, Detection, FrameAnalysis
 from .volume import (
@@ -1878,6 +1881,14 @@ class VisionPipeline:
             instance_mask = self._deposit_measurement_mask(
                 detection, instance_mask, bin_region, deposit_change, deposit_rise,
             )
+            # The box-cuboid estimator erodes its own mask against leaks; it
+            # keeps the unfiltered one, or its edge would be cut twice.
+            cuboid_mask = instance_mask
+            if self.camera_id != "logitech" and depth_m is not None and np.any(instance_mask):
+                # Stereo "flying pixels" along the silhouette put points
+                # between the object and the floor, which smears the
+                # footprint away from the camera (depth_edges.py).
+                instance_mask = self._without_depth_edges(detection, depth_m, instance_mask, radius=2)
             logitech_height_coherent = True
             if depth_m is not None:
                 valid_distance = instance_mask & np.isfinite(depth_m) & (depth_m > 0.10) & (depth_m < 20.0)
@@ -2071,12 +2082,12 @@ class VisionPipeline:
                 if plane_points is not None:
                     # Mesh volume is the height-map integral set just above,
                     # before any cuboid override below replaces it.
-                    pending_shapes[id(detection)] = measure_shape(
+                    pending_shapes[id(detection)] = refine_shape(measure_shape(
                         *plane_points,
                         mesh_volume_l=detection.realsense_volume_l,
                         height_mm=dimensions.height_mm,
                         label=detection.label,
-                    )
+                    ), *plane_points)
             # Table-relative cuboid measurement for box-family detections
             # (Revised Dual-Camera Volume Estimation recipe). RealSense only
             # -- Logitech never supplies metric geometry (PDF hard
@@ -2115,7 +2126,7 @@ class VisionPipeline:
                 cuboid = estimate_box_volume_cuboid(
                     depth_m,
                     intrinsics,
-                    instance_mask,
+                    cuboid_mask,
                     measurement_plane,
                     measurement_mask=bin_region,
                     min_height_m=minimum_height_m,
@@ -2206,6 +2217,12 @@ class VisionPipeline:
                             "label": detection.label,
                         }
                         continue
+                    # Depth Anything blurs the step at the silhouette over a few
+                    # pixels, the monocular form of the same edge artefact.
+                    volume_mask = self._without_depth_edges(
+                        detection, calibrated_prediction, volume_mask,
+                        radius=max(2, int(round(frame.shape[1] / 200.0))),
+                    )
                     if self.config.logitech_volume_erode_px > 0:
                         # Classification keeps the full mask; volume uses the
                         # core, because the rim pixel is floor at object depth.
@@ -2485,11 +2502,11 @@ class VisionPipeline:
                 if plane_points is not None and self.diagnostics.enabled:
                     pending_points[id(detection)] = plane_points
                 if plane_points is not None:
-                    pending_shapes[id(detection)] = measure_shape(
+                    pending_shapes[id(detection)] = refine_shape(measure_shape(
                         *plane_points,
                         mesh_volume_l=detection.monocular_volume_l,
                         label=detection.label,
-                    )
+                    ), *plane_points)
 
         if self.camera_id == "logitech":
             rejected = []
@@ -3800,11 +3817,18 @@ class VisionPipeline:
                 # Logitech: the metric depth and the empty-scene reference as
                 # numbers, so scripts/replay_logitech_bundle.py can re-measure
                 # the same frame with changed code.
-                arrays=None if self.camera_id != "logitech" else {
-                    "depth_m": context.get("depth"), "reference_depth_m": self.reference_monocular,
+                arrays={
+                    "depth_m": context.get("depth"),
+                    "reference_depth_m": (self.reference_monocular if self.camera_id == "logitech"
+                                          else self.reference_realsense),
                 },
-                extra=None if self.camera_id != "logitech" else {
-                    "logitech_record": (self.last_logitech_volume_diagnostics or {}).get("result_record"),
+                extra={
+                    "logitech_record": (self.last_logitech_volume_diagnostics or {}).get("result_record")
+                    if self.camera_id == "logitech" else None,
+                    "intrinsics": None if self.latest_intrinsics is None else [
+                        float(self.latest_intrinsics.fx), float(self.latest_intrinsics.fy),
+                        float(self.latest_intrinsics.ppx), float(self.latest_intrinsics.ppy)],
+                    "dimension_flags": list(detection.dimension_flags or ()),
                 },
             )
         if detection.track_id is not None and (result.ok or result.error):
@@ -4345,6 +4369,12 @@ class VisionPipeline:
                 # floor reach the zone's own edges. Without this the fallback
                 # measured the bed as a 35 L "unclassified object".
                 static_reason = static_background_reason(candidate, region)
+                if static_reason is None and touches_frame_border(candidate):
+                    # It never differed from the committed scene *and* it runs
+                    # out of the picture: a bed, a sofa, a blanket -- the room.
+                    # A deposit present at baseline capture sits inside the
+                    # view. This is how a 1.3 m "textile item" got 18 L.
+                    static_reason = "unchanged_object_leaves_the_frame"
                 if static_reason is not None:
                     detection.volume_rejection_reason = static_reason
                     detection.measurement_quality = static_reason
@@ -4743,6 +4773,18 @@ class VisionPipeline:
         if scale is None:
             return depth
         return (depth * scale).astype(depth.dtype, copy=False)
+
+    def _without_depth_edges(self, detection: Detection, depth: np.ndarray | None,
+                             mask: np.ndarray, *, radius: int) -> np.ndarray:
+        filtered, info = drop_depth_edge_pixels(depth, mask, radius=radius)
+        if info.get("applied"):
+            detection.dimension_flags = tuple(dict.fromkeys(
+                tuple(detection.dimension_flags or ()) + ("depth_edge_pixels_removed",)))
+        elif info.get("reason") == "would_remove_too_much_of_the_mask":
+            detection.dimension_flags = tuple(dict.fromkeys(
+                tuple(detection.dimension_flags or ()) + ("depth_edges_dominate_mask",)))
+        self.stage_counters["depth_edge_pixels_removed"] += int(info.get("removed_pixels", 0) if info.get("applied") else 0)
+        return filtered if filtered is not None else mask
 
     def _check_logitech_view(self, frame: np.ndarray, detections: list[Detection],
                              warnings: list[str]) -> None:
@@ -5242,6 +5284,22 @@ class VisionPipeline:
             detection.dimension_method = f"fitted_cylinder_{shape.cylinder_orientation}"
             detection.measurement_method = "cylinder_pi_r2_h"
             volume = round(float(shape.selected_volume_litres), 6)
+            if logitech:
+                detection.monocular_volume_l = volume
+            else:
+                detection.realsense_volume_l = volume
+        elif shape.geometry_method == SPHERE and shape.height_mm:
+            # Routed on the object's own points (shape_router.py), never on
+            # its name; the fitted ball's envelope replaces the height map.
+            # From the (multi-frame median) height: the lock's aggregation
+            # recomputes only cylinder and cuboid volumes.
+            diameter = round(float(shape.height_mm), 2)
+            detection.footprint_length_mm = detection.footprint_width_mm = diameter
+            detection.physical_height_mm = diameter
+            detection.height_above_baseline_cm = round(diameter / 10.0, 1)
+            detection.dimension_method = "fitted_sphere"
+            detection.measurement_method = "sphere_4_3_pi_r3"
+            volume = round(4.0 / 3.0 * math.pi * (diameter / 2000.0) ** 3 * 1000.0, 6)
             if logitech:
                 detection.monocular_volume_l = volume
             else:

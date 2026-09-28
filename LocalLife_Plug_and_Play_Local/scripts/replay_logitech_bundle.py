@@ -1,4 +1,4 @@
-"""Re-measure saved Logitech diagnostic bundles with the current geometry code.
+"""Re-measure saved diagnostic bundles (Logitech or RealSense) with the current geometry code.
 
 Record bundles on the rig with LOCALLIFE_HARDWARE_DIAGNOSTIC=1; each finalised
 Logitech measurement writes a folder with depth_m.npy, reference_depth_m.npy,
@@ -35,14 +35,29 @@ def replay(bundle: Path) -> dict:
 
     payload = json.loads((bundle / "result.json").read_text(encoding="utf-8"))
     record = payload.get("logitech_record") or {}
+    intrinsics = record.get("intrinsics") or payload.get("intrinsics")
     depth_path, reference_path = bundle / "depth_m.npy", bundle / "reference_depth_m.npy"
-    if not depth_path.exists() or not reference_path.exists() or not record.get("intrinsics"):
+    if not depth_path.exists() or not reference_path.exists() or not intrinsics:
         return {"bundle": bundle.name, "skipped": "no depth arrays or intrinsics in this bundle"}
     depth, reference = np.load(depth_path), np.load(reference_path)
     mask = cv2.imread(str(bundle / "object_mask.png"), cv2.IMREAD_GRAYSCALE) > 0
-    fx, fy, ppx, ppy = record["intrinsics"]
+    fx, fy, ppx, ppy = intrinsics
     camera = CameraIntrinsics(fx=fx, fy=fy, ppx=ppx, ppy=ppy, width=depth.shape[1], height=depth.shape[0])
     plane = fit_reference_plane(reference, camera, mask=~mask)
+    if payload.get("camera") == "realsense":
+        # The RealSense's own path: measured depth, edge pixels dropped first.
+        from locallife_cloud.depth_edges import drop_depth_edge_pixels
+        from locallife_cloud.volume import estimate_object_dimensions
+
+        kept, _ = drop_depth_edge_pixels(depth, mask)
+        dims = estimate_object_dimensions(depth, camera, kept, plane, min_height_m=0.01,
+                                          max_height_m=1.0, min_points=20)
+        return {"bundle": bundle.name, "camera": "realsense",
+                "length_mm": None if dims is None else round(dims.length_mm, 1),
+                "width_mm": None if dims is None else round(dims.width_mm, 1),
+                "height_mm": None if dims is None else round(dims.height_mm, 1),
+                "saved_dimensions_mm": payload.get("dimensions_mm"),
+                "saved_volume_l": payload.get("volume_l")}
     result = metric_object_volume(depth, camera, mask, plane, reference_depth_m=reference,
                                   min_height_m=0.01, min_pixels=25)
     d = result.diagnostics
