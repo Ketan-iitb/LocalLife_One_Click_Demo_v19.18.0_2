@@ -72,7 +72,7 @@ from .coordinates import clip_to_region, frame_consistency, restore_mask
 from .logitech_factor import LogitechVolumeFactors, geometry_group
 from .colour_evidence import describe_colour
 from .material_evidence import reconcile_material
-from .logitech_pose import (AXIS_ALIGNMENT_MAX_TILT_DEG, FloorScaleTracker, PoseGuard,
+from .logitech_pose import (AXIS_ALIGNMENT_MAX_TILT_DEG, FloorScaleTracker, PoseGuard, ViewChangeGuard,
                             floor_tilt_deg, plane_height_scale, result_record, sanity_flags)
 from .logitech_volume import axis_aligned_plane, fit_plane_alignment, metric_object_volume, stable_volume
 from .waste_bag_names import object_type as canonical_object_type
@@ -739,6 +739,9 @@ class VisionPipeline:
         self._pose_check_frames = 0
         # Each frame's depth re-anchored on the floor it can still see.
         self._floor_scale = FloorScaleTracker()
+        # Has the Logitech been moved since its empty-scene reference?
+        self._logitech_view = ViewChangeGuard()
+        self.logitech_view_reason: str | None = None
         self.logitech_floor_scale: dict[str, Any] = {"state": "not_run"}
         # What the last measured frame saw, so a calibration sample can be
         # captured from the object standing in the zone right now.
@@ -792,6 +795,11 @@ class VisionPipeline:
             lambda: deque(maxlen=max(3, config.volume_window_frames))
         )
         self._material_frame_counts: dict[int, int] = defaultdict(int)
+        # The classifier's own score for each accepted vote, so the published
+        # confidence is not just how often the frames agreed.
+        self._material_scores: dict[int, deque[tuple[str, float]]] = defaultdict(
+            lambda: deque(maxlen=max(3, config.volume_window_frames))
+        )
         # Live "seen" totals are intentionally independent from the durable
         # ledger.  A detected bag should appear immediately even while its
         # baseline/depth measurement is still being validated.
@@ -1000,6 +1008,7 @@ class VisionPipeline:
             self._track_signatures.clear()
             self._color_history.clear()
             self._material_history.clear()
+            self._material_scores.clear()
             self._material_frame_counts.clear()
             self.committed_bags = self.ledger.summary()["deposited_bags"]
 
@@ -1356,6 +1365,7 @@ class VisionPipeline:
                     "reference-distance-estimate" if measured_distance > 0 else "uncalibrated-estimate"
                 )
         if self.camera_id == "logitech":
+            self._check_logitech_view(frame, detections, warnings)
             calibrated_prediction = self._rescale_on_visible_floor(
                 frame, calibrated_prediction, measure_intrinsics, detections, bin_region,
             )
@@ -2222,6 +2232,13 @@ class VisionPipeline:
                         )
                     if plane_for_volume is None or plane_for_volume.coefficients is None:
                         plane_for_volume = self._uncalibrated_plane
+                    if self.logitech_view_reason:
+                        # The empty scene, its depth and its floor belong to
+                        # another camera pose; heights against them are not
+                        # heights. Recapture the empty scene in this pose.
+                        detection.volume_rejection_reason = self.logitech_view_reason
+                        detection.measurement_quality = "camera-moved-recapture-empty-scene"
+                        continue
                     if self.logitech_floor_scale.get("state") == "unavailable":
                         # The floor this frame shows cannot confirm the depth
                         # scale, and the last confirmed one is too old: a
@@ -2649,7 +2666,13 @@ class VisionPipeline:
                     # a generic crop classifier. This prevents a confirmed
                     # cardboard box being reported as plastic (image2_1).
                     detection.material = canonical_material
-                    detection.material_confidence = 1.0
+                    # Derived from the detector's class, so it is only as
+                    # certain as that class -- not 100 %.
+                    detection.material_confidence = round(float(detection.confidence), 4)
+                    detection.material_evidence = {
+                        "source": "accepted_detector_class", "accepted_class": detection.accepted_class,
+                        "confidence_meaning": "detector class confidence",
+                    }
                 elif self.material_classifier is not None and self.material_classifier.enabled:
                     materials = self._material_history[detection.track_id]
                     frame_count = self._material_frame_counts[detection.track_id]
@@ -2659,6 +2682,7 @@ class VisionPipeline:
                         label, score = self.material_classifier.classify(frame, detection.mask, detection.box)
                         if label != "unknown" and score >= self.config.material_confidence_threshold:
                             materials.append(label)
+                            self._material_scores[detection.track_id].append((label, float(score)))
                     if materials:
                         # Identity, exterior material and contents kept apart,
                         # and a split vote published as unknown
@@ -2667,6 +2691,7 @@ class VisionPipeline:
                          detection.material_evidence) = reconcile_material(
                             detection.label, list(materials),
                             colour_state=(detection.color_evidence or {}).get("state"),
+                            scores=list(self._material_scores[detection.track_id]),
                         )
             measured = self._detection_volume(detection)
             if detection.track_id is not None and measured is not None:
@@ -2922,6 +2947,7 @@ class VisionPipeline:
             self._track_signatures.clear()
             self._color_history.clear()
             self._material_history.clear()
+            self._material_scores.clear()
             self._material_frame_counts.clear()
             LOGGER.info(
                 "Automatically recorded %s settled waste item(s); updated the bin reference",
@@ -2976,6 +3002,7 @@ class VisionPipeline:
             self._track_signatures.clear()
             self._color_history.clear()
             self._material_history.clear()
+            self._material_scores.clear()
             self._material_frame_counts.clear()
             self.tracker.tracks.clear()
             record["event"] = "committed-waste-item"
@@ -3011,6 +3038,7 @@ class VisionPipeline:
             self._track_signatures.clear()
             self._color_history.clear()
             self._material_history.clear()
+            self._material_scores.clear()
             self._material_frame_counts.clear()
             self._session_seen_tracks.clear()
 
@@ -4127,7 +4155,10 @@ class VisionPipeline:
         """
         if self.camera_id != "logitech" or not self.config.logitech_auto_baseline:
             return
-        if self.reference_rgb is not None and self.reference_monocular is not None:
+        if (self.reference_rgb is not None and self.reference_monocular is not None
+                and not getattr(self, "logitech_view_reason", None)):
+            # Relearn only when the camera has been moved away from the
+            # reference it has: then the old one is worse than none.
             return
         inside = [
             item for item in detections
@@ -4507,6 +4538,8 @@ class VisionPipeline:
             except (KeyError, TypeError, ValueError):
                 pass
         difference = current.difference(recorded)
+        if getattr(self, "logitech_view_reason", None):
+            difference = self.logitech_view_reason
         if self.logitech_pose.changed_reason:
             # CameraSetup knows the resolution, zone and distance, not the
             # tilt: a mapping fitted looking across the mat was reused
@@ -4682,6 +4715,7 @@ class VisionPipeline:
         """This frame's depth, re-scaled so its visible floor sits where the setup put it."""
         pose = self.logitech_pose.recorded
         if (depth is None or intrinsics is None or pose is None or self.logitech_pose.changed_reason
+                or getattr(self, "logitech_view_reason", None)
                 or depth_output_kind(self.config.depth_model) != METRIC_OUTPUT
                 or tuple(pose.resolution) != (int(depth.shape[1]), int(depth.shape[0]))):
             self.logitech_floor_scale = {"state": "not_applicable",
@@ -4710,6 +4744,31 @@ class VisionPipeline:
             return depth
         return (depth * scale).astype(depth.dtype, copy=False)
 
+    def _check_logitech_view(self, frame: np.ndarray, detections: list[Detection],
+                             warnings: list[str]) -> None:
+        guard = self.__dict__.get("_logitech_view")
+        if guard is None:
+            return
+        occupied = np.zeros(frame.shape[:2], dtype=bool)
+        for item in detections:
+            if item.mask is not None and item.mask.shape == occupied.shape:
+                occupied |= item.mask
+            else:
+                x1, y1, x2, y2 = (int(value) for value in item.box)
+                occupied[max(0, y1):max(0, y2), max(0, x1):max(0, x2)] = True
+        reason = guard.update(frame, self.reference_rgb, exclude=occupied)
+        if reason != self.logitech_view_reason:
+            self.logitech_view_reason = reason
+            if reason:
+                LOGGER.warning("Logitech %s: measurements paused until the empty scene is recaptured", reason)
+                # The floor fitted in the old pose must not be reused.
+                self._logitech_plane_cache = None
+            self._validate_height_calibration()
+        if reason:
+            warnings.append(
+                f"{reason}: the Logitech view no longer matches its empty-scene reference; "
+                "clear the zone and capture the empty scene again in this pose")
+
     def _logitech_record_context(self, detection: Detection, frame: np.ndarray, intrinsics: Any) -> dict[str, Any]:
         calibration = self.calibration
         return {
@@ -4725,6 +4784,7 @@ class VisionPipeline:
                 "scale": calibration.scale, "offset_m": calibration.offset_m, "rmse_m": calibration.rmse_m},
             "height_calibration": detection.calibration_version,
             "floor_scale": dict(self.logitech_floor_scale),
+            "view_check": dict(self._logitech_view.last) if "_logitech_view" in self.__dict__ else None,
             "detection_box": [int(value) for value in detection.box],
             "label": detection.label,
             "track_id": detection.track_id,
@@ -4990,6 +5050,7 @@ class VisionPipeline:
             self._logitech_volume_spread.pop(track_id, None)
             self._color_history.pop(track_id, None)
             self._material_history.pop(track_id, None)
+            self._material_scores.pop(track_id, None)
             self._material_frame_counts.pop(track_id, None)
             self._bin_total_before_track.pop(track_id, None)
             self._track_signatures.pop(track_id, None)

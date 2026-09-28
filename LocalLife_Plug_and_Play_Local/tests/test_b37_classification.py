@@ -98,7 +98,11 @@ class SiglipSelectionTests(unittest.TestCase):
     def test_clip_is_still_the_default(self) -> None:
         config = AppConfig()
         self.assertFalse(is_siglip(config.material_model))
-        self.assertIs(type(create_material_classifier(config)), MaterialClassifier)
+        # Still CLIP; since v38 scored one vote per label (material_fair.py).
+        from locallife_cloud.material_fair import BalancedClipMaterialClassifier
+
+        self.assertIs(type(create_material_classifier(config)), BalancedClipMaterialClassifier)
+        self.assertIsInstance(create_material_classifier(config), MaterialClassifier)
 
     def test_a_siglip_model_name_selects_the_siglip_classifier(self) -> None:
         config = replace(AppConfig(), material_model="google/siglip2-base-patch16-224")

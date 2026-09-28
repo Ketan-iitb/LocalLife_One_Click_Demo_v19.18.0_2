@@ -46,6 +46,7 @@ from typing import Any
 import numpy as np
 
 from .config import AppConfig
+from .material_fair import BalancedClipMaterialClassifier, balanced_label_scores
 from .material import (
     DEFAULT_MATERIAL_PROMPTS,
     MaterialClassifier,
@@ -102,7 +103,7 @@ class SiglipMaterialClassifier(MaterialClassifier):
             reason, CLIP_FALLBACK_MODEL,
         )
         self.model = None
-        self._fallback = MaterialClassifier(
+        self._fallback = BalancedClipMaterialClassifier(
             replace(self.config, material_model=CLIP_FALLBACK_MODEL), self.device,
         )
         self.runtime.update({
@@ -189,7 +190,8 @@ class SiglipMaterialClassifier(MaterialClassifier):
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("SigLIP material classification failed on one crop (%s)", exc)
             return "unknown", 0.0
-        label, confidence, _ = aggregate_label_scores(logits, self._prompt_labels)
+        # One vote per label, not per prompt, with abstention (material_fair.py).
+        label, confidence, _, _ = balanced_label_scores(logits, self._prompt_labels)
         return label, confidence
 
 
@@ -197,4 +199,4 @@ def create_material_classifier(config: AppConfig, device: str | None = None) -> 
     """The material classifier the configuration asks for."""
     if is_siglip(config.material_model):
         return SiglipMaterialClassifier(config, device)
-    return MaterialClassifier(config, device)
+    return BalancedClipMaterialClassifier(config, device)

@@ -383,3 +383,92 @@ def result_record(
         "raw_volume_l": raw_volume_l, "calibrated_volume_l": calibrated_volume_l,
         "rejection_reason": rejection,
     }
+
+
+# ------------------------------------------------------------ view-change guard
+VIEW_DOWNSCALE_WIDTH = 160
+VIEW_MIN_CORRELATION = 0.45
+VIEW_CHANGE_FRAMES = 3
+VIEW_IMMEDIATE_CORRELATION = 0.25
+VIEW_MIN_USABLE_FRACTION = 0.25
+VIEW_MIN_EDGE_STD = 2.0
+
+
+def _edge_image(frame_bgr: np.ndarray) -> np.ndarray:
+    import cv2
+
+    height, width = frame_bgr.shape[:2]
+    scale = VIEW_DOWNSCALE_WIDTH / float(width)
+    small = cv2.resize(frame_bgr, (VIEW_DOWNSCALE_WIDTH, max(8, int(round(height * scale)))),
+                       interpolation=cv2.INTER_AREA)
+    grey = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    grey = cv2.GaussianBlur(grey, (3, 3), 0)
+    gx = cv2.Sobel(grey, cv2.CV_32F, 1, 0)
+    gy = cv2.Sobel(grey, cv2.CV_32F, 0, 1)
+    return np.hypot(gx, gy)
+
+
+class ViewChangeGuard:
+    """Has the Logitech been moved since its empty-scene reference was taken?
+
+    The Logitech's empty-scene image, depth, floor plane and zone all belong to
+    the pose they were captured in. Nothing checked that pose afterwards: the
+    placement check runs on hardware depth, which the Logitech does not have.
+    A camera turned from a front view to a downward view kept measuring against
+    the old floor, which is how one object read 168 mm tall in one pose and
+    299 mm in the next.
+
+    The check compares the structure of the view -- edge strength, which
+    survives a change of lighting -- with the reference image, away from
+    anything detected. Deposited objects are excluded; a moved camera moves
+    every edge of the room.
+    """
+
+    def __init__(self) -> None:
+        self._reference_token: Any = None
+        self._reference_edges: np.ndarray | None = None
+        self._low = 0
+        self.reason: str | None = None
+        self.last: dict[str, Any] = {"state": "no_reference"}
+
+    def update(self, frame_bgr: np.ndarray, reference_bgr: np.ndarray | None,
+               exclude: np.ndarray | None = None) -> str | None:
+        import cv2
+
+        if reference_bgr is None or reference_bgr.shape != frame_bgr.shape:
+            self.last = {"state": "no_reference" if reference_bgr is None else "reference_resolution_differs"}
+            self.reason = None if reference_bgr is None else "camera_view_resolution_changed"
+            return self.reason
+        if reference_bgr is not self._reference_token:
+            # A new empty-scene reference: whatever moved before, this is now the view.
+            self._reference_token = reference_bgr
+            self._reference_edges = _edge_image(reference_bgr)
+            self._low, self.reason = 0, None
+        current = _edge_image(frame_bgr)
+        usable = np.ones(current.shape, dtype=bool)
+        if exclude is not None and exclude.shape == frame_bgr.shape[:2]:
+            small = cv2.resize(exclude.astype(np.uint8), current.shape[::-1], interpolation=cv2.INTER_NEAREST)
+            usable = ~(cv2.dilate(small, np.ones((5, 5), np.uint8)) > 0)
+        if usable.mean() < VIEW_MIN_USABLE_FRACTION:
+            self.last = {"state": "too_much_of_the_view_occupied", "reason": self.reason}
+            return self.reason
+        a = self._reference_edges[usable]
+        b = current[usable]
+        if a.std() < VIEW_MIN_EDGE_STD or b.std() < VIEW_MIN_EDGE_STD:
+            # A featureless view (a blank wall, a covered lens, darkness)
+            # cannot show a move; say so rather than guess either way.
+            self.last = {"state": "too_little_structure_to_compare", "reason": self.reason}
+            return self.reason
+        a, b = a - a.mean(), b - b.mean()
+        correlation = float((a * b).sum() / max(np.sqrt((a * a).sum() * (b * b).sum()), 1e-9))
+        if correlation < VIEW_MIN_CORRELATION:
+            self._low += 1
+            # A view that shares almost no structure with the reference has
+            # moved; waiting frames only lets wrong measurements through.
+            if self._low >= VIEW_CHANGE_FRAMES or correlation < VIEW_IMMEDIATE_CORRELATION:
+                self.reason = "camera_view_changed_since_empty_scene"
+        else:
+            self._low, self.reason = 0, None
+        self.last = {"state": "moved" if self.reason else "same_view",
+                     "edge_correlation": round(correlation, 3), "reason": self.reason}
+        return self.reason

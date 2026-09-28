@@ -22,6 +22,8 @@ from __future__ import annotations
 
 from collections import Counter
 
+import numpy as np
+
 from .waste_bag_names import NOT_WASTE_BAG_WORDS
 
 UNKNOWN = "unknown"
@@ -37,6 +39,7 @@ def _words(label: str | None) -> set[str]:
 
 def reconcile_material(
     label: str | None, votes: list[str], *, colour_state: str | None = None,
+    scores: list[tuple[str, float]] | None = None,
 ) -> tuple[str, float, dict]:
     """Published material, its confidence and the reasoning, from the classifier's votes."""
     evidence: dict = {"votes": dict(Counter(votes)), "notes": []}
@@ -65,4 +68,15 @@ def reconcile_material(
         evidence["notes"].append("translucent_contents_visible_not_classified")
     evidence["identity"] = label
     evidence["exterior_material"] = material
-    return material, round(float(share), 4), evidence
+    evidence["agreement"] = round(float(share), 4)
+    confidence = share
+    winning = [value for name, value in (scores or []) if name == best]
+    if winning:
+        # Agreement across frames times the classifier's own median score for
+        # the winning label. Still a ranking score, never a calibrated
+        # probability of the physical material.
+        evidence["median_classifier_score"] = round(float(np.median(winning)), 4)
+        confidence = share * float(np.median(winning))
+    evidence["confidence_meaning"] = (
+        "frame agreement x zero-shot ranking score; not a calibrated probability")
+    return material, round(float(confidence), 4), evidence
