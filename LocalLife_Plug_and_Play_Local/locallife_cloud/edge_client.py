@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import io
 import json
 import logging
@@ -104,6 +105,39 @@ def _validate_depth_scale(depth_scale: float) -> float:
             "wrong-by-orders-of-magnitude depth/height/volume numbers downstream."
         )
     return depth_scale
+
+
+REALSENSE_SDK_MISSING = "pyrealsense2 missing"
+
+
+def realsense_sdk_available() -> bool:
+    """Whether the RealSense SDK can be imported on this machine.
+
+    pyrealsense2 publishes no wheel for every platform -- there is none for
+    Python 3.13 on ARM64, which is what a Raspberry Pi on Debian Trixie runs.
+    Without it the RealSense camera cannot be opened at all, and retrying the
+    import every few seconds only fills the log. Checked without importing, so
+    it costs nothing where the SDK is present (Windows keeps its RealSense path
+    exactly as it was).
+    """
+    return importlib.util.find_spec("pyrealsense2") is not None
+
+
+def report_camera_availability(
+    session: requests.Session, cloud: str, camera_id: str, available: bool, reason: str = "",
+) -> None:
+    """Tell the processing server a camera is unavailable, so it can say why.
+
+    Best effort: the dashboard message is a convenience, and failing to send it
+    must never stop the camera that *is* working.
+    """
+    try:
+        session.post(
+            cloud.rstrip("/") + f"/api/cameras/{camera_id}/availability",
+            json={"available": bool(available), "reason": reason}, timeout=10,
+        )
+    except requests.RequestException as exc:
+        LOGGER.info("Could not report %s availability to the server: %s", camera_id, exc)
 
 
 def iter_realsense(
@@ -405,6 +439,19 @@ def main() -> None:
             "realsense": realsense_factory,
             "logitech": logitech_factory,
         }
+        if not realsense_sdk_available():
+            # Run the Logitech on its own instead of retrying an import that
+            # cannot succeed on this machine, and let the dashboard say why the
+            # RealSense view is empty.
+            LOGGER.warning(
+                "RealSense unavailable: %s on this device; continuing with the Logitech only",
+                REALSENSE_SDK_MISSING,
+            )
+            status = requests.Session()
+            if args.token:
+                status.headers["Authorization"] = f"Bearer {args.token}"
+            report_camera_availability(status, args.cloud, "realsense", False, REALSENSE_SDK_MISSING)
+            del camera_factories["realsense"]
         threads = [threading.Thread(
             target=run_resilient_camera,
             args=(camera_id, factory, stream_frames),
@@ -416,6 +463,11 @@ def main() -> None:
         for thread in threads:
             thread.join()
     elif args.source.lower() == "realsense":
+        if not realsense_sdk_available():
+            raise SystemExit(
+                f"RealSense unavailable: {REALSENSE_SDK_MISSING} on this device. "
+                "Run with --source logitech, or --source dual to use the Logitech alone."
+            )
         stream_frames(iter_realsense(args.width, args.height, args.camera_fps, filter_depth=not args.raw_depth))
     else:
         choice = discover_logitech_source() if args.source.lower() in {"logitech", "auto"} else args.source

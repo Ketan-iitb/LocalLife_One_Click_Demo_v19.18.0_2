@@ -266,6 +266,38 @@ def create_app(
                        cameras={name: station.frames_processed for name, station in manager.pipelines.items()},
                        transport=frame_processor.snapshot())
 
+    # What the edge device reported about a camera it could not open (for
+    # example RealSense on a Raspberry Pi with no pyrealsense2 wheel), so the
+    # dashboard can say why a view is empty instead of waiting forever.
+    camera_availability: dict[str, dict[str, Any]] = {}
+
+    def _unavailable_reason(camera_id: str) -> str | None:
+        report = camera_availability.get(camera_id)
+        if not report or report.get("available", True):
+            return None
+        try:
+            if manager.camera(camera_id).latest_frame is not None:
+                # Frames are arriving, so the camera is plainly available now.
+                return None
+        except (KeyError, ValueError, AttributeError):
+            pass
+        return str(report.get("reason") or "not available on the edge device")
+
+    @app.post("/api/cameras/<camera_id>/availability")
+    @protected
+    def report_availability(camera_id: str) -> Any:
+        if camera_id not in {"realsense", "logitech"}:
+            return jsonify(error="Unknown camera"), 404
+        payload = request.get_json(silent=True) or {}
+        available = payload.get("available")
+        if not isinstance(available, bool):
+            return jsonify(error="Provide available as true or false"), 400
+        reason = " ".join(str(payload.get("reason") or "").split())[:200]
+        camera_availability[camera_id] = {
+            "available": available, "reason": reason, "reported_at": time.time(),
+        }
+        return jsonify(ok=True, camera_id=camera_id, available=available, reason=reason)
+
     @app.get("/api/state")
     def state() -> Any:
         payload = manager.state()
@@ -273,6 +305,11 @@ def create_app(
         payload["transport"] = transport
         for camera_id, stats in transport.items():
             payload["cameras"][camera_id]["stream"].update(stats)
+        for camera_id, camera in (payload.get("cameras") or {}).items():
+            reason = _unavailable_reason(camera_id)
+            camera["available"] = reason is None
+            camera["unavailable_reason"] = reason
+            payload[f"{camera_id}_available"] = reason is None
         return jsonify(payload)
 
     @app.get("/api/cameras/<camera_id>/state")
@@ -977,8 +1014,15 @@ def create_app(
                         frame = _annotate_frame(frame, station)
                 if frame is None:
                     frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                    cv2.putText(frame, f"WAITING FOR {camera_id.upper()} CAMERA", (45, 240),
-                                cv2.FONT_HERSHEY_SIMPLEX, .75, (180, 200, 200), 2)
+                    unavailable = _unavailable_reason(camera_id)
+                    if unavailable:
+                        cv2.putText(frame, f"{camera_id.upper()} UNAVAILABLE", (45, 225),
+                                    cv2.FONT_HERSHEY_SIMPLEX, .75, (90, 170, 240), 2)
+                        cv2.putText(frame, unavailable[:48], (45, 262),
+                                    cv2.FONT_HERSHEY_SIMPLEX, .6, (180, 200, 200), 1)
+                    else:
+                        cv2.putText(frame, f"WAITING FOR {camera_id.upper()} CAMERA", (45, 240),
+                                    cv2.FONT_HERSHEY_SIMPLEX, .75, (180, 200, 200), 2)
                 success, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
                 if success:
                     yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + encoded.tobytes() + b"\r\n"
