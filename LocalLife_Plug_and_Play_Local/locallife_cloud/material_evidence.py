@@ -49,6 +49,12 @@ def reconcile_material(
         evidence["notes"].append("material_votes_split")
         material = UNKNOWN
     words = _words(label)
+    if words & NOT_WASTE_BAG_WORDS and best == "polythene bag" and share >= 0.6 \
+            and len(votes) >= MIN_VOTES_FOR_SPLIT_CHECK:
+        # The detector's name and the material disagree: a dark waste bag is
+        # often called a "handbag" by appearance alone. Reported; the name is
+        # the detector's and the sorting rules still read it.
+        evidence["notes"].append("identity_conflict_material_suggests_plastic_waste_bag")
     if words & NOT_WASTE_BAG_WORDS and material in EXTERIOR_OF_A_NON_WASTE_BAG:
         # Identity is not material: the classifier recognised a bag.
         evidence["notes"].append("identity_is_not_a_waste_bag")

@@ -112,6 +112,106 @@ class PoseFingerprint:
                    (int(resolution[0]), int(resolution[1])), time.time())
 
 
+def fingerprint_coefficients(pose: PoseFingerprint) -> tuple[float, float, float]:
+    """The recorded floor as z = a*x + b*y + c in camera coordinates."""
+    nx, ny, nz = pose.normal
+    a, b = -nx / nz, -ny / nz
+    return a, b, pose.camera_height_m * math.sqrt(a * a + b * b + 1.0)
+
+
+def expected_floor_depth(
+    shape: tuple[int, int], intrinsics: CameraIntrinsics, coefficients: tuple[float, float, float],
+) -> np.ndarray:
+    """Axial depth at which each pixel's ray meets the recorded floor."""
+    a, b, c = coefficients
+    rows, columns = np.indices(shape, dtype=np.float64)
+    x = (columns - intrinsics.ppx) / intrinsics.fx
+    y = (rows - intrinsics.ppy) / intrinsics.fy
+    with np.errstate(divide="ignore", invalid="ignore"):
+        depth = c / (1.0 - a * x - b * y)
+    return np.where(np.isfinite(depth) & (depth > 0), depth, np.nan)
+
+
+# ------------------------------------------------------ per-frame floor scale
+FLOOR_MIN_PIXELS = 400
+FLOOR_MIN_FRACTION = 0.05
+FLOOR_MAX_NEAR_FAR_DISAGREEMENT = 0.06
+FLOOR_MAX_RELATIVE_RESIDUAL = 0.05
+FLOOR_SCALE_MAX_AGE_FRAMES = 150
+
+
+class FloorScaleTracker:
+    """Re-anchor each frame's monocular depth on the floor it can still see.
+
+    Depth Anything's scale is not fixed: it changes with what is in the view,
+    so a bag entering the bin can rescale the whole frame, and a scale fixed
+    once on the empty scene then measures every object in the wrong units.
+    Each frame, the floor pixels no object covers are compared with where the
+    recorded floor says they must be; the ratio is the frame's scale. The
+    near and the far floor must agree, because a single scale cannot fix a
+    prediction that is wrong in shape rather than in size -- such a frame is
+    refused, not averaged. Too little floor: the last validated scale is used
+    for a while, at reduced confidence, and then nothing is.
+    """
+
+    def __init__(self, max_age_frames: int = FLOOR_SCALE_MAX_AGE_FRAMES) -> None:
+        self.max_age_frames = max_age_frames
+        self.frame = 0
+        self.last_valid: tuple[float, int] | None = None
+        self.last: dict[str, Any] = {"state": "not_run"}
+
+    def update(
+        self, depth: np.ndarray, intrinsics: CameraIntrinsics, floor_mask: np.ndarray,
+        pose: PoseFingerprint,
+    ) -> tuple[float | None, dict[str, Any]]:
+        self.frame += 1
+        expected = expected_floor_depth(depth.shape[:2], intrinsics, fingerprint_coefficients(pose))
+        usable = floor_mask & np.isfinite(depth) & (depth > 0) & np.isfinite(expected)
+        count = int(np.count_nonzero(usable))
+        needed = max(FLOOR_MIN_PIXELS, int(FLOOR_MIN_FRACTION * depth.shape[0] * depth.shape[1]))
+        record: dict[str, Any] = {"visible_floor_pixels": count, "required_floor_pixels": needed}
+        reason = None
+        scale = None
+        if count < needed:
+            reason = "too_little_visible_floor"
+        else:
+            ratio = expected[usable] / depth[usable]
+            scale = float(np.median(ratio))
+            residual = float(np.median(np.abs(ratio - scale))) * 1.4826 / scale
+            # The nearest and the farthest quarter of the visible floor.
+            low, high = np.percentile(expected[usable], (25, 75))
+            near = ratio[expected[usable] <= low]
+            far = ratio[expected[usable] >= high]
+            near_scale, far_scale = float(np.median(near)), float(np.median(far))
+            disagreement = abs(near_scale - far_scale) / scale
+            record.update({
+                "scale": round(scale, 5), "relative_residual": round(residual, 5),
+                "near_scale": round(near_scale, 5), "far_scale": round(far_scale, 5),
+                "near_far_disagreement": round(disagreement, 5),
+                "floor_depth_predicted_p10_p50_p90_m": [
+                    round(float(v), 4) for v in np.percentile(depth[usable], (10, 50, 90))],
+                "floor_depth_expected_p10_p50_p90_m": [
+                    round(float(v), 4) for v in np.percentile(expected[usable], (10, 50, 90))],
+            })
+            if disagreement > FLOOR_MAX_NEAR_FAR_DISAGREEMENT:
+                reason = "floor_scale_differs_near_to_far"
+            elif residual > FLOOR_MAX_RELATIVE_RESIDUAL:
+                reason = "floor_scale_residual_too_high"
+        if reason is None:
+            self.last_valid = (scale, self.frame)
+            record.update({"state": "validated_this_frame", "applied_scale": round(scale, 5)})
+        elif self.last_valid is not None and self.frame - self.last_valid[1] <= self.max_age_frames:
+            record.update({"state": "reused_previous_scale", "reason": reason,
+                           "applied_scale": round(self.last_valid[0], 5),
+                           "frames_since_validation": self.frame - self.last_valid[1]})
+            scale = self.last_valid[0]
+        else:
+            record.update({"state": "unavailable", "reason": reason, "applied_scale": None})
+            scale = None
+        self.last = record
+        return scale, record
+
+
 def pose_difference(recorded: PoseFingerprint, current: PoseFingerprint) -> str | None:
     """Why `current` is not the pose `recorded` describes, or None."""
     if tuple(recorded.resolution) != tuple(current.resolution):
@@ -242,6 +342,7 @@ def result_record(
     depth_type: str, pose: dict[str, Any], calibration_valid: bool,
     raw_volume_l: float | None, calibrated_volume_l: float | None,
     dimensions_mm: tuple[float | None, float | None, float | None], rejection: str | None,
+    context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """One Logitech result, with everything needed to judge it later."""
     raw_range = None
@@ -252,7 +353,21 @@ def result_record(
         valid_fraction = round(float(finite.size) / float(values.size), 4)
         if finite.size:
             raw_range = [round(float(finite.min()), 4), round(float(finite.max()), 4)]
+            object_percentiles = [round(float(v), 4) for v in np.percentile(finite, (10, 50, 90))]
+        else:
+            object_percentiles = None
+    else:
+        object_percentiles = None
     return {
+        # Camera, checkpoint, calibration, detection, floor scale: whatever
+        # the caller knows about this frame (see the pipeline).
+        **(context or {}),
+        "object_depth_p10_p50_p90_m": object_percentiles,
+        "cropped_by_frame_border": touches_frame_border(mask),
+        "raw_height_p90_m": diagnostics.get("height_p90_cells_m"),
+        "filtered_height_p90_m": diagnostics.get("height_p90_m"),
+        "footprint_area_m2": diagnostics.get("footprint_area_m2"),
+        "local_floor_offset_m": diagnostics.get("local_floor_offset_m"),
         "pose_state": pose.get("state"), "pose_reason": pose.get("reason"),
         "calibration_valid": bool(calibration_valid),
         "mask_area_px": None if mask is None else int(np.count_nonzero(mask)),

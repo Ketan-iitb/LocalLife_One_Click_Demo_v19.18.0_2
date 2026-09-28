@@ -65,7 +65,8 @@ class HardwareDiagnostics:
         return path
 
     def _write(self, path: Path, images: dict[str, np.ndarray | None], payload: dict[str, Any],
-               points: tuple[np.ndarray, np.ndarray] | None = None) -> None:
+               points: tuple[np.ndarray, np.ndarray] | None = None,
+               arrays: dict[str, np.ndarray | None] | None = None) -> None:
         import cv2
 
         for name, image in images.items():
@@ -74,6 +75,10 @@ class HardwareDiagnostics:
             if image.dtype == bool:
                 image = image.astype(np.uint8) * 255
             cv2.imwrite(str(path / f"{name}.png"), image)
+        for name, array in (arrays or {}).items():
+            # Replayable float arrays (metres), not the colour-mapped preview.
+            if array is not None:
+                np.save(path / f"{name}.npy", np.asarray(array, dtype=np.float32))
         if points is not None:
             footprint, heights = points
             np.save(path / "points.npy", np.column_stack((footprint, heights)).astype(np.float32))
@@ -90,6 +95,8 @@ class HardwareDiagnostics:
         points: tuple[np.ndarray, np.ndarray] | None,
         mask_overlay: np.ndarray | None,
         latency_ms: float | None,
+        arrays: dict[str, np.ndarray | None] | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> Path | None:
         """Never raises: a diagnostic failure must not affect measurement."""
         if not self.enabled:
@@ -108,7 +115,8 @@ class HardwareDiagnostics:
                 "latency_ms": latency_ms,
                 "points_saved": points is not None,
                 "csv_row": row,
-            }, points)
+                **(extra or {}),
+            }, points, arrays)
             return path
         except Exception:  # noqa: BLE001
             LOGGER.exception("Hardware diagnostic bundle failed for %s", self.camera_id)

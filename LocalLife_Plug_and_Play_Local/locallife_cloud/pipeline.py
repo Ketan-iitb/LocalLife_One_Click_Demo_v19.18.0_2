@@ -72,8 +72,8 @@ from .coordinates import clip_to_region, frame_consistency, restore_mask
 from .logitech_factor import LogitechVolumeFactors, geometry_group
 from .colour_evidence import describe_colour
 from .material_evidence import reconcile_material
-from .logitech_pose import (AXIS_ALIGNMENT_MAX_TILT_DEG, PoseGuard, floor_tilt_deg,
-                            plane_height_scale, result_record, sanity_flags)
+from .logitech_pose import (AXIS_ALIGNMENT_MAX_TILT_DEG, FloorScaleTracker, PoseGuard,
+                            floor_tilt_deg, plane_height_scale, result_record, sanity_flags)
 from .logitech_volume import axis_aligned_plane, fit_plane_alignment, metric_object_volume, stable_volume
 from .waste_bag_names import object_type as canonical_object_type
 from .bin_occupancy import (
@@ -737,6 +737,9 @@ class VisionPipeline:
             config.results_dir / "calibration" / "logitech_pose.json" if camera_id == "logitech" else None
         )
         self._pose_check_frames = 0
+        # Each frame's depth re-anchored on the floor it can still see.
+        self._floor_scale = FloorScaleTracker()
+        self.logitech_floor_scale: dict[str, Any] = {"state": "not_run"}
         # What the last measured frame saw, so a calibration sample can be
         # captured from the object standing in the zone right now.
         self.last_metric_context: dict[str, Any] = {}
@@ -1338,6 +1341,12 @@ class VisionPipeline:
             source_depth = self._metric_from_relative(source_depth, bin_region)
             plane_values = source_depth[bin_region & np.isfinite(source_depth) & (source_depth > 0.1)]
             uncalibrated_logitech = measure_intrinsics is not None and plane_values.size >= 100
+            if self.relative_depth_reason == "relative_depth_without_reference_distance":
+                # A relative checkpoint's output is inverse depth in no unit.
+                # It went on from here as though it were metres; with no
+                # measured distance to scale it by there is no measurement.
+                uncalibrated_logitech = False
+                self.calibration_mode = "relative-depth-unscaled-unavailable"
             if uncalibrated_logitech:
                 calibrated_prediction = source_depth
                 measured_distance = self.config.logitech_reference_distance_m
@@ -1347,6 +1356,9 @@ class VisionPipeline:
                     "reference-distance-estimate" if measured_distance > 0 else "uncalibrated-estimate"
                 )
         if self.camera_id == "logitech":
+            calibrated_prediction = self._rescale_on_visible_floor(
+                frame, calibrated_prediction, measure_intrinsics, detections, bin_region,
+            )
             mask_debug: dict[str, Any] = {}
             depth_change = None
             if calibrated_prediction is not None and self.reference_monocular is not None \
@@ -2210,6 +2222,14 @@ class VisionPipeline:
                         )
                     if plane_for_volume is None or plane_for_volume.coefficients is None:
                         plane_for_volume = self._uncalibrated_plane
+                    if self.logitech_floor_scale.get("state") == "unavailable":
+                        # The floor this frame shows cannot confirm the depth
+                        # scale, and the last confirmed one is too old: a
+                        # number here would be made up.
+                        detection.volume_rejection_reason = (
+                            f"metric_scale_unavailable_{self.logitech_floor_scale.get('reason')}")
+                        detection.measurement_quality = "metric-scale-unavailable"
+                        continue
                     result = metric_object_volume(
                         calibrated_prediction, measure_intrinsics, volume_mask, plane_for_volume,
                         reference_depth_m=self.reference_monocular,
@@ -2426,6 +2446,7 @@ class VisionPipeline:
                         dimensions_mm=(detection.footprint_length_mm, detection.footprint_width_mm,
                                        detection.physical_height_mm),
                         rejection=detection.volume_rejection_reason,
+                        context=self._logitech_record_context(detection, frame, measure_intrinsics),
                     )
             if (
                 self.camera_id == "logitech"
@@ -3748,6 +3769,15 @@ class VisionPipeline:
                 points=(context.get("points") or {}).get(id(detection)),
                 mask_overlay=self.logitech_mask_overlay() if self.camera_id == "logitech" else None,
                 latency_ms=row.get("processing_time_ms"),
+                # Logitech: the metric depth and the empty-scene reference as
+                # numbers, so scripts/replay_logitech_bundle.py can re-measure
+                # the same frame with changed code.
+                arrays=None if self.camera_id != "logitech" else {
+                    "depth_m": context.get("depth"), "reference_depth_m": self.reference_monocular,
+                },
+                extra=None if self.camera_id != "logitech" else {
+                    "logitech_record": (self.last_logitech_volume_diagnostics or {}).get("result_record"),
+                },
             )
         if detection.track_id is not None and (result.ok or result.error):
             # A failed write is queued in the event log for retry; the track
@@ -4617,7 +4647,8 @@ class VisionPipeline:
             detection.volume_rejection_reason = refusal
             detection.measurement_quality = refusal
             return
-        litres = integrate_volume_l(np.clip(heights_cm, 0.0, ceiling_cm), area_cm2, mask)
+        litres = integrate_volume_l(
+            np.clip(heights_cm, 0.0, ceiling_cm), self._area_at_height(area_cm2, heights_cm), mask)
         if litres is not None and litres > 0:
             detection.monocular_volume_l = round(litres, 6)
             detection.measurement_method = "logitech_calibrated_height_map"
@@ -4628,6 +4659,76 @@ class VisionPipeline:
             "height_cm": float(statistics["top_cm"]),
             "volume_l": detection.monocular_volume_l,
         })
+
+    def _area_at_height(self, floor_area_cm2: np.ndarray | None, heights_cm: np.ndarray) -> np.ndarray | None:
+        """The ground area a pixel covers *at the height of what it sees*.
+
+        The mat homography gives each pixel's area on the floor. A pixel that
+        sees a bag's top 20 cm up sees a smaller patch: along a ray, height
+        falls linearly to the floor, so lateral size scales by (1 - h/H) and
+        area by its square, at any tilt. Using the floor area for elevated
+        pixels inflated every calibrated volume, and most for tall objects.
+        """
+        camera_height = self.camera_height_m()
+        if floor_area_cm2 is None or not camera_height:
+            return floor_area_cm2
+        shrink = np.clip(1.0 - np.nan_to_num(heights_cm) / (camera_height * 100.0), 0.0, 1.0)
+        return floor_area_cm2 * shrink * shrink
+
+    def _rescale_on_visible_floor(
+        self, frame: np.ndarray, depth: np.ndarray | None, intrinsics: Any,
+        detections: list[Detection], region: np.ndarray | None,
+    ) -> np.ndarray | None:
+        """This frame's depth, re-scaled so its visible floor sits where the setup put it."""
+        pose = self.logitech_pose.recorded
+        if (depth is None or intrinsics is None or pose is None or self.logitech_pose.changed_reason
+                or depth_output_kind(self.config.depth_model) != METRIC_OUTPUT
+                or tuple(pose.resolution) != (int(depth.shape[1]), int(depth.shape[0]))):
+            self.logitech_floor_scale = {"state": "not_applicable",
+                                         "reason": "no_recorded_pose" if pose is None else
+                                         (self.logitech_pose.changed_reason or "model_or_resolution")}
+            return depth
+        import cv2
+
+        occupied = np.zeros(depth.shape[:2], dtype=bool)
+        for item in detections:
+            if item.mask is not None and item.mask.shape == occupied.shape:
+                occupied |= item.mask
+            else:
+                x1, y1, x2, y2 = (int(value) for value in item.box)
+                occupied[max(0, y1):max(0, y2), max(0, x1):max(0, x2)] = True
+        changed = rgb_change(frame, self.reference_rgb, self.config.foreground_threshold)
+        if changed is not None and changed.shape == occupied.shape:
+            # Anything that changed since the empty scene -- a bag, its
+            # shadow, earlier waste -- is not floor.
+            occupied |= changed
+        occupied = cv2.dilate(occupied.astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
+        floor = ~occupied if region is None else (region & ~occupied)
+        scale, record = self._floor_scale.update(depth, intrinsics, floor, pose)
+        self.logitech_floor_scale = record
+        if scale is None:
+            return depth
+        return (depth * scale).astype(depth.dtype, copy=False)
+
+    def _logitech_record_context(self, detection: Detection, frame: np.ndarray, intrinsics: Any) -> dict[str, Any]:
+        calibration = self.calibration
+        return {
+            "resolution": [int(frame.shape[1]), int(frame.shape[0])],
+            "intrinsics": None if intrinsics is None else [
+                round(float(intrinsics.fx), 3), round(float(intrinsics.fy), 3),
+                round(float(intrinsics.ppx), 3), round(float(intrinsics.ppy), 3)],
+            "lens_status": None if self.logitech_lens is None else self.logitech_lens.status,
+            "depth_checkpoint": self.config.depth_model,
+            "depth_output": "METRIC" if depth_output_kind(self.config.depth_model) == METRIC_OUTPUT else "RELATIVE",
+            "depth_calibration": None if calibration is None else {
+                "method": calibration.method, "id": calibration.calibration_id,
+                "scale": calibration.scale, "offset_m": calibration.offset_m, "rmse_m": calibration.rmse_m},
+            "height_calibration": detection.calibration_version,
+            "floor_scale": dict(self.logitech_floor_scale),
+            "detection_box": [int(value) for value in detection.box],
+            "label": detection.label,
+            "track_id": detection.track_id,
+        }
 
     def _implausible_measurement(
         self, detection: Detection, height_cm: float, zone: MeasurementZone | None,

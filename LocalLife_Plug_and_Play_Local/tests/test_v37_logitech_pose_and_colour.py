@@ -415,5 +415,178 @@ class RealSenseGeometryPreservedTests(unittest.TestCase):
             self.assertEqual(getattr(with_colour, name, None), getattr(without, name, None), name)
 
 
+
+from locallife_cloud.logitech_pose import (  # noqa: E402
+    FLOOR_SCALE_MAX_AGE_FRAMES, FloorScaleTracker, PoseFingerprint, expected_floor_depth,
+    fingerprint_coefficients,
+)
+
+
+class FloorScaleTests(unittest.TestCase):
+    """Each frame re-anchored on the floor it can still see."""
+
+    def setUp(self) -> None:
+        self.scene = Scene(DOWNWARD)
+        plane = fit_reference_plane(self.scene.empty, CAMERA, mask=self.scene.region)
+        self.pose = PoseFingerprint.from_plane(plane, (rig.WIDTH, rig.HEIGHT))
+        self.depth, self.mask = self.scene.render(self.scene.box((0.0, 0.0), 0.265, 0.142, 0.089))
+        self.floor = self.scene.region & ~self.mask
+
+    def test_the_recorded_floor_predicts_near_and_far_depth(self) -> None:
+        expected = expected_floor_depth(self.depth.shape, CAMERA, fingerprint_coefficients(self.pose))
+        region = self.scene.region
+        np.testing.assert_allclose(expected[region], self.scene.empty[region], rtol=1e-3)
+        # A tilted view: the far floor really is much further than the near floor.
+        self.assertGreater(np.percentile(expected[region], 90) / np.percentile(expected[region], 10), 1.2)
+
+    def test_a_frame_whose_scale_drifted_is_measured_in_metres_again(self) -> None:
+        drifted = self.depth * MODEL_SCALE_ERROR          # the bag made the model rescale the frame
+        # Against the empty scene's scale the drifted frame is unmeasurable or wrong.
+        refused, before = _measure(drifted, self.scene.empty, self.mask, self.scene.region)
+        scale, record = FloorScaleTracker().update(drifted, CAMERA, self.floor, self.pose)
+        self.assertEqual(record["state"], "validated_this_frame")
+        self.assertAlmostEqual(scale, 1.0 / MODEL_SCALE_ERROR, delta=0.005)
+        _, after = _measure(drifted * scale, self.scene.empty, self.mask, self.scene.region)
+        for measured, truth in zip(after, (265.0, 142.0, 89.0)):
+            self.assertLess(abs(measured - truth) / truth, 0.10, after)
+        self.assertTrue(refused.reason is not None or abs(before[2] - 89.0) / 89.0 > 0.3)
+
+    def test_a_prediction_wrong_in_shape_is_refused_not_averaged(self) -> None:
+        warped = self.depth + 0.25                         # a shift, not a scale: near and far disagree
+        scale, record = FloorScaleTracker().update(warped, CAMERA, self.floor, self.pose)
+        self.assertIsNone(scale)
+        self.assertEqual(record["reason"], "floor_scale_differs_near_to_far")
+        self.assertEqual(record["state"], "unavailable")
+
+    def test_a_covered_floor_reuses_the_last_scale_then_gives_up(self) -> None:
+        tracker = FloorScaleTracker(max_age_frames=3)
+        tracker.update(self.depth, CAMERA, self.floor, self.pose)
+        covered = np.zeros_like(self.floor)                # a full bin: no floor visible
+        scale, record = tracker.update(self.depth, CAMERA, covered, self.pose)
+        self.assertEqual(record["state"], "reused_previous_scale")
+        self.assertEqual(record["reason"], "too_little_visible_floor")
+        self.assertAlmostEqual(scale, 1.0, delta=0.01)
+        for _ in range(3):
+            scale, record = tracker.update(self.depth, CAMERA, covered, self.pose)
+        self.assertIsNone(scale)
+        self.assertEqual(record["state"], "unavailable")
+        self.assertGreater(FLOOR_SCALE_MAX_AGE_FRAMES, 3)
+
+    def test_an_occupied_bin_is_not_used_as_floor(self) -> None:
+        # The bag's own pixels would drag the scale: with the mask excluded
+        # the scale is exact, with it included it is not.
+        drifted = self.depth * MODEL_SCALE_ERROR
+        clean, _ = FloorScaleTracker().update(drifted, CAMERA, self.floor, self.pose)
+        self.assertAlmostEqual(clean, 1.0 / MODEL_SCALE_ERROR, delta=0.002)
+
+
+class ElevatedAreaTests(unittest.TestCase):
+    """The calibrated volume used each pixel's floor area for a bag's top."""
+
+    def test_a_pixel_seeing_an_elevated_surface_covers_less_ground(self) -> None:
+        from locallife_cloud.pipeline import VisionPipeline
+
+        station = VisionPipeline.__new__(VisionPipeline)
+        station.config = mock.Mock(logitech_reference_distance_m=0.62)
+        station.logitech_derived_distance_m = None
+        floor_area = np.full((2, 2), 0.04)                 # cm^2 per pixel on the floor
+        heights = np.array([[0.0, 31.0], [15.5, 0.0]])     # cm
+        area = station._area_at_height(floor_area, heights)
+        self.assertAlmostEqual(area[0, 0], 0.04)
+        self.assertAlmostEqual(area[0, 1], 0.04 * 0.25)    # half-way to the camera: a quarter
+        self.assertAlmostEqual(area[1, 0], 0.04 * 0.75 ** 2)
+
+    def test_integrating_a_box_top_with_its_own_area_gives_its_volume(self) -> None:
+        # A 20 x 20 cm, 31 cm tall box under a camera 62 cm up, straight down:
+        # its top pixels see floor patches twice as wide as the top itself.
+        top_pixels = 100
+        top_area_each = 400.0 / top_pixels
+        floor_area_each = top_area_each * 4.0
+        heights = np.full(top_pixels, 31.0)
+        shrink = (1.0 - heights / 62.0) ** 2
+        self.assertAlmostEqual(float(np.sum(heights * floor_area_each * shrink)) / 1000.0, 12.4)
+        self.assertAlmostEqual(float(np.sum(heights * floor_area_each)) / 1000.0, 49.6)   # the old answer
+
+
+class OverlappingObjectsTests(unittest.TestCase):
+    def test_one_mask_measures_one_of_two_touching_objects(self) -> None:
+        scene = Scene(DOWNWARD)
+        box = scene.box((-0.08, 0.0), 0.15, 0.12, 0.10)
+        bottle = scene.cylinder((0.06, 0.0), 0.035, 0.20)
+        depth, _ = scene.render(box, bottle)
+        _, box_only = scene.render(box)
+        _, bottle_only = scene.render(bottle)
+        mask = box_only & ~bottle_only & (depth >= np.minimum(box, np.inf) - 1e-9)
+        _, (length, width, height) = _measure(depth, scene.empty, mask, scene.region)
+        self.assertAlmostEqual(height, 100.0, delta=12.0)
+        self.assertLess(length, 150.0 * 1.2)
+
+
+class RelativeCheckpointTests(unittest.TestCase):
+    def test_relative_depth_without_a_distance_measures_nothing(self) -> None:
+        from test_v31_logitech_measurement_cascade import _run, _station
+
+        with tempfile.TemporaryDirectory() as directory:
+            manager, _, frame, camera = _station(
+                directory, depth_model="depth-anything/Depth-Anything-V2-Small-hf")
+            detection = _run(manager.camera("logitech"), frame, camera).detections[0]
+        self.assertIsNone(detection.monocular_volume_l)
+        self.assertEqual(manager.camera("logitech").calibration_mode,
+                         "relative-depth-unscaled-unavailable")
+
+    def test_a_metric_checkpoint_still_measures(self) -> None:
+        from test_v31_logitech_measurement_cascade import _run, _station
+
+        with tempfile.TemporaryDirectory() as directory:
+            manager, _, frame, camera = _station(directory)
+            detection = _run(manager.camera("logitech"), frame, camera).detections[0]
+        self.assertGreater(detection.monocular_volume_l, 0)
+
+
+class PipelineFloorScaleTests(unittest.TestCase):
+    """The same object, with and without the model rescaling the whole frame."""
+
+    def _measure(self, drift: float):
+        from test_v31_logitech_measurement_cascade import MetricDepth, _run, _scene, _station
+
+        class Drifting(MetricDepth):
+            def __init__(self) -> None:
+                super().__init__()
+                self.factor = 1.0
+
+            def estimate_batch(self, frames):
+                return [depth * self.factor for depth in super().estimate_batch(frames)]
+
+        depth = Drifting()
+        with tempfile.TemporaryDirectory() as directory:
+            manager, detector, frame, camera = _station(
+                directory, depth=depth, logitech_reference_distance_m=1.5)
+            logitech = manager.camera("logitech")
+            detector.items = []
+            logitech.process_frame(np.zeros_like(frame), intrinsics=camera, persist=False)
+            logitech.set_baseline()
+            logitech._expect_logitech_pose()
+            logitech.process_frame(np.zeros_like(frame), intrinsics=camera, persist=False)
+            self.assertEqual(logitech.logitech_pose.state, "recorded")
+            detector.items = [_scene()[2]]
+            depth.factor = drift
+            detection = _run(logitech, frame, camera, start=40.0).detections[0]
+            return detection, dict(logitech.logitech_floor_scale)
+
+    def test_a_rescaled_frame_measures_the_same_object(self) -> None:
+        steady, record = self._measure(1.0)
+        self.assertEqual(record["state"], "validated_this_frame")
+        drifted, record = self._measure(1.3)
+        self.assertAlmostEqual(record["applied_scale"], 1 / 1.3, delta=0.01)
+        self.assertAlmostEqual(drifted.physical_height_mm, steady.physical_height_mm, delta=5.0)
+        self.assertAlmostEqual(drifted.monocular_volume_l, steady.monocular_volume_l,
+                               delta=0.05 * steady.monocular_volume_l)
+
+
+class IdentityConflictTests(unittest.TestCase):
+    def test_a_waste_bag_called_handbag_is_reported(self) -> None:
+        _, _, evidence = reconcile_material("handbag", ["polythene bag"] * 4)
+        self.assertIn("identity_conflict_material_suggests_plastic_waste_bag", evidence["notes"])
+
 if __name__ == "__main__":
     unittest.main()
