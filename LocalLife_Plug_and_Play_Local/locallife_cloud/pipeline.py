@@ -70,6 +70,10 @@ from .box_templates import load_box_templates, match_box_template
 from .logitech_calibration import RELATIVE_ONLY_MESSAGE, LogitechCalibrationStore, LogitechLens, depth_output_kind
 from .coordinates import clip_to_region, frame_consistency, restore_mask
 from .logitech_factor import LogitechVolumeFactors, geometry_group
+from .colour_evidence import describe_colour
+from .material_evidence import reconcile_material
+from .logitech_pose import (AXIS_ALIGNMENT_MAX_TILT_DEG, PoseGuard, floor_tilt_deg,
+                            plane_height_scale, result_record, sanity_flags)
 from .logitech_volume import axis_aligned_plane, fit_plane_alignment, metric_object_volume, stable_volume
 from .waste_bag_names import object_type as canonical_object_type
 from .bin_occupancy import (
@@ -727,13 +731,19 @@ class VisionPipeline:
         self.metric_store = LogitechMetricStore(config.results_dir / "calibration")
         self.height_calibration = self.metric_store.calibration if camera_id == "logitech" else None
         self.height_calibration_reason: str | None = None
+        # The floor pose the Logitech was set up in. A calibration fitted in
+        # one pose is not reused in another (logitech_pose.py).
+        self._logitech_pose = PoseGuard(
+            config.results_dir / "calibration" / "logitech_pose.json" if camera_id == "logitech" else None
+        )
+        self._pose_check_frames = 0
         # What the last measured frame saw, so a calibration sample can be
         # captured from the object standing in the zone right now.
         self.last_metric_context: dict[str, Any] = {}
         # Why the last Logitech footprint measured or refused, for diagnostics.
         self.last_footprint_result: FootprintResult | None = None
         # The fixed camera's floor plane, fitted once per resolution.
-        self._logitech_plane_cache: tuple[tuple[int, int], Any] | None = None
+        self._logitech_plane_cache: tuple[tuple[int, int], Any, np.ndarray | None] | None = None
         self._logitech_plane_reason: str | None = None
         self._logitech_plane_source = "none"
         # Rolling median of each Logitech track's dimensions and volume.
@@ -904,16 +914,37 @@ class VisionPipeline:
                         values = predicted[region & np.isfinite(predicted) & (predicted > 0.10)]
                         if not values.size:
                             raise ValueError("The Logitech depth model returned no valid baseline pixels")
+                        # The measured distance is the camera's perpendicular
+                        # height above the floor. The median depth over the bin
+                        # equals it only for a camera looking straight down; on
+                        # a tilted mount it is longer, and dividing by it shrank
+                        # every dimension -- by half at a shallow angle. The
+                        # floor plane's own perpendicular distance is right at
+                        # any tilt (logitech_pose.py).
+                        anchored = None
+                        plane_intrinsics = intrinsics or self.latest_intrinsics
+                        if plane_intrinsics is not None and depth_output_kind(self.config.depth_model) == "metric":
+                            anchored, _ = plane_height_scale(
+                                predicted, region, plane_intrinsics,
+                                float(self.config.logitech_reference_distance_m),
+                            )
                         scale = self.config.logitech_reference_distance_m / float(np.median(values))
-                        self.calibration = DepthCalibration(
-                            scale=scale, offset_m=0.0, rmse_m=0.0, sample_pixels=int(values.size),
-                            method="reference-distance-scale",
-                            calibration_id=uuid4().hex[:12],
-                            calibrated_at=time.time(),
-                            reference_distance_m=float(self.config.logitech_reference_distance_m),
-                            sample_count=1,
-                            resolution=(int(predicted.shape[1]), int(predicted.shape[0])),
-                        )
+                        if anchored is not None:
+                            anchored.calibration_id = uuid4().hex[:12]
+                            self.calibration = anchored
+                        else:
+                            # No floor plane to anchor to: the axis-median
+                            # scale, which is right only for a camera looking
+                            # straight down, and is named as such.
+                            self.calibration = DepthCalibration(
+                                scale=scale, offset_m=0.0, rmse_m=0.0, sample_pixels=int(values.size),
+                                method="reference-distance-scale",
+                                calibration_id=uuid4().hex[:12],
+                                calibrated_at=time.time(),
+                                reference_distance_m=float(self.config.logitech_reference_distance_m),
+                                sample_count=1,
+                                resolution=(int(predicted.shape[1]), int(predicted.shape[0])),
+                            )
                         self.calibration_mode = "independent-measured-distance"
                     else:
                         self.calibration = DepthCalibration(
@@ -1348,6 +1379,7 @@ class VisionPipeline:
             self._auto_camera_height(self._logitech_floor_plane(
                 calibrated_prediction, measure_intrinsics, None, bin_region,
             ))
+            self._check_logitech_pose(calibrated_prediction, measure_intrinsics, detections, bin_region)
             self._maybe_learn_empty_baseline(
                 frame, calibrated_prediction, bin_region, detections,
             )
@@ -2309,6 +2341,20 @@ class VisionPipeline:
                         result.diagnostics.update(decision.diagnostics)
                         detection.dimension_confidence = round(
                             float(min(0.6, result.measurement.coverage_ratio)), 4)
+                        # Flags, never clamps: a cable standing 30 cm tall or
+                        # a cropped bag is reported with the reason it is
+                        # doubtful (logitech_pose.py).
+                        suspicious = sanity_flags(
+                            detection.label, length_mm=stable.length_mm,
+                            width_mm=stable.width_mm, height_mm=stable.height_mm,
+                            mask=volume_mask,
+                            scale_anchored=self.calibration_mode not in (
+                                "model-metric-unverified", "uncalibrated-estimate", "not-calibrated"),
+                            pose_reason=self.logitech_pose.changed_reason,
+                            local_floor_offset_m=result.diagnostics.get("local_floor_offset_m"),
+                        )
+                        detection.dimension_flags = tuple(dict.fromkeys(
+                            tuple(detection.dimension_flags or ()) + suspicious))
                     metric_mask, metric_result = volume_mask, result
                 else:
                     individual_mono = estimate_volume(
@@ -2366,6 +2412,20 @@ class VisionPipeline:
                     # stay on the detection for comparison.
                     self._apply_metric_calibration(
                         detection, metric_mask, calibrated_prediction, metric_result,
+                    )
+                    calibrated = detection.calibration_version is not None
+                    self.last_logitech_volume_diagnostics["result_record"] = result_record(
+                        diagnostics=getattr(metric_result, "diagnostics", None) or {},
+                        depth=calibrated_prediction, mask=metric_mask,
+                        depth_type=f"{depth_output_kind(self.config.depth_model)}:{self.calibration_mode}",
+                        pose=self.logitech_pose.status(),
+                        calibration_valid=self.height_calibration is not None,
+                        raw_volume_l=(detection.uncalibrated_volume_l if calibrated
+                                      else detection.monocular_volume_l),
+                        calibrated_volume_l=detection.monocular_volume_l if calibrated else None,
+                        dimensions_mm=(detection.footprint_length_mm, detection.footprint_width_mm,
+                                       detection.physical_height_mm),
+                        rejection=detection.volume_rejection_reason,
                     )
             if (
                 self.camera_id == "logitech"
@@ -2476,7 +2536,11 @@ class VisionPipeline:
                     None if detection.shape_geometry is None else detection.shape_geometry.geometry_method,
                     detection.canonical_type or detection.label,
                 )
-                corrected, applied = self.volume_factors.correct(raw, group)
+                if self.logitech_pose.changed_reason:
+                    # Factors fitted in another pose do not describe this one.
+                    corrected, applied = raw, None
+                else:
+                    corrected, applied = self.volume_factors.correct(raw, group)
                 detection.monocular_volume_l = corrected
                 self.last_logitech_volume_diagnostics = {
                     **self.last_logitech_volume_diagnostics,
@@ -2515,6 +2579,21 @@ class VisionPipeline:
                     "Unmeasured or unvalidated detections are shown live but are not added to the database"
                 )
         for detection in detections:
+            # One colour definition for both cameras (colour_evidence.py):
+            # the dominant colour of the visible surface, glare and deep
+            # shadow excluded, with a cap or label reported as an accent
+            # rather than replacing it. Geometry is not read or changed.
+            colour_mask = measurement_masks.get(id(detection), detection.mask)
+            if colour_mask is not None and detection.source != "tracked-prediction":
+                colour = describe_colour(
+                    frame, colour_mask, label=detection.label,
+                    background_bgr=self.reference_rgb,
+                )
+                if colour.state != "no_mask":
+                    detection.color = colour.colour
+                    detection.color_confidence = float(colour.confidence)
+                    detection.color_accent = colour.accent
+                    detection.color_evidence = colour.as_dict()
             if detection.track_id is not None:
                 colors = self._color_history[detection.track_id]
                 # A tracked prediction repeats the previous frame's colour;
@@ -2560,10 +2639,14 @@ class VisionPipeline:
                         if label != "unknown" and score >= self.config.material_confidence_threshold:
                             materials.append(label)
                     if materials:
-                        votes = Counter(materials)
-                        best_material, best_count = votes.most_common(1)[0]
-                        detection.material = best_material
-                        detection.material_confidence = round(best_count / len(materials), 4)
+                        # Identity, exterior material and contents kept apart,
+                        # and a split vote published as unknown
+                        # (material_evidence.py).
+                        (detection.material, detection.material_confidence,
+                         detection.material_evidence) = reconcile_material(
+                            detection.label, list(materials),
+                            colour_state=(detection.color_evidence or {}).get("state"),
+                        )
             measured = self._detection_volume(detection)
             if detection.track_id is not None and measured is not None:
                 history = self._volume_history[detection.track_id]
@@ -3936,6 +4019,59 @@ class VisionPipeline:
             self.logitech_distance_source = "derived_from_floor_plane"
         return height
 
+    LOGITECH_POSE_CHECK_EVERY = 30
+
+    @property
+    def logitech_pose(self) -> PoseGuard:
+        # Lazily, for pipelines assembled without __init__ in tests.
+        guard = self.__dict__.get("_logitech_pose")
+        if guard is None:
+            guard = self.__dict__["_logitech_pose"] = PoseGuard(None)
+        return guard
+
+    def _check_logitech_pose(
+        self, depth: np.ndarray | None, intrinsics: Any, detections: list[Detection],
+        region: np.ndarray | None,
+    ) -> None:
+        """Every so often, fit the floor in the live view and compare it to the setup's.
+
+        The empty baseline is fitted once; a camera nudged afterwards keeps
+        measuring against it. The live floor around the objects is what shows
+        the move. Three disagreeing checks in a row are needed, so one noisy
+        monocular frame does not revoke a calibration.
+        """
+        if self.camera_id != "logitech" or depth is None or intrinsics is None:
+            return
+        if self.logitech_pose.recorded is None:
+            return
+        self._pose_check_frames = getattr(self, "_pose_check_frames", 0) + 1
+        if self._pose_check_frames % self.LOGITECH_POSE_CHECK_EVERY:
+            return
+        occupied = np.zeros(depth.shape[:2], dtype=bool)
+        for item in detections:
+            if item.mask is not None and item.mask.shape == occupied.shape:
+                occupied |= item.mask
+        plane = fit_support_plane_from_background(
+            depth, intrinsics, object_mask=occupied, region_mask=region,
+        )
+        if not reference_plane_is_usable(plane):
+            return
+        before = self.logitech_pose.changed_reason
+        after = self.logitech_pose.observe(plane, (int(depth.shape[1]), int(depth.shape[0])))
+        if after != before:
+            if after:
+                LOGGER.warning("Logitech %s: calibrations fitted in the old pose are suspended", after)
+            self._validate_height_calibration()
+
+    def _expect_logitech_pose(self) -> None:
+        """The operator has just set the camera up; its current floor is the pose."""
+        if self.camera_id != "logitech":
+            return
+        self.logitech_pose.expect()
+        cached = self._logitech_plane_cache
+        if cached is not None and self._logitech_plane_source == "empty_baseline":
+            self.logitech_pose.record(cached[1], (cached[0][1], cached[0][0]))
+
     def camera_height_m(self) -> float | None:
         """The camera's height above the floor, measured or derived.
 
@@ -4041,7 +4177,13 @@ class VisionPipeline:
         baseline = self.reference_monocular
         has_baseline = baseline is not None and baseline.shape == depth_m.shape
         cached = self._logitech_plane_cache
-        if cached is not None and cached[0] == shape:
+        # The plane belongs to the baseline it was fitted from. A new empty
+        # baseline comes with a new depth scale, and a plane cached from the
+        # old one measured every height in the old units.
+        baseline_token = baseline if has_baseline else None
+        if cached is not None and cached[0] == shape and (
+            self._logitech_plane_source != "empty_baseline" or cached[2] is baseline_token
+        ):
             # A plane fitted from a live frame was fitted around whatever was
             # in the scene. Once an empty baseline exists it is the better
             # surface, so that one provisional fit is replaced exactly once.
@@ -4061,7 +4203,13 @@ class VisionPipeline:
             return None if cached is None else cached[1]
         self._logitech_plane_reason = None
         self._logitech_plane_source = source
-        self._logitech_plane_cache = (shape, plane)
+        self._logitech_plane_cache = (shape, plane, baseline_token if source == "empty_baseline" else None)
+        if source == "empty_baseline":
+            # A new empty baseline is a fresh look at the floor: if the camera
+            # was moved, this is where it shows (logitech_pose.py).
+            before = self.logitech_pose.changed_reason
+            if self.logitech_pose.observe(plane, (shape[1], shape[0]), immediate=True) != before:
+                self._validate_height_calibration()
         LOGGER.info(
             "Logitech floor plane fitted: tilt=%.1f deg rmse=%.4f m inliers=%s",
             plane.tilt_degrees, plane.residual_rmse_m, plane.inlier_pixels,
@@ -4297,6 +4445,7 @@ class VisionPipeline:
             setup = replace(setup, camera_floor_distance_cm=distance,
                             setup_id=setup_id or setup.setup_id, note=note or setup.note)
             stored = self.metric_store.save_setup(setup)
+            self._expect_logitech_pose()
             self._validate_height_calibration(stored)
             # The restore path reads this file at startup. Writing only the
             # setup record left a station that had been given its distance
@@ -4328,6 +4477,11 @@ class VisionPipeline:
             except (KeyError, TypeError, ValueError):
                 pass
         difference = current.difference(recorded)
+        if self.logitech_pose.changed_reason:
+            # CameraSetup knows the resolution, zone and distance, not the
+            # tilt: a mapping fitted looking across the mat was reused
+            # looking down on it.
+            difference = self.logitech_pose.changed_reason
         if difference and difference != "no_saved_camera_setup":
             self.height_calibration = None
             self.height_calibration_reason = f"calibration_invalidated_{difference}"
@@ -4635,6 +4789,7 @@ class VisionPipeline:
         if calibration is None:
             return {"ok": False, "reason": reason, **self.metric_status()}
         self.metric_store.save_calibration(calibration)
+        self._expect_logitech_pose()
         self._validate_height_calibration()
         return {"ok": True, **self.metric_status()}
 
@@ -4678,6 +4833,7 @@ class VisionPipeline:
                 else round(self.logitech_derived_distance_m * 100.0, 1)
             ),
             "floor_plane_source": self._logitech_plane_source,
+            "camera_pose": self.logitech_pose.status(),
             "floor_plane_reason": self._logitech_plane_reason,
             "auto_baseline": self.auto_baseline_state,
         })
@@ -4872,10 +5028,20 @@ class VisionPipeline:
             region = fixed_bin_mask(self.latest_frame.shape, self.config.roi, self.config.bin_polygon)
         if intrinsics is None:
             raise ValueError("The Logitech camera has not reported intrinsics yet")
-        calibration, diagnostics = fit_plane_alignment(
-            predicted, region, intrinsics, float(camera_height_m),
-            inverse=depth_output_kind(self.config.depth_model) != "metric",
-        )
+        metric_model = depth_output_kind(self.config.depth_model) == "metric"
+        tilt = floor_tilt_deg(predicted, region, intrinsics) if metric_model else None
+        if tilt is not None and tilt > AXIS_ALIGNMENT_MAX_TILT_DEG:
+            # `fit_plane_alignment` maps the prediction onto a floor square to
+            # the optical axis. A tilted floor cannot be mapped onto that by a
+            # scale and an offset, and the fit flattened the depth map until
+            # no object had any height. Scale to the fitted floor instead.
+            calibration, diagnostics = plane_height_scale(
+                predicted, region, intrinsics, float(camera_height_m))
+        else:
+            calibration, diagnostics = fit_plane_alignment(
+                predicted, region, intrinsics, float(camera_height_m),
+                inverse=not metric_model,
+            )
         if calibration is None:
             raise ValueError(f"Empty-plane calibration failed: {diagnostics.get('reason')}")
         calibration.roi = tuple(self.config.roi)
@@ -4883,6 +5049,7 @@ class VisionPipeline:
         calibration.device = str(getattr(self, "camera_device", "") or self.camera_id)
         self.config.logitech_reference_distance_m = float(camera_height_m)
         sample = self.logitech_calibration.set_calibration(calibration, diagnostics)
+        self.logitech_pose.expect()
         baseline = self.set_baseline()
         self.store.save_json("calibration/reference_distance.json",
                              {"distance_m": float(camera_height_m), "captured_at": time.time()})

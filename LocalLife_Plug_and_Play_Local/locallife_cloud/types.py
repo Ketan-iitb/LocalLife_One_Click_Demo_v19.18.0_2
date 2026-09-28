@@ -100,6 +100,12 @@ class Detection:
     # stood above the floor). Displayed as provisional; never recorded, because
     # the ledger and history read only the accepted volume fields.
     provisional_volume_l: float | None = None
+    # A small, strongly coloured part distinct from the dominant colour -- the
+    # red cap on a grey bottle -- and how the colour was reached
+    # (colour_evidence.py). The dominant colour stays in `color`.
+    color_accent: str | None = None
+    color_evidence: dict | None = field(default=None, repr=False)
+    material_evidence: dict | None = field(default=None, repr=False)
     # Set when the detector's class and the material classifier disagree (a
     # folded cloth called "cardboard box"): reported, and geometry is not forced.
     classification_note: str | None = None
@@ -192,6 +198,9 @@ class Detection:
             "stable_volume_l": self.stable_volume_l,
             "finalized_event_id": self.finalized_event_id,
             "provisional_volume_l": self.provisional_volume_l,
+            "color_accent": self.color_accent,
+            "color_evidence": self.color_evidence,
+            "material_evidence": self.material_evidence,
             "classification_note": self.classification_note,
             "canonical_type": self.canonical_type,
             "raw_volume_l": self.raw_volume_l,
