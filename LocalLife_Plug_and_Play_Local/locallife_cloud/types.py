@@ -96,6 +96,10 @@ class Detection:
     # Set once the deposit is recorded, so overlay, table and export can be
     # shown to be quoting the same immutable record.
     finalized_event_id: str | None = None
+    # Litres computed but not accepted (for example too little of the mask
+    # stood above the floor). Displayed as provisional; never recorded, because
+    # the ledger and history read only the accepted volume fields.
+    provisional_volume_l: float | None = None
     # Set when the detector's class and the material classifier disagree (a
     # folded cloth called "cardboard box"): reported, and geometry is not forced.
     classification_note: str | None = None
@@ -187,6 +191,7 @@ class Detection:
             "volume_rejection_reason": self.volume_rejection_reason,
             "stable_volume_l": self.stable_volume_l,
             "finalized_event_id": self.finalized_event_id,
+            "provisional_volume_l": self.provisional_volume_l,
             "classification_note": self.classification_note,
             "canonical_type": self.canonical_type,
             "raw_volume_l": self.raw_volume_l,

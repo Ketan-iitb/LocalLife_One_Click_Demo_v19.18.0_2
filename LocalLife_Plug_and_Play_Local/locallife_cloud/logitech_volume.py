@@ -328,6 +328,55 @@ def fill_occluded_cells(
     return (np.vstack((cells, added)), np.r_[heights, filled_heights[keep]], int(keep.sum()))
 
 
+# The floor ring around an object: far enough out to miss its blurred edge,
+# close enough to share its local depth error.
+LOCAL_FLOOR_INNER_PX = 4
+LOCAL_FLOOR_OUTER_PX = 14
+LOCAL_FLOOR_MIN_PIXELS = 40
+# Ring pixels standing this far off the plane are another object or a wall,
+# not floor, and are left out of the local reference.
+LOCAL_FLOOR_MAX_ABS_M = 0.05
+# Below this the plane already agrees with the local floor; beyond the upper
+# bound the "floor" ring is evidently not floor, and nothing is corrected.
+LOCAL_FLOOR_MIN_OFFSET_M = 0.003
+LOCAL_FLOOR_MAX_OFFSET_M = 0.04
+
+
+def local_floor_offset(
+    height_map: np.ndarray,
+    object_mask: np.ndarray,
+    depth: np.ndarray,
+    *,
+    measurement_mask: np.ndarray | None = None,
+) -> tuple[float | None, int]:
+    """How far the fitted plane sits above the real floor right around an object.
+
+    Returns (offset metres, ring pixels). The offset is the median plane height
+    of a floor ring just outside the mask; None when the ring is too small to
+    trust or the plane already agrees with it.
+    """
+    try:
+        import cv2
+    except ImportError:  # pragma: no cover
+        return None, 0
+    mask = object_mask.astype(np.uint8)
+    if not mask.any():
+        return None, 0
+    outer = cv2.dilate(mask, np.ones((2 * LOCAL_FLOOR_OUTER_PX + 1,) * 2, np.uint8)) > 0
+    inner = cv2.dilate(mask, np.ones((2 * LOCAL_FLOOR_INNER_PX + 1,) * 2, np.uint8)) > 0
+    ring = outer & ~inner & np.isfinite(height_map) & np.isfinite(depth) & (depth > 0.05)
+    if measurement_mask is not None and measurement_mask.shape == ring.shape:
+        ring &= measurement_mask.astype(bool)
+    ring &= np.abs(height_map) <= LOCAL_FLOOR_MAX_ABS_M
+    pixels = int(np.count_nonzero(ring))
+    if pixels < LOCAL_FLOOR_MIN_PIXELS:
+        return None, pixels
+    offset = float(np.median(height_map[ring]))
+    if abs(offset) < LOCAL_FLOOR_MIN_OFFSET_M or abs(offset) > LOCAL_FLOOR_MAX_OFFSET_M:
+        return None, pixels
+    return offset, pixels
+
+
 @dataclass
 class HeightMapResult:
     measurement: VolumeMeasurement | None
@@ -349,6 +398,7 @@ def metric_object_volume(
     cell_size_m: float = CELL_SIZE_M,
     camera_height_m: float | None = None,
     fill_occlusion: bool = True,
+    local_floor: bool = True,
 ) -> HeightMapResult:
     """Masked height-map volume from calibrated monocular depth, with its statistics."""
     diagnostics: dict[str, Any] = {}
@@ -390,6 +440,28 @@ def metric_object_volume(
     diagnostics["height_source"] = "fitted_support_plane"
     if height_map is None:
         return HeightMapResult(None, diagnostics, "degenerate_support_plane")
+    if local_floor:
+        # Measure against the floor right around the object, not only the
+        # plane fitted across the whole view. Monocular depth is wrong in a
+        # smooth, spatially varying way, so the global plane can sit a
+        # centimetre or two above or below the real floor at any one spot --
+        # and a 3 cm slipper under a plane 2 cm too high reads as nothing at
+        # all ("no measurable height above plane"). The floor ring around the
+        # object carries the same local error, so differencing against it
+        # cancels the error instead of burying the object in it.
+        offset, ring_pixels = local_floor_offset(
+            height_map, candidate, depth, measurement_mask=measurement_mask,
+        )
+        diagnostics["local_floor_ring_pixels"] = ring_pixels
+        diagnostics["local_floor_offset_m"] = offset
+        if offset is not None:
+            a, b, c = plane_coefficients
+            norm = math.sqrt(a * a + b * b + 1.0)
+            plane_coefficients = (a, b, c - offset * norm)
+            corrected = _plane_perpendicular_height(depth, intrinsics, plane_coefficients)
+            if corrected is not None:
+                height_map = corrected
+                diagnostics["height_source"] = "fitted_support_plane_local_floor"
     if reference_depth_m is not None and reference_depth_m.shape == depth.shape:
         # The empty-scene prediction is the other, independent reference: used
         # when the fitted plane leaves this object with no measurable height

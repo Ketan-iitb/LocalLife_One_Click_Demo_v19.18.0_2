@@ -65,7 +65,7 @@ from .event_log import MeasurementEventLog, STATUS_ACCEPTED, STATUS_REJECTED, re
 from .duplicate_detections import drop_unclassified_duplicates
 from .finalized_record import FinalizedRegistry
 from .storage import ResultStore
-from .tracking import ObjectTracker
+from .stable_tracking import LabelTolerantTracker
 from .box_templates import load_box_templates, match_box_template
 from .logitech_calibration import RELATIVE_ONLY_MESSAGE, LogitechCalibrationStore, LogitechLens, depth_output_kind
 from .coordinates import clip_to_region, frame_consistency, restore_mask
@@ -478,6 +478,11 @@ def _spans_the_background(mask: np.ndarray, region: np.ndarray | None) -> bool:
     return looks_like_background(mask, region) is not None
 
 
+# The smallest connected surface, in depth points, that is still measured as an
+# object when the usual 60-point floor refuses it. Flagged when used.
+SMALL_OBJECT_MIN_POINTS = 20
+
+
 def _zone_limits_m(zone: Any) -> tuple[float, float] | None:
     """The calibrated mat's own size: nothing standing on it can be larger."""
     width = getattr(zone, "width_m", None)
@@ -517,7 +522,8 @@ class VisionPipeline:
             if config.enable_material_classification
             else None
         )
-        self.tracker = ObjectTracker(
+        # Same tracker, but a relabelled detection no longer opens a new ID.
+        self.tracker = LabelTolerantTracker(
             confirmation_frames=config.tracker_confirm_frames,
             max_missing_frames=config.tracker_max_missing_frames,
             minimum_iou=config.tracker_minimum_iou,
@@ -1576,6 +1582,7 @@ class VisionPipeline:
         )
         measurement_masks: dict[int, np.ndarray] = {}
         recovered_measurement_ids: set[int] = set()
+        recovered_small_ids: set[int] = set()
         if (
             self.camera_id != "logitech"
             and depth_m is not None
@@ -1893,6 +1900,9 @@ class VisionPipeline:
                 foreground_fraction = individual.valid_pixels / max(1, individual.candidate_pixels)
                 if foreground_fraction < self.config.minimum_foreground_fraction:
                     detection.measurement_quality = "rejected-sparse-height-inside-mask"
+                    # Shown, never recorded: the history and the deposit logic
+                    # read realsense_volume_l, which stays empty.
+                    detection.provisional_volume_l = round(individual.liters, 6)
                     warnings.append(
                         "Rejected a volume whose measured height occupied too little of the detection mask"
                     )
@@ -1932,6 +1942,34 @@ class VisionPipeline:
                     max_height_m=self.config.max_object_height_m,
                     min_points=min(60, self.config.min_component_pixels),
                 )
+                mask_pixels = int(np.count_nonzero(instance_mask & bin_region))
+                small_floor = SMALL_OBJECT_MIN_POINTS
+                if dimensions is None and small_floor < min(60, self.config.min_component_pixels):
+                    # A fixed 60-point floor measures a bag and refuses a
+                    # slipper two metres away, whose elevated top is a few
+                    # dozen pixels. The same method is run again needing only
+                    # a connected 20-point surface standing measurably above
+                    # the plane; the result is flagged so it reads as
+                    # provisional, and a mask with nothing above the plane is
+                    # refused exactly as before.
+                    dimensions = estimate_object_dimensions(
+                        depth_m, intrinsics, instance_mask, measurement_plane,
+                        measurement_mask=bin_region,
+                        min_height_m=minimum_height_m,
+                        max_height_m=self.config.max_object_height_m,
+                        min_points=small_floor,
+                    )
+                    if dimensions is not None:
+                        recovered_small_ids.add(id(detection))
+                if detection.depth_coverage_percent is None and depth_m is not None and mask_pixels:
+                    # Said for every detection, not only the ones a volume was
+                    # computed for: a black or shiny object returns no stereo
+                    # depth, and the dashboard should say that rather than
+                    # "pending measurable height".
+                    sensed = instance_mask & bin_region & np.isfinite(depth_m) & (depth_m > 0.10)
+                    detection.depth_coverage_percent = round(
+                        100.0 * int(np.count_nonzero(sensed)) / mask_pixels, 1,
+                    )
             if dimensions is not None:
                 # Median over a short window, so one badly segmented frame
                 # cannot decide the reported size. This is what stops a 2 cm
@@ -1950,6 +1988,8 @@ class VisionPipeline:
                 )
                 if id(detection) in recovered_measurement_ids:
                     extra_dimension_flags += ("support_plane_mask_recovered",)
+                if id(detection) in recovered_small_ids:
+                    extra_dimension_flags += ("small_object_point_floor",)
                 # A label, never a deletion: the numbers still go out unchanged,
                 # so nothing that worked stops working, but a reader can see
                 # that the system does not believe a 572 mm column 71 mm wide
@@ -2301,6 +2341,7 @@ class VisionPipeline:
                     foreground_fraction = individual_mono.valid_pixels / max(1, individual_mono.candidate_pixels)
                     if foreground_fraction < self.config.minimum_foreground_fraction:
                         detection.measurement_quality = "rejected-sparse-height-inside-mask"
+                        detection.provisional_volume_l = round(individual_mono.liters, 6)
                     elif logitech_publish is not None and not logitech_publish.publish:
                         # A volume that cannot be right is withheld: one
                         # integrated over two bags at once, or one that does
