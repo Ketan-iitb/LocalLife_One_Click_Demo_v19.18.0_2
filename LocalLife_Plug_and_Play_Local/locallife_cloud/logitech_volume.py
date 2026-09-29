@@ -377,6 +377,66 @@ def local_floor_offset(
     return offset, pixels
 
 
+# A bag resting on earlier waste: the ring around it stands well above the
+# floor. The ring is the support only if most of it is raised and it is level.
+SUPPORT_RAISED_M = 0.05
+SUPPORT_MIN_RAISED_SHARE = 0.60
+SUPPORT_MAX_RELATIVE_SPREAD = 0.35
+SUPPORT_CONTACT_TOLERANCE_M = 0.05
+SUPPORT_MIN_CLEARANCE_M = 0.03
+
+
+def local_support_height(
+    height_map: np.ndarray, object_mask: np.ndarray, depth: np.ndarray,
+    *, measurement_mask: np.ndarray | None = None,
+) -> tuple[float | None, str | None, dict[str, Any]]:
+    """(support height above the floor plane, reason, diagnostics) for a bag on a pile.
+
+    `local_floor_offset` corrects a plane a centimetre or two off and ignores
+    a ring more than 5 cm up. In a bin with earlier bags that ring is the
+    waste the new bag rests on, 20-60 cm above the bin floor, and ignoring it
+    measured the new bag from the bin floor: a 30 cm bag on a pile reported as
+    60 cm tall. Here a raised, level ring is taken as the local support. A
+    raised ring that is not level (neighbours of different heights) leaves the
+    support unknown, and says so.
+    """
+    try:
+        import cv2
+    except ImportError:  # pragma: no cover
+        return None, None, {}
+    mask = object_mask.astype(np.uint8)
+    outer = cv2.dilate(mask, np.ones((2 * LOCAL_FLOOR_OUTER_PX + 1,) * 2, np.uint8)) > 0
+    inner = cv2.dilate(mask, np.ones((2 * LOCAL_FLOOR_INNER_PX + 1,) * 2, np.uint8)) > 0
+    ring = outer & ~inner & np.isfinite(height_map) & np.isfinite(depth) & (depth > 0.05)
+    if measurement_mask is not None and measurement_mask.shape == ring.shape:
+        ring &= measurement_mask.astype(bool)
+    values = height_map[ring]
+    if values.size < LOCAL_FLOOR_MIN_PIXELS:
+        return None, None, {"support_ring_pixels": int(values.size)}
+    raised = float(np.mean(values > SUPPORT_RAISED_M))
+    info = {"support_ring_pixels": int(values.size), "support_raised_share": round(raised, 3)}
+    if raised < SUPPORT_MIN_RAISED_SHARE:
+        return None, None, info
+    lifted = values[values > SUPPORT_RAISED_M]
+    support = float(np.median(lifted))
+    spread = float(np.median(np.abs(lifted - support))) * 1.4826 / max(support, 1e-6)
+    info.update({"support_height_m": round(support, 4), "support_relative_spread": round(spread, 3)})
+    if spread > SUPPORT_MAX_RELATIVE_SPREAD:
+        return None, "support_surface_uneven_height_above_bin_floor", info
+    own = height_map[object_mask.astype(bool) & np.isfinite(height_map)]
+    if own.size:
+        low, top = float(np.percentile(own, 10)), float(np.percentile(own, 90))
+        info.update({"object_low_m": round(low, 4), "object_top_m": round(top, 4)})
+        # A support is under the object: the object's own lowest visible
+        # points reach down to it and its top stands clear above it. A bag on
+        # the floor between two taller bags has raised surroundings that
+        # hold nothing up.
+        if low > support + SUPPORT_CONTACT_TOLERANCE_M or top < support + SUPPORT_MIN_CLEARANCE_M:
+            if top < support + SUPPORT_MIN_CLEARANCE_M:
+                return None, "raised_surroundings_are_not_its_support", info
+    return support, None, info
+
+
 @dataclass
 class HeightMapResult:
     measurement: VolumeMeasurement | None
@@ -454,6 +514,17 @@ def metric_object_volume(
         )
         diagnostics["local_floor_ring_pixels"] = ring_pixels
         diagnostics["local_floor_offset_m"] = offset
+        if offset is None:
+            support, support_reason, support_info = local_support_height(
+                height_map, candidate, depth, measurement_mask=measurement_mask,
+            )
+            diagnostics.update(support_info)
+            if support_reason:
+                diagnostics["height_reference"] = support_reason
+            if support is not None:
+                # Resting on earlier waste: its height is measured from that.
+                offset = support
+                diagnostics["height_reference"] = "height_above_local_support"
         if offset is not None:
             a, b, c = plane_coefficients
             norm = math.sqrt(a * a + b * b + 1.0)
