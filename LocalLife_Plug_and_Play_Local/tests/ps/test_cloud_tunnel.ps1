@@ -161,6 +161,30 @@ if ($bash -and $keygen -and -not $IsWindows) {
     Remove-Item -Recurse -Force $fakeHome
 }
 
+# 10. Top-level roles (Stop, Doctor, Launcher) end after their own work and never reach the
+#     child-window LAN address check; child roles still get it.
+$mainTry = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.TryStatementAst] -and
+    $n.Body.Extent.Text -match "Role -eq 'Stop'" -and $n.Body.Extent.Text -match 'Assert-ValidLanAddress' }, $false) | Select-Object -First 1
+function Stop-Demo { [void]$script:Calls.Add('Stop-Demo') }
+function Start-Demo { [void]$script:Calls.Add('Start-Demo') }
+function Invoke-Doctor { [void]$script:Calls.Add('Invoke-Doctor') }
+function Start-AppRole { [void]$script:Calls.Add('Start-AppRole') }
+function Assert-ValidLanAddress { param($Address) throw ('The laptop network address is invalid: ' + $Address) }
+$mainBody = $mainTry.Body.Extent.Text.Trim()
+$mainBody = $mainBody.Substring(1, $mainBody.Length - 2)   # drop the try block's own braces
+foreach ($case in @(@('Stop', 'Stop-Demo'), @('Doctor', 'Invoke-Doctor'), @('Launcher', 'Start-Demo'))) {
+    $script:Calls = New-Object System.Collections.ArrayList
+    $Role = $case[0]; $SessionId = ''; $LanAddress = ''
+    $threw = $null
+    try { . ([scriptblock]::Create($mainBody)) } catch { $threw = $_.Exception.Message }
+    Assert-True ($null -eq $threw -and $script:Calls -contains $case[1]) ("role " + $case[0] + " finishes without the LAN address check")
+}
+$script:Calls = New-Object System.Collections.ArrayList
+$Role = 'App'; $LanAddress = ''
+$threw = $null
+try { . ([scriptblock]::Create($mainBody)) } catch { $threw = $_.Exception.Message }
+Assert-True ($threw -match 'network address is invalid' -and -not ($script:Calls -contains 'Start-AppRole')) 'child role still validates its LAN address'
+
 if ($script:Failures) { Write-Output "$($script:Failures) FAILED"; exit 1 }
 Write-Output 'ALL PASSED'
 exit 0

@@ -2560,7 +2560,11 @@ try {
     if (-not [string]::IsNullOrWhiteSpace($SessionId)) {
         Get-RequiredSessionId -SessionId $SessionId | Out-Null
     }
-    if ($false) { }
+    if ($Role -in @('Launcher', 'Stop', 'Doctor')) {
+        # Top-level roles are finished here. Only the child windows below
+        # receive -LanAddress; a Stop run used to fall through and fail with
+        # "The laptop network address is invalid" after stopping the VM.
+    }
     elseif ($Role -eq 'RecipeApi') {
         Start-RecipeApiRole
     }
