@@ -1,0 +1,16 @@
+object,actual_LxWxH_cm,actual_envelope_L,measured_LxWxH_cm,reported_volume_L,measured_envelope_L,err_longest_%,err_middle_%,err_shortest_%,volume_err_vs_envelope_%,actual_material,measured_material,material_conf_%,material_correct,actual_colour,measured_colour,colour_correct,flags
+Shoes box,36x25x12.5,11.25,36x24x12.5,9.8,10.8,0.0,4.0,0.0,-12.9,paper,cardboard,100,yes,black,black,yes,
+Black polythene bag,30x30x20,18.0,28x20x26,12,14.56,6.7,13.3,0.0,-33.3,plastic,polythene bag,100,yes,black,black,yes,
+Apple waste bag,25x20x8,4.0,24x16x10,2.6,3.84,4.0,20.0,25.0,-35.0,plastic,polythene bag,100,yes,transparent,grey,close,
+Backpack,35x12x40,16.8,42x42x13,14,22.93,5.0,20.0,8.3,-16.7,fabric,cardboard,75,no,black,black,yes,wrong material shown at 75%
+Polythene bag,26x24x12,7.49,25x22x10,1.4,5.5,3.8,8.3,16.7,-81.3,plastic,polythene bag,100,yes,white,grey,close,
+Toy,12x10x20,2.4,15x9x20,1.7,2.7,0.0,25.0,10.0,-29.2,fabric,metal,100,no,grey,orange,no,wrong material shown at 100%
+Brown paper bag,13x30x30,11.7,10x28x29,28,8.12,3.3,6.7,23.1,139.3,paper,mixed waste,100,no,brown,brown,yes,reported litres > its own LxWxH envelope; wrong material shown at 100%
+Drink can,17x7x7,0.83,17x6x7,0.5,0.71,0.0,0.0,14.3,-40.0,metal,fabric,50,no,pink,red,close,
+Milk box,9.5x7x22,1.46,8.2x6x23.5,1.1,1.16,6.8,13.7,14.3,-24.8,paper,plastic,100,no,white,blue,no,wrong material shown at 100%
+Tea box,11x11x17,2.06,11x8x17,0.8,1.5,0.0,0.0,27.3,-61.1,plastic,plastic,100,yes,orange,orange,yes,
+Small plastic box,3.5x3.5x5,0.06,4x3x6,0.07,0.07,20.0,14.3,14.3,14.3,plastic,plastic,50,yes,bluish green,cyan,close,
+Plastic cream bottle,8x4x20,0.64,8x3x20,0.3,0.48,0.0,0.0,25.0,-53.1,plastic,plastic,100,yes,white,red,no,
+Gym equipment,15x12x1.5,0.27,12x9x1.4,0.08,0.15,20.0,25.0,6.7,-70.4,plastic,metal,50,no,green,green,yes,
+Food waste bag,20x19x4,1.52,23x20x5,0.8,2.3,15.0,5.3,25.0,-47.4,plastic,food waste,100,no,yellow,orange,close,wrong material shown at 100%
+Pillow,40x40x12,19.2,43x38x12,18,19.61,7.5,5.0,0.0,-6.2,fabric,fabric,100,yes,grey,brown,no,
