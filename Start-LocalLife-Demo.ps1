@@ -106,12 +106,30 @@ $script:PiTunnelUser = 'locallife-tunnel'
 # is missing or the VM's address has actually changed.
 $script:CloudVmAddressPath = Join-Path $script:SessionDirectory 'cloud-vm-address.txt'
 
+function Get-LauncherFingerprint {
+    # Printed under every banner so a log shows exactly which launcher ran:
+    # a stale checkout (not yet pulled) is then visible instead of guessed.
+    $hash = 'unknown'
+    try { $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $PSCommandPath).Hash.Substring(0, 12).ToLower() } catch { }
+    $commit = ''
+    try {
+        $previous = $ErrorActionPreference
+        $ErrorActionPreference = 'SilentlyContinue'
+        $value = (& git -C $PSScriptRoot rev-parse --short HEAD 2>$null | Out-String).Trim()
+        if ($LASTEXITCODE -eq 0 -and $value) { $commit = ', git ' + $value }
+    }
+    catch { }
+    finally { $ErrorActionPreference = $previous }
+    return ('launcher ' + $hash + $commit)
+}
+
 function Write-Banner {
     param([string]$Message)
     Write-Host ''
     Write-Host ('=' * 72) -ForegroundColor Cyan
     Write-Host $Message -ForegroundColor Cyan
     Write-Host ('=' * 72) -ForegroundColor Cyan
+    Write-Host ('(' + (Get-LauncherFingerprint) + ')') -ForegroundColor DarkGray
     Write-Host ''
 }
 
