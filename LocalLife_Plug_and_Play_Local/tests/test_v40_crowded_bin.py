@@ -378,5 +378,42 @@ class LogitechDepthGainTests(unittest.TestCase):
             self.assertIsNone(station.logitech_depth_gain()[0])
 
 
+class CalibrationSlipTests(unittest.TestCase):
+    """What an operator sees after calibrating: the field reports, reproduced."""
+
+    def _scene(self):
+        bag = _mask(80, 180, 100, 200)
+        frame = np.full((*SIZE, 3), 60, np.uint8)
+        frame[::8], frame[:, ::8] = 90, 90                     # some floor texture
+        depth = np.full(SIZE, FLOOR, np.float32)
+        _paint(frame, depth, bag, 0.15, (200, 200, 200))
+        return bag, frame, depth
+
+    def test_an_object_in_the_captured_empty_scene_stays_visible_and_is_never_deposited(self):
+        bag, frame, depth = self._scene()
+        with tempfile.TemporaryDirectory() as directory:
+            station, _, _ = _station(directory, _Detector([_bag(bag)]), frame, depth)
+            for index in range(20):
+                result = station.process_frame(frame, depth_m=depth, intrinsics=CAMERA, timestamp=1.0 + index)
+            deposits = station.ledger.summary()["deposited_count"]
+        self.assertEqual(len(result.detections), 1)       # before: the object vanished
+        self.assertIsNone(result.detections[0].realsense_volume_l)
+        self.assertEqual(result.detections[0].volume_rejection_reason,
+                         "object_was_in_view_when_the_empty_scene_was_captured")
+        self.assertEqual(deposits, 0)
+
+    def test_a_baseline_from_another_room_is_discarded_and_the_bag_is_measured(self):
+        bag, frame, depth = self._scene()
+        other_room = np.random.default_rng(0).integers(0, 255, (*SIZE, 3)).astype(np.uint8)
+        with tempfile.TemporaryDirectory() as directory:
+            station, _, _ = _station(directory, _Detector([_bag(bag)]), other_room,
+                                     np.full(SIZE, 0.8, np.float32))
+            for index in range(6):
+                result = station.process_frame(frame, depth_m=depth, intrinsics=CAMERA, timestamp=1.0 + index)
+        self.assertEqual(station.baseline_restore_state, "discarded_camera_view_changed")
+        self.assertAlmostEqual(result.detections[0].physical_height_mm, 150.0, delta=10.0)
+        self.assertIsNotNone(result.detections[0].realsense_volume_l)
+
+
 if __name__ == "__main__":
     unittest.main()
