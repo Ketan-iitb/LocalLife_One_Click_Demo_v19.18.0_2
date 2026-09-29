@@ -1453,6 +1453,8 @@ class VisionPipeline:
                     bin_region,
                     foreground_threshold=self.config.foreground_threshold,
                 )
+        if self.camera_id != "logitech":
+            self._discard_stale_realsense_baseline(frame, detections, warnings)
         scene_depth = calibrated_prediction if self.camera_id == "logitech" else depth_m
         scene_reference = self.reference_monocular if self.camera_id == "logitech" else self.reference_realsense
 
@@ -2875,7 +2877,7 @@ class VisionPipeline:
             for detection in detections:
                 if detection.track_id is None or self.ledger.is_deposited(detection.track_id):
                     continue
-                if _is_phantom_detection(detection):
+                if _is_phantom_detection(detection) or detection.source == "yoloe-unchanged":
                     continue
                 if detection.accepted_class is None:
                     continue
@@ -4438,6 +4440,11 @@ class VisionPipeline:
                 detection.dimension_flags = tuple(dict.fromkeys(
                     tuple(detection.dimension_flags or ()) + (flag,)))
             return instance_mask & choice.mask if bounded is None else bounded
+        if choice.reason == NO_NEW_DEPOSIT and detection.source == "yoloe-unchanged":
+            # Already in the empty scene: shown, never measured as a deposit.
+            detection.volume_rejection_reason = "object_was_in_view_when_the_empty_scene_was_captured"
+            detection.measurement_quality = detection.volume_rejection_reason
+            return np.zeros_like(instance_mask)
         if choice.reason == NO_NEW_DEPOSIT and track is not None:
             refusals = self._deposit_refusals[track] = self._deposit_refusals.get(track, 0) + 1
             if refusals >= self.config.baseline_contains_object_frames:
@@ -4547,6 +4554,7 @@ class VisionPipeline:
             tracked_objects=sum(
                 1 for item in detections
                 if item.track_id is not None and not _is_phantom_detection(item)
+                and item.source != "yoloe-unchanged"
                 and not self.ledger.is_deposited(item.track_id)
             ),
             # A hand reaching in covers the bin without being a deposit: the
@@ -4886,6 +4894,36 @@ class VisionPipeline:
 
     DEPTHLESS_MAX_VALID = 0.30
 
+    def _discard_stale_realsense_baseline(self, frame: np.ndarray, detections: list[Detection],
+                                          warnings: list[str]) -> None:
+        """Stop measuring against an empty scene this camera no longer sees.
+
+        A baseline is restored at start-up and kept across sessions. Taken in
+        one room (or pose) and used in another, every object read "no height
+        rise above the committed scene" and furniture read as change. The view's
+        edge structure is compared with the reference; when it no longer
+        matches, the baseline is dropped with a warning and the camera falls
+        back to its live floor fit until a new empty scene is captured.
+        """
+        guard = self.__dict__.get("_realsense_view")
+        if guard is None:
+            guard = self.__dict__["_realsense_view"] = ViewChangeGuard()
+        if self.reference_rgb is None:
+            return
+        occupied = np.zeros(frame.shape[:2], dtype=bool)
+        for item in detections:
+            occupied |= combined_mask([item], frame.shape[:2])
+        reason = guard.update(frame, self.reference_rgb, exclude=occupied)
+        if not reason:
+            return
+        LOGGER.warning("RealSense %s: discarding the stale empty-scene baseline", reason)
+        self.baseline_rgb = self.reference_rgb = None
+        self.baseline_realsense = self.reference_realsense = None
+        self.reference_plane = None
+        self.baseline_restore_state = "discarded_camera_view_changed"
+        warnings.append(f"{reason}: the saved empty scene no longer matches this view and was discarded; "
+                        "capture the empty scene again for before/after occupancy")
+
     def _depthless_proposals(self, proposals: list[Detection], fused: list[Detection],
                              depth: np.ndarray | None, shape: tuple[int, int]) -> list[Detection]:
         """Detector bags that fusion dropped only because the stereo saw nothing there.
@@ -4911,6 +4949,16 @@ class VisionPipeline:
                 continue
             valid = float(np.mean(np.isfinite(depth[mask]) & (depth[mask] > 0.1)))
             if valid > self.DEPTHLESS_MAX_VALID:
+                # Seen by the detector, unchanged since the empty scene: it was
+                # standing there when the empty scene was captured (a common
+                # slip while calibrating). Dropping it made the object vanish
+                # from the RealSense panel altogether; it is kept and the
+                # measurement cascade decides, with its reason.
+                item.volume_rejection_reason = "object_was_in_view_when_the_empty_scene_was_captured"
+                item.measurement_quality = item.volume_rejection_reason
+                item.source = "yoloe-unchanged"
+                kept.append(item)
+                taken |= mask
                 continue
             item.volume_rejection_reason = "no_valid_stereo_depth_dark_or_shiny_surface"
             item.measurement_quality = item.volume_rejection_reason
