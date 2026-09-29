@@ -222,7 +222,8 @@ class ControlApiTests(unittest.TestCase):
             "/api/launcher/start", json={"mode": "cloud", "confirm_billing": True}
         )
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.get_json()["launch"]["mode"], "cloud")
+        self.control._worker.join(10)   # the route starts in the background
+        self.assertEqual(self.control.state.mode, "cloud")
 
     def test_the_api_rejects_anything_that_is_not_a_known_mode(self) -> None:
         for payload in ({"mode": "shell"}, {"mode": 5}, {}, {"mode": ["local"]}):
@@ -244,6 +245,7 @@ class ControlApiTests(unittest.TestCase):
 
     def test_the_dashboard_url_points_at_the_configured_port(self) -> None:
         self.client.post("/api/launcher/start", json={"mode": "local"})
+        self.control._worker.join(10)
         launch = self.client.get("/api/launcher/status").get_json()["launch"]
         self.assertEqual(launch["dashboard_url"], f"http://127.0.0.1:{self.control.config.port}/")
 

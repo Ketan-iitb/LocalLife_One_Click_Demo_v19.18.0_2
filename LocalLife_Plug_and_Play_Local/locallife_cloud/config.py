@@ -287,6 +287,10 @@ class AppConfig:
     default_run_mode: str = "ask"
     allow_local_fallback: bool = True
     cloud_startup_timeout_seconds: int = 90
+    # Local start includes loading the detection/depth models and waiting for
+    # the Pi's first frames; the old shared 90 s limit killed the launcher
+    # mid-start on a slower laptop, so the system never finished opening.
+    local_startup_timeout_seconds: int = 900
     # Per-stage budgets. Defaults come from measured startup, not from guesses:
     # a real run brought the VM up in 79 s with capacity in the usual zone, so
     # 300 s covers that with room for a slow boot while still failing long
@@ -630,6 +634,8 @@ class AppConfig:
             allow_local_fallback=_bool_env("ALLOW_LOCAL_FALLBACK", defaults.allow_local_fallback),
             cloud_startup_timeout_seconds=int(os.environ.get(
                 "CLOUD_STARTUP_TIMEOUT_SECONDS", defaults.cloud_startup_timeout_seconds)),
+            local_startup_timeout_seconds=int(os.environ.get(
+                "LOCAL_STARTUP_TIMEOUT_SECONDS", defaults.local_startup_timeout_seconds)),
             diagnostic_mode=_bool_env("LOCALLIFE_DIAGNOSTIC_MODE", defaults.diagnostic_mode),
             dimension_smoothing_frames=int(os.environ.get(
                 "DIMENSION_SMOOTHING_FRAMES", defaults.dimension_smoothing_frames)),

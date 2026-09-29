@@ -40,7 +40,7 @@ from .cloud_startup import (
     readiness_checklist,
 )
 from .config import AppConfig
-from .launcher_page import WELCOME_PAGE
+from .launcher_page import COMPARE_PAGE, WELCOME_PAGE
 from .pi_discovery import default_cache_path, resolve_pi, unreachable_message
 
 RUN_MODES = ("local", "cloud", "auto")
@@ -148,6 +148,7 @@ class LaunchController:
         self.launcher_script = launcher_script
         self.state = LaunchState()
         self._lock = threading.Lock()
+        self._worker: threading.Thread | None = None
         self._runner = runner or self._run_launcher
         # Last telemetry seen from each mode's backend, so switching modes keeps
         # the other mode's numbers on screen (clearly marked as not live).
@@ -314,11 +315,44 @@ class LaunchController:
             return False, f"{mode} startup failed: {detail[-1] if detail else 'unknown error'}"
         return True, None
 
-    def start(self, mode: str) -> dict[str, Any]:
+    def start_in_background(self, mode: str) -> dict[str, Any]:
+        """Start without holding the HTTP request open.
+
+        The launcher script only returns once the app is healthy, the Pi is
+        streaming and the dashboard is open -- often longer than a browser or
+        a fixed request budget waits. The page polls /api/launcher/status for
+        progress instead.
+        """
+        if mode not in RUN_MODES:
+            raise ValueError(f"Unsupported run mode: choose one of {', '.join(RUN_MODES)}")
+        # start() holds the lock for the whole run, so a busy lock means a start
+        # is in progress: refuse at once instead of queueing a second start.
+        if not self._lock.acquire(blocking=False):
+            raise ValueError("A startup is already in progress")
+        try:
+            busy = self.state.phase in {"checking", "starting-cloud", "starting-local"}
+            if busy or (self._worker is not None and self._worker.is_alive()):
+                raise ValueError("A startup is already in progress")
+            self.state = LaunchState(requested_mode=mode, phase="checking", started_at=time.time())
+            self._worker = threading.Thread(target=self._start_worker, args=(mode,),
+                                            name="launcher-start", daemon=True)
+            self._worker.start()
+            return self.state.to_dict()
+        finally:
+            self._lock.release()
+
+    def _start_worker(self, mode: str) -> None:
+        try:
+            self.start(mode, reserved=True)
+        except Exception as exc:  # noqa: BLE001 - surfaced on the page, never swallowed
+            self.state.phase = "failed"
+            self.state.error = f"{type(exc).__name__}: {exc}"
+
+    def start(self, mode: str, *, reserved: bool = False) -> dict[str, Any]:
         if mode not in RUN_MODES:
             raise ValueError(f"Unsupported run mode: choose one of {', '.join(RUN_MODES)}")
         with self._lock:
-            if self.state.phase in {"checking", "starting-cloud", "starting-local"}:
+            if not reserved and self.state.phase in {"checking", "starting-cloud", "starting-local"}:
                 raise ValueError("A startup is already in progress")
             self.state = LaunchState(
                 requested_mode=mode, phase="checking", started_at=time.time(),
@@ -372,7 +406,7 @@ class LaunchController:
                 self.state.fallback_used = True
                 self._note("Falling back to local processing")
 
-            ok, error = self._attempt("local", float(self.config.cloud_startup_timeout_seconds))
+            ok, error = self._attempt("local", float(self.config.local_startup_timeout_seconds))
             if not ok:
                 self.state.phase = "failed"
                 self.state.error = error
@@ -491,6 +525,11 @@ def create_launcher_app(
     def welcome() -> str:
         return WELCOME_PAGE
 
+    @app.get("/compare")
+    def compare_page() -> str:
+        """The local-versus-cloud table on its own page."""
+        return COMPARE_PAGE
+
     @app.get("/api/launcher/status")
     def status() -> Any:
         return jsonify(
@@ -553,7 +592,7 @@ def create_launcher_app(
                 needs_confirmation=True,
             ), 400
         try:
-            return jsonify(ok=True, launch=control.start(mode))
+            return jsonify(ok=True, launch=control.start_in_background(mode))
         except ValueError as exc:
             return jsonify(error=str(exc)), 400
 
@@ -580,12 +619,20 @@ def create_launcher_app(
 
 
 def main() -> None:  # pragma: no cover - process entry point
+    import sys as _sys
     import threading as _threading
     import webbrowser
 
     settings = AppConfig.from_env()
     app = create_launcher_app(settings)
-    url = f"http://127.0.0.1:{settings.local_api_port}/"
+    page = "compare" if "--compare" in _sys.argv[1:] else ""
+    url = f"http://127.0.0.1:{settings.local_api_port}/{page}"
+    if _port_open("127.0.0.1", settings.local_api_port, timeout=0.5):
+        # The control service is already running (e.g. from START_LOCAL_LIFE.cmd):
+        # just open the page in the browser instead of failing to bind the port.
+        print(f"Local Life control service already running: {url}")
+        webbrowser.open(url)
+        return
     print(f"Local Life control service: {url}")
     _threading.Timer(1.2, lambda: webbrowser.open(url)).start()
     # 127.0.0.1 only: these endpoints start processes and must never be

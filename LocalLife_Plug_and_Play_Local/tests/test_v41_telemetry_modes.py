@@ -239,3 +239,46 @@ class ReplayQualityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BackgroundStartTests(unittest.TestCase):
+    """The white page must keep showing progress when startup takes longer than 90 s."""
+
+    def test_route_returns_while_the_launcher_is_still_running(self) -> None:
+        import threading
+        from locallife_cloud.launcher_service import create_launcher_app
+
+        release = threading.Event()
+        seen = {}
+
+        def slow_runner(command, timeout):
+            seen["timeout"] = timeout
+            release.wait(10)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with TemporaryDirectory() as directory:
+            control = LaunchController(AppConfig(results_dir=Path(directory)), runner=slow_runner)
+            control.resolve_launcher_script = lambda: Path("Start-LocalLife-Demo.ps1")
+            client = create_launcher_app(control.config, control).test_client()
+            response = client.post("/api/launcher/start", json={"mode": "local"})
+            self.assertEqual(response.status_code, 200)
+            self.assertIn(response.get_json()["launch"]["phase"], {"checking", "starting-local"})
+            # A second start while the first is running is refused, not queued.
+            self.assertEqual(client.post("/api/launcher/start", json={"mode": "local"}).status_code, 400)
+            release.set()
+            control._worker.join(10)
+            status = client.get("/api/launcher/status").get_json()["launch"]
+            self.assertEqual(status["phase"], "running")
+            self.assertEqual(seen["timeout"], 900.0)   # local budget, not the old shared 90 s
+
+    def test_worker_failure_is_reported_on_the_page(self) -> None:
+        def broken(command, timeout):
+            raise subprocess.TimeoutExpired(command, timeout)
+
+        with TemporaryDirectory() as directory:
+            control = LaunchController(AppConfig(results_dir=Path(directory)), runner=broken)
+            control.resolve_launcher_script = lambda: Path("Start-LocalLife-Demo.ps1")
+            control.start_in_background("local")
+            control._worker.join(10)
+            self.assertEqual(control.state.phase, "failed")
+            self.assertIn("900", control.state.error)

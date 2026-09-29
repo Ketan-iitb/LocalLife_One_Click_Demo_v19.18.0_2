@@ -105,18 +105,7 @@ summary{cursor:pointer;font-weight:800}details pre{overflow:auto;font-size:12px;
   </div>
 </section>
 
-<section class="checks" id="metrics-panel">
-  <h2 style="margin:0 0 4px">Local vs cloud comparison (automatic)</h2>
-  <div class="muted" id="m-backend" style="font-size:13px">Waiting for a running pipeline…</div>
-  <div style="overflow-x:auto"><table id="m-table" style="width:100%;border-collapse:collapse;font-size:13px;margin-top:8px"></table></div>
-  <div class="muted" id="m-notes" style="font-size:12px;margin-top:6px"></div>
-  <div style="margin-top:8px;display:flex;gap:10px;flex-wrap:wrap">
-    <button class="text-btn" onclick="vmStatus()">Check VM (gpu.py status, no charge)</button>
-    <a class="text-btn" id="m-csv" href="#" target="_blank">Export live telemetry CSV</a>
-    <a class="text-btn" id="m-json" href="#" target="_blank">Export live telemetry JSON</a>
-  </div>
-  <pre id="m-vm" style="display:none;font-size:12px;white-space:pre-wrap"></pre>
-</section>
+@@METRICS_SECTION@@
 
 <details><summary>Diagnostics</summary><pre id="diag">—</pre></details>
 </div>
@@ -187,33 +176,98 @@ async function choose(mode){
   catch(e){$('progress').classList.add('show');$('progress-note').className='callout bad';$('progress-note').textContent=e.message}
 }
 async function cancelStartup(){try{const d=await api('/api/launcher/cancel',{});launch=d.launch;renderLaunch()}catch(e){alert(e.message)}}
-const NA='N/A';
-const n=(v,d=1)=>v==null?NA:Number(v).toFixed(d);
-function cellFor(snap,fn){if(!snap)return 'no run yet';const s=snap.summary;const parts=[fn(s.all,s,'all')].filter(Boolean);for(const [c,m] of Object.entries(s.cameras||{})){const v=fn(m,s,c);if(v)parts.push(c+': '+v)}return parts.join('<br>')+(snap.live?'':'<br><i>last seen '+Math.round(snap.age_s)+' s ago</i>')}
+@@METRICS_JS@@
+setInterval(refresh,1500);refresh();
+</script></body></html>'''
+
+
+# Local-versus-cloud comparison: shared by the welcome page and /compare, so
+# the table is visible on its own page even when the demo was started
+# directly with START_LOCAL_LIFE_CLOUD.cmd. Every number comes from the
+# backend's own /api/telemetry; the mode of a column is the mode the backend
+# reported, never the one that was requested.
+METRICS_SECTION = r"""<section class="checks" id="metrics-panel">
+  <h2 style="margin:0 0 4px">Local vs cloud comparison (automatic)</h2>
+  <div class="muted" id="m-backend" style="font-size:13px">Waiting for a running pipeline…</div>
+  <div style="overflow-x:auto"><table id="m-table" class="m-table"></table></div>
+  <div class="muted" id="m-notes" style="font-size:12px;margin-top:6px"></div>
+  <div style="margin-top:8px;display:flex;gap:10px;flex-wrap:wrap">
+    <button class="text-btn" onclick="vmStatus()">Check VM (gpu.py status, no charge)</button>
+    <a class="text-btn" id="m-csv" href="#" target="_blank">Export live telemetry CSV</a>
+    <a class="text-btn" id="m-json" href="#" target="_blank">Export live telemetry JSON</a>
+    <a class="text-btn" href="/compare" target="_blank">Open comparison on its own page</a>
+  </div>
+  <pre id="m-vm" style="display:none;font-size:12px;white-space:pre-wrap"></pre>
+</section>"""
+
+METRICS_CSS = """.m-table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px}
+.m-table th{text-align:left;padding:6px 8px;border-bottom:2px solid #cfd8d4}
+.m-table td{padding:6px 8px;border-top:1px solid #edf1ef;vertical-align:top}
+.m-table td:first-child{font-weight:650;white-space:nowrap}.m-table tr.sub td:first-child{font-weight:400;padding-left:22px}
+.m-live{display:inline-block;font-size:11px;font-weight:800;padding:1px 7px;border-radius:9px;background:#e7f6f0;color:#188a64}
+.m-old{display:inline-block;font-size:11px;font-weight:800;padding:1px 7px;border-radius:9px;background:#f1f3f2;color:#61706b}"""
+
+METRICS_JS = r"""const NA='N/A';
+const n=(v,d=1)=>v==null||isNaN(v)?NA:Number(v).toFixed(d);
+function cellFor(snap,fn){if(!snap)return 'no run yet';const s=snap.summary;const parts=[fn(s.all,s,'all')].filter(Boolean);for(const [c,m] of Object.entries(s.cameras||{})){const v=fn(m,s,c);if(v)parts.push(c+': '+v)}return parts.join('<br>')}
+const pct=(a,b)=>b?(100*a/b):null;
+// [label, per-scope formatter, optional {get: all-scope number, better: 'lower'|'higher'} for the ratio column, sub-row]
 const ROWS=[
- ['1. Latency p50 / p95 (ms)',m=>m.status!=='ok'?'insufficient data (n='+m.latency.n+')':n(m.latency.p50_ms)+' / '+n(m.latency.p95_ms)+' (n='+m.latency.n+', '+m.window_s+' s)'],
- ['&nbsp;&nbsp;edge upload RTT p50 / p95 (ms)',m=>n(m.client_upload_rtt.p50_ms)+' / '+n(m.client_upload_rtt.p95_ms)+' (n='+m.client_upload_rtt.n+')'],
- ['2. Throughput (unique frames/s)',m=>m.throughput.fps==null?'insufficient data':n(m.throughput.fps,2)+' ('+m.throughput.unique_completed+' frames)'],
- ['3. Reliability completed/sent',m=>{const r=m.reliability;return (r.completed_pct==null?'insufficient data':n(r.completed_pct)+'%')+' ('+r.completed+'/'+r.sent+'; superseded '+r.superseded_by_newer_frame+', failed '+r.failed+', lost '+r.lost_in_transit+', reconnects '+r.reconnects+')'}],
+ ['1. Latency p50 / p95 (ms)',m=>m.status!=='ok'?'insufficient data (n='+m.latency.n+')':n(m.latency.p50_ms)+' / '+n(m.latency.p95_ms)+' (n='+m.latency.n+', '+m.window_s+' s)',{get:s=>s.all.latency.p50_ms,better:'lower'}],
+ ['Inference time p50 / p95 (ms)',m=>n(m.processing.p50_ms)+' / '+n(m.processing.p95_ms)+' (n='+m.processing.n+')',{get:s=>s.all.processing.p50_ms,better:'lower'},true],
+ ['Edge upload RTT p50 / p95 (ms)',m=>n(m.client_upload_rtt.p50_ms)+' / '+n(m.client_upload_rtt.p95_ms)+' (n='+m.client_upload_rtt.n+')',{get:s=>s.all.client_upload_rtt.p50_ms,better:'lower'},true],
+ ['2. Throughput (unique frames/s)',m=>m.throughput.fps==null?'insufficient data':n(m.throughput.fps,2)+' ('+m.throughput.unique_completed+' frames)',{get:s=>s.all.throughput.fps,better:'higher'}],
+ ['3. Reliability completed / sent',m=>{const r=m.reliability;return (r.completed_pct==null?'insufficient data':n(r.completed_pct)+'%')+' ('+r.completed+'/'+r.sent+'; failed '+r.failed+', lost '+r.lost_in_transit+', reconnects '+r.reconnects+')'},{get:s=>s.all.reliability.completed_pct,better:'higher'}],
+ ['Frames dropped for a newer frame',m=>{const r=m.reliability;const v=pct(r.superseded_by_newer_frame,r.received);return v==null?NA:n(v)+'% ('+r.superseded_by_newer_frame+'/'+r.received+')'},{get:s=>pct(s.all.reliability.superseded_by_newer_frame,s.all.reliability.received),better:'lower'},true],
+ ['Frames received / in flight / duplicates',m=>{const r=m.reliability;return r.received+' / '+r.in_flight+' / '+r.duplicates_ignored},null,true],
  ['4. Measurement quality',()=> 'Not evaluated live (no ground truth); see replay benchmark'],
  ['5. Host CPU / RAM %',(m,s,c)=>c!=='all'?'':n(s.host_resources.cpu_percent)+' / '+n(s.host_resources.ram_percent)+' ('+(s.host.hostname||'?')+')'],
- ['&nbsp;&nbsp;GPU util % / VRAM MB',(m,s,c)=>c!=='all'?'':(s.gpu&&s.gpu.available?n(s.gpu.utilization_percent)+' / '+n(s.gpu.memory_used_mb,0)+' ('+s.gpu.name+')':NA)],
- ['&nbsp;&nbsp;Pi CPU / RAM %',(m,s,c)=>{const e=(s.edge_resources||{})[c];return c==='all'?'':(e?n(e.cpu_percent)+' / '+n(e.ram_percent):NA)}],
- ['6. Bytes in / out per frame',m=>n(m.transfer.bytes_in_per_frame,0)+' / '+n(m.transfer.bytes_out_per_completed_frame,0)],
- ['&nbsp;&nbsp;Bytes in / out per minute',m=>n(m.transfer.bytes_in_per_minute,0)+' / '+n(m.transfer.bytes_out_per_minute,0)],
+ ['GPU util % / VRAM MB',(m,s,c)=>c!=='all'?'':(s.gpu&&s.gpu.available?n(s.gpu.utilization_percent)+' / '+n(s.gpu.memory_used_mb,0)+' of '+n(s.gpu.memory_total_mb,0):NA),null,true],
+ ['Processing hardware',(m,s,c)=>c!=='all'?'':((s.gpu&&s.gpu.available)?s.gpu.name:'CPU only (no GPU reported)')+' · '+((s.host&&s.host.cpu_count)||'?')+' CPU threads',null,true],
+ ['Models in use',(m,s,c)=>c!=='all'?'':(s.models?('detector '+s.models.detector+' · Logitech depth '+s.models.logitech_depth+(s.models.logitech_depth_model?' ('+s.models.logitech_depth_model.split('/').pop()+')':'')):NA),null,true],
+ ['Pi CPU / RAM %',(m,s,c)=>{const e=(s.edge_resources||{})[c];return c==='all'?'':(e?n(e.cpu_percent)+' / '+n(e.ram_percent):NA)},null,true],
+ ['6. Bytes in / out per frame',m=>n(m.transfer.bytes_in_per_frame,0)+' / '+n(m.transfer.bytes_out_per_completed_frame,0),{get:s=>s.all.transfer.bytes_in_per_frame,better:'lower'}],
+ ['Bytes in / out per minute',m=>n(m.transfer.bytes_in_per_minute,0)+' / '+n(m.transfer.bytes_out_per_minute,0),null,true],
 ];
+function ratioCell(row,d){const spec=row[2];if(!spec||!d.modes.local||!d.modes.cloud)return '—';
+ const l=spec.get(d.modes.local.summary),c=spec.get(d.modes.cloud.summary);
+ if(l==null||c==null||!isFinite(l)||!isFinite(c)||l<=0||c<=0)return '—';
+ if(spec.better==='lower'){return c<l?'cloud '+n(l/c,2)+'× lower':(c>l?'local '+n(c/l,2)+'× lower':'equal')}
+ return c>l?'cloud '+n(c/l,2)+'× higher':(c<l?'local '+n(l/c,2)+'× higher':'equal')}
+function headerFor(label,snap){if(!snap)return label;return label+' '+(snap.live?'<span class="m-live">LIVE</span>':'<span class="m-old">last seen '+Math.round(snap.age_s)+' s ago</span>')}
 function benchCell(b){if(!b)return 'no replay run';const q=b.quality||{};const l=b.latency_e2e||{};return 'e2e p50/p95 '+n(l.p50_ms)+'/'+n(l.p95_ms)+' ms (n='+(l.n||0)+'), '+n(b.throughput_fps,2)+' fps; quality: '+(q.status||'Not evaluated')}
 async function refreshMetrics(){try{const d=await api('/api/launcher/metrics');const b=d.backend;
  $('m-backend').innerHTML=(b.reachable?'Backend on port '+b.port+' reports processing mode <b>'+b.processing_mode.toUpperCase()+'</b>':'Backend not reachable ('+(b.error||'not started')+')')+(d.fallback_used?' · <b style="color:#b45309">cloud failed; running LOCAL fallback</b>':'')+(d.mode_mismatch?' · <b style="color:#b91c1c">MODE MISMATCH: launched '+d.launched_mode+'</b>':'');
- let h='<tr><th style="text-align:left">Metric</th><th style="text-align:left">Local</th><th style="text-align:left">Cloud</th></tr>';
- for(const [label,fn] of ROWS)h+='<tr style="border-top:1px solid #edf1ef"><td>'+label+'</td><td>'+cellFor(d.modes.local,fn)+'</td><td>'+cellFor(d.modes.cloud,fn)+'</td></tr>';
- h+='<tr style="border-top:2px solid #cfd8d4"><td>Replay benchmark (fair comparison)</td><td>'+benchCell(d.benchmarks.local)+'</td><td>'+benchCell(d.benchmarks.cloud)+'</td></tr>';
- h+='<tr><td>Cloud cost</td><td>—</td><td>'+(d.cost.estimate==null?NA:'≈ '+d.cost.estimate+' '+d.cost.currency+' (estimate)')+'</td></tr>';
+ let h='<tr><th>Metric</th><th>'+headerFor('Local',d.modes.local)+'</th><th>'+headerFor('Cloud',d.modes.cloud)+'</th><th>Cloud vs local</th></tr>';
+ for(const row of ROWS)h+='<tr'+(row[3]?' class="sub"':'')+'><td>'+row[0]+'</td><td>'+cellFor(d.modes.local,row[1])+'</td><td>'+cellFor(d.modes.cloud,row[1])+'</td><td>'+ratioCell(row,d)+'</td></tr>';
+ h+='<tr><td>Replay benchmark (fair comparison)</td><td>'+benchCell(d.benchmarks.local)+'</td><td>'+benchCell(d.benchmarks.cloud)+'</td><td>—</td></tr>';
+ h+='<tr><td>Cloud cost</td><td>—</td><td>'+(d.cost.estimate==null?NA:'≈ '+d.cost.estimate+' '+d.cost.currency+' (estimate)')+'</td><td>—</td></tr>';
  $('m-table').innerHTML=h;
- const any=(d.modes.local||d.modes.cloud);$('m-notes').textContent=any?('Latency boundary: '+(any.summary.all.latency.boundary)+'. Edge RTT boundary: '+any.summary.all.client_upload_rtt.boundary+'. Reliability denominator: '+any.summary.all.reliability.denominator+'. '+d.cost.note):d.cost.note;
+ const any=(d.modes.local||d.modes.cloud);$('m-notes').textContent=(any?('Latency boundary: '+any.summary.all.latency.boundary+'. Inference boundary: '+any.summary.all.processing.boundary+'. Edge RTT boundary: '+any.summary.all.client_upload_rtt.boundary+'. Reliability denominator: '+any.summary.all.reliability.denominator+'. Live runs differ in scene and timing; the replay benchmark is the fair comparison. '):'')+d.cost.note;
  const base='http://127.0.0.1:'+b.port;$('m-csv').href=base+'/api/telemetry.csv';$('m-json').href=base+'/api/telemetry.json';
 }catch(e){$('m-backend').textContent='Metrics unavailable: '+e.message}}
 async function vmStatus(){const p=$('m-vm');p.style.display='block';p.textContent='Running gpu.py status…';try{const d=await api('/api/launcher/vm-status',{});p.textContent=(d.zone?'VM '+d.vm_state+' in zone '+d.zone+'\n\n':'')+(d.output||d.error||'')}catch(e){p.textContent=e.message}}
-setInterval(refreshMetrics,3000);refreshMetrics();
-setInterval(refresh,1500);refresh();
-</script></body></html>'''
+setInterval(refreshMetrics,3000);refreshMetrics();"""
+
+WELCOME_PAGE = (WELCOME_PAGE.replace("@@METRICS_SECTION@@", METRICS_SECTION)
+                .replace("@@METRICS_JS@@", METRICS_JS)
+                .replace("</style>", METRICS_CSS + "\n</style>", 1))
+
+COMPARE_PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Local vs Cloud</title>
+<style>
+:root{--bg:#f4f7f6;--panel:#fff;--ink:#17221f;--muted:#61706b;--line:#d9e2df}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Inter,Segoe UI,system-ui,sans-serif}
+.app{max-width:1200px;margin:auto;padding:16px}.muted{color:var(--muted)}
+.checks{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:18px}
+.text-btn{background:none;border:0;color:#1769aa;text-decoration:underline;cursor:pointer;font:inherit;padding:0}
+""" + METRICS_CSS + """
+</style></head><body><main class="app">
+<h1 style="margin:4px 0 12px;font-size:26px">Local vs cloud comparison</h1>
+""" + METRICS_SECTION + """
+</main><script>
+const $=id=>document.getElementById(id);
+async function api(url,payload){const r=await fetch(url,{method:payload===undefined?'GET':'POST',headers:payload===undefined?{}:{'Content-Type':'application/json'},body:payload===undefined?undefined:JSON.stringify(payload)});const d=await r.json();if(!r.ok)throw Error(d.error||'Request failed');return d}
+""" + METRICS_JS + """
+</script></body></html>"""
