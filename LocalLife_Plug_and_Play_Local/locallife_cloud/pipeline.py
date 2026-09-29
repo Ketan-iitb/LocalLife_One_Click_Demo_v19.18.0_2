@@ -1391,11 +1391,15 @@ class VisionPipeline:
                 )
         if self.camera_id == "logitech":
             self._check_logitech_view(frame, detections, warnings)
-            calibrated_prediction = self._guard_metric_scale(
-                calibrated_prediction, predicted_depth, bin_region, warnings)
+            # The pose check must see the depth *before* it is rescaled to the
+            # recorded floor: after it, a moved camera always looks unmoved.
+            unscaled_prediction = calibrated_prediction
             calibrated_prediction = self._rescale_on_visible_floor(
                 frame, calibrated_prediction, measure_intrinsics, detections, bin_region,
             )
+            # Last, so it bounds every rescaling step together.
+            calibrated_prediction = self._guard_metric_scale(
+                calibrated_prediction, predicted_depth, bin_region, warnings)
             mask_debug: dict[str, Any] = {}
             depth_change = None
             if calibrated_prediction is not None and self.reference_monocular is not None \
@@ -1428,7 +1432,7 @@ class VisionPipeline:
             self._auto_camera_height(self._logitech_floor_plane(
                 calibrated_prediction, measure_intrinsics, None, bin_region,
             ))
-            self._check_logitech_pose(calibrated_prediction, measure_intrinsics, detections, bin_region)
+            self._check_logitech_pose(unscaled_prediction, measure_intrinsics, detections, bin_region)
             self._maybe_learn_empty_baseline(
                 frame, calibrated_prediction, bin_region, detections,
             )
@@ -2303,6 +2307,10 @@ class VisionPipeline:
                         )
                     if plane_for_volume is None or plane_for_volume.coefficients is None:
                         plane_for_volume = self._uncalibrated_plane
+                    if not self.logitech_view_reason and self.logitech_pose.changed_reason:
+                        detection.volume_rejection_reason = self.logitech_pose.changed_reason
+                        detection.measurement_quality = "camera-moved-recapture-empty-scene"
+                        continue
                     if self.logitech_view_reason:
                         # The empty scene, its depth and its floor belong to
                         # another camera pose; heights against them are not
@@ -4887,6 +4895,12 @@ class VisionPipeline:
         floor = ~occupied if region is None else (region & ~occupied)
         scale, record = self._floor_scale.update(depth, intrinsics, floor, pose)
         self.logitech_floor_scale = record
+        if record.get("reason") == "floor_scale_implausible_camera_moved" and not self.logitech_pose.changed_reason:
+            # The floor is where a different installation would see it.
+            self.logitech_pose.changed_reason = "camera_pose_changed_floor_distance"
+            LOGGER.warning("Logitech floor is %sx off its recorded distance: camera moved; "
+                           "recapture the empty zone", record.get("scale"))
+            self._validate_height_calibration()
         if scale is None:
             return depth
         return (depth * scale).astype(depth.dtype, copy=False)
@@ -5024,8 +5038,11 @@ class VisionPipeline:
             longest = max(detection.footprint_length_mm or 0.0, detection.footprint_width_mm or 0.0)
             if longest > 1000.0 * self.config.max_object_footprint_m:
                 reason = f"implausible_footprint_{longest / 1000.0:.1f}m_for_one_object"
-        if logitech and getattr(self, "metric_scale_reason", None):
-            reason = reason or self.metric_scale_reason
+        if logitech:
+            # No valid metric scale in this frame: say which, never a number.
+            reason = (reason or getattr(self, "metric_scale_reason", None)
+                      or getattr(self, "logitech_view_reason", None)
+                      or self.logitech_pose.changed_reason)
         if reason is None:
             return
         detection.footprint_length_mm = detection.footprint_width_mm = None

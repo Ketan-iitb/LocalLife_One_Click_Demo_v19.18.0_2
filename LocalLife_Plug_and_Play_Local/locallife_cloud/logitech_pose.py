@@ -138,6 +138,10 @@ FLOOR_MIN_FRACTION = 0.05
 FLOOR_MAX_NEAR_FAR_DISAGREEMENT = 0.06
 FLOOR_MAX_RELATIVE_RESIDUAL = 0.05
 FLOOR_SCALE_MAX_AGE_FRAMES = 150
+# A floor 1.5x further or nearer than where the setup recorded it is not model
+# drift: the camera has been moved (or raised/lowered) since the setup.
+FLOOR_SCALE_LIMITS = (0.67, 1.5)
+FLOOR_MOVED_REASON = "floor_scale_implausible_camera_moved"
 
 
 class FloorScaleTracker:
@@ -193,13 +197,20 @@ class FloorScaleTracker:
                 "floor_depth_expected_p10_p50_p90_m": [
                     round(float(v), 4) for v in np.percentile(expected[usable], (10, 50, 90))],
             })
-            if disagreement > FLOOR_MAX_NEAR_FAR_DISAGREEMENT:
+            if not FLOOR_SCALE_LIMITS[0] <= scale <= FLOOR_SCALE_LIMITS[1]:
+                reason = FLOOR_MOVED_REASON
+            elif disagreement > FLOOR_MAX_NEAR_FAR_DISAGREEMENT:
                 reason = "floor_scale_differs_near_to_far"
             elif residual > FLOOR_MAX_RELATIVE_RESIDUAL:
                 reason = "floor_scale_residual_too_high"
         if reason is None:
             self.last_valid = (scale, self.frame)
             record.update({"state": "validated_this_frame", "applied_scale": round(scale, 5)})
+        elif reason == FLOOR_MOVED_REASON:
+            # Never reuse an old scale across a move.
+            self.last_valid = None
+            record.update({"state": "unavailable", "reason": reason, "applied_scale": None})
+            scale = None
         elif self.last_valid is not None and self.frame - self.last_valid[1] <= self.max_age_frames:
             record.update({"state": "reused_previous_scale", "reason": reason,
                            "applied_scale": round(self.last_valid[0], 5),
