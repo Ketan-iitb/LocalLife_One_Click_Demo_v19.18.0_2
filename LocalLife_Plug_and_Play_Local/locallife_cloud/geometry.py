@@ -497,6 +497,88 @@ def _fused_mask_for_match(
     return ((candidate_mask & dilated_neural) | neural_mask).copy()
 
 
+SAME_BAG_OVERLAP = 0.25
+
+
+def _separate_scene_matches(
+    frame: np.ndarray, candidate: Detection, matches: list[Detection],
+) -> list[Detection] | None:
+    """Keep distinct neural bags separate when depth joins them into one island.
+
+    A filled bin has touching bags at different depths. Closing the patchy
+    stereo mask joins them into one changed component, and every label inside
+    it used to become a single fused object -- how a pile of black, grey, pink
+    and white bags was drawn as one "unclassified object".
+
+    Labels are first grouped into physical objects: two labels whose masks
+    overlap by more than a quarter of the smaller one are the same bag (two
+    prompts, one bag) and stay one object. Only two or more such groups are
+    separated. Each group keeps its own neural pixels plus the component's
+    pixels near it; a pixel near two groups belongs to neither, so no two bags
+    ever measure the same surface. One ambiguous blob with one group is left
+    to the ordinary fusion -- nothing is invented.
+    """
+    if len(matches) < 2:
+        return None
+    shape = frame.shape[:2]
+    masks = [_detection_mask(match, shape) for match in matches]
+    areas = [int(np.count_nonzero(mask)) for mask in masks]
+    group = list(range(len(matches)))
+
+    def root(index: int) -> int:
+        while group[index] != index:
+            group[index] = group[group[index]]
+            index = group[index]
+        return index
+
+    for first in range(len(masks)):
+        for second in range(first + 1, len(masks)):
+            smaller = min(areas[first], areas[second])
+            if smaller and np.count_nonzero(masks[first] & masks[second]) / smaller > SAME_BAG_OVERLAP:
+                group[root(first)] = root(second)
+    members: dict[int, list[int]] = {}
+    for index in range(len(matches)):
+        members.setdefault(root(index), []).append(index)
+    if len(members) < 2:
+        return None
+
+    scene_mask = _detection_mask(candidate, shape)
+    own, claims = [], []
+    for indices in members.values():
+        mask = np.zeros(shape, dtype=bool)
+        for index in indices:
+            mask |= masks[index]
+        ys, xs = np.nonzero(mask)
+        x1, y1, x2, y2 = int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+        margin = max(2, int(0.08 * max(x2 - x1, y2 - y1)))
+        window = np.zeros(shape, dtype=bool)
+        window[max(0, y1 - margin):min(shape[0], y2 + margin),
+               max(0, x1 - margin):min(shape[1], x2 + margin)] = True
+        own.append(mask)
+        claims.append(scene_mask & window)
+    claimed_by = np.sum(np.stack(claims), axis=0)
+    labelled = np.any(np.stack(own), axis=0)
+    separate: list[Detection] = []
+    for (indices, mask, claim) in zip(members.values(), own, claims):
+        # Contested scene pixels and other bags' labelled pixels are nobody's.
+        bounded = mask | (claim & (claimed_by == 1) & ~labelled)
+        for other in own:
+            if other is not mask:
+                bounded &= ~other
+        if not np.any(bounded):
+            return None
+        best = max((matches[index] for index in indices),
+                   key=lambda item: (_container_priority(item.label), item.area_pixels, item.confidence))
+        ys, xs = np.nonzero(bounded)
+        separate.append(Detection(
+            label=best.label, confidence=best.confidence,
+            box=(int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1),
+            mask=bounded, source="yoloe-scene-fusion",
+            accepted_class=best.accepted_class, **color_fields(frame, bounded),
+        ))
+    return separate
+
+
 def fuse_scene_detections(
     frame: np.ndarray,
     detections: list[Detection],
@@ -510,7 +592,8 @@ def fuse_scene_detections(
     """Give neural labels to complete physical objects, not nested labels.
 
     Every neural mask is assigned to the changed component containing most of
-    it. Multiple labels on one parcel therefore become one tracked container.
+    it. Overlapping labels on one parcel become one tracked container; distinct
+    confirmed bags remain separate even when their depth pixels touch.
     Neural detections with no changed-scene match remain available unchanged.
     Unclassified movement is ignored by default because depth alone cannot
     distinguish a waste container from a person entering the camera view.
@@ -577,6 +660,23 @@ def fuse_scene_detections(
                 or _near_an_existing_track(candidate.box, counted_track_boxes)
             ):
                 continue
+            if not allow_unclassified and counted_track_boxes:
+                # "Near" used to accept any overlap, including a stale
+                # baseline region covering the entire pile and one old track.
+                # Such a blob cannot bridge one bag's brief detector dropout.
+                candidate_area = max(1, candidate.area_pixels)
+                comparable = any(
+                    _near_an_existing_track(candidate.box, [track_box])
+                    and candidate_area <= 2.5 * max(1, (track_box[2] - track_box[0]) *
+                                                   (track_box[3] - track_box[1]))
+                    for track_box in counted_track_boxes
+                )
+                if not comparable:
+                    continue
+        separate = _separate_scene_matches(frame, candidate, matches)
+        if separate is not None:
+            fused.extend(separate)
+            continue
         best = (
             max(matches, key=lambda item: (_container_priority(item.label), item.area_pixels, item.confidence))
             if matches

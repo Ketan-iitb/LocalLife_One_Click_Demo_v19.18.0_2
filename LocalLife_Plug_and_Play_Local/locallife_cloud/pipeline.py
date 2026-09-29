@@ -73,6 +73,7 @@ from .logitech_factor import LogitechVolumeFactors, geometry_group
 from .colour_evidence import describe_colour
 from .depth_edges import drop_depth_edge_pixels
 from .shape_router import refine_shape
+from .crowded_scene import bound_recovered_mask
 from .logitech_pose import touches_frame_border
 from .material_evidence import reconcile_material
 from .logitech_pose import (AXIS_ALIGNMENT_MAX_TILT_DEG, FloorScaleTracker, PoseGuard, ViewChangeGuard,
@@ -391,10 +392,22 @@ def deduplicate_overlapping_detections(
                 max(0, bx2 - bx1) * max(0, by2 - by1),
             ))
             box_nested = box_intersection / smaller_box
+            # In a crowded bin two genuine bags can have heavily overlapping
+            # bounding rectangles while their segmentation masks are distinct.
+            # Box containment alone must not erase one of their identities.
+            has_distinct_masks = (
+                candidate.mask is not None and existing.mask is not None
+                and candidate.mask.shape == existing.mask.shape
+                and candidate.source == "yoloe-scene-fusion"
+                and existing.source == "yoloe-scene-fusion"
+                and nested < 0.25
+            )
             if (
-                intersection_over_union(candidate.box, existing.box) >= iou_threshold
-                or nested >= nested_threshold
-                or box_nested >= nested_threshold
+                nested >= nested_threshold
+                or (not has_distinct_masks and (
+                    intersection_over_union(candidate.box, existing.box) >= iou_threshold
+                    or box_nested >= nested_threshold
+                ))
             ):
                 duplicate = True
                 break
@@ -1499,7 +1512,16 @@ class VisionPipeline:
             # neural match, or two fused scene objects whose merged masks
             # still touch). Collapse those before tracking so one bag is
             # never counted or displayed twice.
+            fused_count = len(detections)
             detections = deduplicate_overlapping_detections(detections, frame.shape[:2])
+            # Where a crowded bin loses bags, frame by frame: how many changed
+            # components, what fusion made of them, what deduplication removed.
+            self.stage_counters["scene_components_last_frame"] = len(scene_objects)
+            self.stage_counters["detector_proposals_last_frame"] = original_count
+            self.stage_counters["fused_detections_last_frame"] = fused_count
+            self.stage_counters["deduplicated_away_last_frame"] = fused_count - len(detections)
+            self.stage_counters["split_scene_detections_total"] += sum(
+                1 for item in detections if item.source == "yoloe-scene-fusion")
             # That collapse compares masks of the same kind. It does not catch
             # the case the bin screenshots show: one red bag wearing "#10 test
             # object (filled plastic waste bag)" and "#11 unclassified object"
@@ -1664,6 +1686,15 @@ class VisionPipeline:
                     max_height_m=self.config.max_object_height_m,
                     min_points=min(60, self.config.min_component_pixels),
                 )
+                if recovered is not None:
+                    recovered, spread = bound_recovered_mask(
+                        recovered, seed,
+                        [combined_mask([other], frame.shape[:2]) for other in detections
+                         if other is not detection and not _is_phantom_detection(other)],
+                    )
+                    if spread:
+                        detection.dimension_flags = tuple(dict.fromkeys(
+                            tuple(detection.dimension_flags or ()) + (spread,)))
                 if recovered is not None and int(np.count_nonzero(recovered)) > int(np.count_nonzero(seed) * 1.08):
                     measurement_masks[id(detection)] = recovered
                     recovered_measurement_ids.add(id(detection))
@@ -1884,6 +1915,9 @@ class VisionPipeline:
             # actually deposited, and background is refused outright.
             instance_mask = self._deposit_measurement_mask(
                 detection, instance_mask, bin_region, deposit_change, deposit_rise,
+                others=[measurement_masks.get(id(other), combined_mask([other], frame.shape[:2]))
+                        for other in detections
+                        if other is not detection and not _is_phantom_detection(other)],
             )
             # The box-cuboid estimator erodes its own mask against leaks; it
             # keeps the unfiltered one, or its edge would be cut twice.
@@ -1893,6 +1927,11 @@ class VisionPipeline:
                 # between the object and the floor, which smears the
                 # footprint away from the camera (depth_edges.py).
                 instance_mask = self._without_depth_edges(detection, depth_m, instance_mask, radius=2)
+                if touches_frame_border(instance_mask):
+                    # Part of it is out of the picture: whatever is measured
+                    # is the visible part only. Flagged, never clamped.
+                    detection.dimension_flags = tuple(dict.fromkeys(
+                        tuple(detection.dimension_flags or ()) + ("object_cropped_by_frame_border",)))
             logitech_height_coherent = True
             if depth_m is not None:
                 valid_distance = instance_mask & np.isfinite(depth_m) & (depth_m > 0.10) & (depth_m < 20.0)
@@ -2411,8 +2450,12 @@ class VisionPipeline:
                             pose_reason=self.logitech_pose.changed_reason,
                             local_floor_offset_m=result.diagnostics.get("local_floor_offset_m"),
                         )
+                        # Which surface the height stands on: the bin floor, or
+                        # the earlier waste this bag rests on (logitech_volume.py).
+                        reference = result.diagnostics.get("height_reference")
                         detection.dimension_flags = tuple(dict.fromkeys(
-                            tuple(detection.dimension_flags or ()) + suspicious))
+                            tuple(detection.dimension_flags or ()) + suspicious
+                            + ((reference,) if reference else ())))
                     metric_mask, metric_result = volume_mask, result
                 else:
                     individual_mono = estimate_volume(
@@ -4330,6 +4373,7 @@ class VisionPipeline:
     def _deposit_measurement_mask(
         self, detection: Detection, instance_mask: np.ndarray, region: np.ndarray,
         change: np.ndarray | None, rise: np.ndarray | None,
+        others: list[np.ndarray] | None = None,
     ) -> np.ndarray:
         """The mask this detection is measured with, or an empty one with a reason.
 
@@ -4355,7 +4399,15 @@ class VisionPipeline:
         if choice.measurable:
             if track is not None:
                 self._deposit_refusals.pop(track, None)
-            return choice.mask if choice.source == FOREGROUND_COMPONENT else instance_mask
+            if choice.source != FOREGROUND_COMPONENT:
+                return instance_mask
+            # The changed island under a bag in a full bin is the whole pile
+            # of what changed: bound it to this bag (crowded_scene.py).
+            bounded, flag = bound_recovered_mask(choice.mask, instance_mask, list(others or ()))
+            if flag:
+                detection.dimension_flags = tuple(dict.fromkeys(
+                    tuple(detection.dimension_flags or ()) + (flag,)))
+            return instance_mask & choice.mask if bounded is None else bounded
         if choice.reason == NO_NEW_DEPOSIT and track is not None:
             refusals = self._deposit_refusals[track] = self._deposit_refusals.get(track, 0) + 1
             if refusals >= self.config.baseline_contains_object_frames:
@@ -4413,7 +4465,19 @@ class VisionPipeline:
                 item.volume_rejection_reason for item in detections
             ),
         ))
-        self._observe_bin_occupancy(detections, changed)
+        # The before/after tracker needs "is the scene still moving", not "has
+        # it changed since the empty bin": the committed reference is not
+        # advanced by default, so once one bag was in, the second measure
+        # stayed above the arrival threshold for good and no event could
+        # ever finalise. What changed since the previous frame is motion.
+        previous = self.__dict__.get("_previous_change_mask")
+        current = None if change is None else (change & region)
+        if current is None or previous is None or previous.shape != current.shape:
+            motion = changed
+        else:
+            motion = int(np.count_nonzero(current ^ previous)) / available
+        self._previous_change_mask = None if current is None else current.copy()
+        self._observe_bin_occupancy(detections, motion)
 
     def _observe_bin_occupancy(self, detections: list[Detection], changed: float) -> None:
         """Feed this frame's bin surface to the before/after event tracker.
@@ -4446,7 +4510,15 @@ class VisionPipeline:
         event = self.bin_occupancy.observe(DepositObservation(
             reading=reading,
             changed_fraction=changed,
-            tracked_objects=sum(1 for item in detections if item.track_id is not None),
+            # Only objects still arriving: a bag already recorded as deposited
+            # stays in view in a bin, and counting it kept the tracker in
+            # "deposit in progress" for ever -- no before/after event could
+            # ever finalise once the first bag was in.
+            tracked_objects=sum(
+                1 for item in detections
+                if item.track_id is not None and not _is_phantom_detection(item)
+                and not self.ledger.is_deposited(item.track_id)
+            ),
             # A hand reaching in covers the bin without being a deposit: the
             # surface it hides is not the waste surface, and an event measured
             # across it is not a before/after pair.
