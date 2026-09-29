@@ -483,6 +483,11 @@ class AppConfig:
     # geometry; waste mode keeps the safer 25 mm threshold unchanged.
     geometry_validation_min_object_height_m: float = 0.010
     max_object_height_m: float = 0.80
+    # Beyond this range stereo noise (~z^2) and monocular scale errors make
+    # dimensions meaningless; objects are shown but not measured.
+    max_measuring_range_m: float = 2.5
+    # No single waste item has a footprint side longer than this.
+    max_object_footprint_m: float = 1.5
     roi: tuple[float, float, float, float] = (0.05, 0.05, 0.90, 0.90)
     auto_count: bool = True
     tracker_confirm_frames: int = 2
@@ -770,6 +775,8 @@ class AppConfig:
                 defaults.geometry_validation_min_object_height_m,
             )),
             max_object_height_m=float(os.environ.get("LOCALLIFE_MAX_HEIGHT_M", defaults.max_object_height_m)),
+            max_measuring_range_m=float(os.environ.get("LOCALLIFE_MAX_MEASURING_RANGE_M", defaults.max_measuring_range_m)),
+            max_object_footprint_m=float(os.environ.get("LOCALLIFE_MAX_OBJECT_FOOTPRINT_M", defaults.max_object_footprint_m)),
             roi=roi,
             auto_count=_bool_env("LOCALLIFE_AUTO_COUNT", True),
             tracker_confirm_frames=int(os.environ.get("LOCALLIFE_TRACK_CONFIRM", defaults.tracker_confirm_frames)),
