@@ -515,6 +515,10 @@ class VisionPipeline:
         self.camera_id = camera_id
         self.inference_lock = inference_lock or threading.RLock()
         self.detector = detector or create_segmenter(config)
+        if depth_estimator is None and config.enable_monocular_depth:
+            from .optional_imports import disable_broken_torchaudio
+
+            disable_broken_torchaudio()
         self.depth_estimator = (
             depth_estimator
             if depth_estimator is not None

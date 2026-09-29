@@ -504,7 +504,7 @@ class ProtectedSurfacesTests(unittest.TestCase):
             "LocalLife_Plug_and_Play_Local/locallife_cloud/logitech.py",
             "LocalLife_Plug_and_Play_Local/locallife_cloud/material.py",
             "LocalLife_Plug_and_Play_Local/locallife_cloud/sorting_rules.py",
-            "Start-LocalLife-Demo.ps1",
+            # Start-LocalLife-Demo.ps1: released in v41 for the supervised cloud tunnel (Window 2).
         ]
         result = subprocess.run(
             ["git", "diff", "--name-only", SOURCE_SHA, "--", *protected],

@@ -51,6 +51,10 @@ class TransformersDepthProvider:
 
     def load(self) -> None:
         import torch
+
+        from .optional_imports import disable_broken_torchaudio
+
+        disable_broken_torchaudio()
         from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 
         device = self.device

@@ -153,6 +153,7 @@ class ServerAttributionTests(unittest.TestCase):
                 self.assertTrue(duplicate.get_json()["duplicate"])
                 summary = client.get("/api/telemetry").get_json()
                 self.assertEqual(summary["processing_mode"], expected)
+                self.assertEqual(summary["models"]["logitech_depth"], "OFF")   # depth disabled in this config
                 self.assertEqual(summary["all"]["reliability"]["completed"], 1)
                 self.assertEqual(summary["all"]["reliability"]["duplicates_ignored"], 1)
                 csv_text = client.get("/api/telemetry.csv").get_data(as_text=True)

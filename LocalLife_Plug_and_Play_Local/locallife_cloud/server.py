@@ -279,7 +279,16 @@ def create_app(
     @app.get("/api/telemetry")
     def telemetry_summary() -> Any:
         """Rolling-window transport metrics, per camera and overall."""
-        return jsonify(telemetry.summary(_window()))
+        summary = telemetry.summary(_window())
+        webcam = manager.camera("logitech")
+        depth_on = webcam.depth_estimator is not None
+        summary["models"] = {
+            "detector": settings.detector_model,
+            "logitech_depth": "ON" if depth_on else "OFF",
+            "logitech_depth_model": settings.depth_model if depth_on else None,
+            "logitech_depth_error": getattr(webcam, "depth_load_error", None),
+        }
+        return jsonify(summary)
 
     @app.get("/api/telemetry.csv")
     def telemetry_csv() -> Any:

@@ -159,6 +159,11 @@ class DualCameraCoordinator:
         shared_detector = detector if detector is not None else create_segmenter(config)
         shared_depth = depth_estimator
         if shared_depth is None and config.enable_monocular_depth:
+            # Before transformers is imported: a torchaudio whose compiled
+            # library does not load must not switch image depth off.
+            from .optional_imports import disable_broken_torchaudio
+
+            disable_broken_torchaudio()
             shared_depth = MetricDepthEstimator(config, getattr(shared_detector, "device", None))
         hardware = replace(config, results_dir=config.results_dir / "realsense", enable_monocular_depth=False)
         webcam = replace(config, results_dir=config.results_dir / "logitech",

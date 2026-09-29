@@ -205,7 +205,7 @@ class ProtectedFilesTests(unittest.TestCase):
             "LocalLife_Plug_and_Play_Local/locallife_cloud/heightmap_volume.py",
             "LocalLife_Plug_and_Play_Local/locallife_cloud/cloud_ssh.py",
             "LocalLife_Plug_and_Play_Local/locallife_cloud/cloud_startup.py",
-            "Start-LocalLife-Demo.ps1",
+            # Start-LocalLife-Demo.ps1: released in v41 for the supervised cloud tunnel (Window 2).
             "gpu.py",
         ]
         result = subprocess.run(["git", "diff", "--name-only", START_SHA, "--", *protected],

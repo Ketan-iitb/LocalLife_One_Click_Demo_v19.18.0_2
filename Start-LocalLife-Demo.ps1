@@ -1699,32 +1699,357 @@ function Wait-ForCloudZoneFile {
 # laptop<->Pi (SSH login only, no camera traffic), laptop<->cloud (this
 # window, dashboard viewing only), Pi<->cloud (camera traffic, direct).
 # --------------------------------------------------------------------- #
+function Join-ProcessArguments {
+    # Windows command-line quoting for Start-Process (PowerShell 5.1 joins an
+    # argument array with bare spaces, which splits any path with a space).
+    param([string[]]$Arguments)
+    return (($Arguments | ForEach-Object {
+        if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
+    }) -join ' ')
+}
+
+function Stop-ProcessTree {
+    param([int]$ProcessId)
+    if ($ProcessId -le 0) { return }
+    try { & taskkill.exe '/PID' $ProcessId '/T' '/F' 2>$null | Out-Null } catch { }
+    try { Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue } catch { }
+}
+
+function Invoke-BoundedProcess {
+    <#
+        Run a native command with a hard timeout; output is captured to files
+        so nothing blocks or floods the console. Returns exit code, stdout,
+        stderr and whether it timed out.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [string[]]$Arguments = @(),
+        [int]$TimeoutSeconds = 60
+    )
+    $out = Join-Path $script:SessionDirectory ('bounded-' + [guid]::NewGuid().ToString('N') + '.out')
+    $err = $out -replace '\.out$', '.err'
+    $process = Start-Process -FilePath $FilePath -ArgumentList (Join-ProcessArguments $Arguments) `
+        -NoNewWindow -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+    $null = $process.Handle   # PowerShell 5.1: cache the handle so ExitCode is readable later
+    $timedOut = -not $process.WaitForExit($TimeoutSeconds * 1000)
+    if ($timedOut) { Stop-ProcessTree -ProcessId $process.Id }
+    $stdout = ''; $stderr = ''
+    if (Test-Path -LiteralPath $out) { $stdout = (Get-Content -LiteralPath $out -Raw -ErrorAction SilentlyContinue) + ''; Remove-Item -LiteralPath $out -ErrorAction SilentlyContinue }
+    if (Test-Path -LiteralPath $err) { $stderr = (Get-Content -LiteralPath $err -Raw -ErrorAction SilentlyContinue) + ''; Remove-Item -LiteralPath $err -ErrorAction SilentlyContinue }
+    $code = if ($timedOut) { -1 } else { $process.ExitCode }
+    return @{ exit = $code; stdout = $stdout; stderr = $stderr; timed_out = $timedOut }
+}
+
+function Get-RemoteAppProbe {
+    <#
+        Boundary A, checked ON THE VM over authenticated gcloud SSH: is the
+        application process alive, is anything listening on 127.0.0.1:$Port,
+        and does GET /health answer 200 there. Base64-wrapped so no quoting or
+        percent sign ever passes through cmd.exe.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Zone)
+    $probe = @(
+        ('P=' + $Port),
+        'if command -v curl >/dev/null 2>&1; then code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "http://127.0.0.1:$P/health" 2>/dev/null); else code=$(python3 -c "import urllib.request,sys; print(urllib.request.urlopen(sys.argv[1], timeout=3).status)" "http://127.0.0.1:$P/health" 2>/dev/null); fi',
+        '[ -n "$code" ] || code=000',
+        'listen=$(ss -ltnH 2>/dev/null | awk -v p=":$P" ''$4 ~ p"$" {print $4; exit}'')',
+        'pid=$(pgrep -f "[l]ocallife_cloud.server" | head -1)',
+        'echo "LOCALLIFE_PROBE http=$code listen=${listen:-none} pid=${pid:-none}"'
+    ) -join "`n"
+    $payload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($probe))
+    $result = Invoke-BoundedProcess -FilePath (Assert-GcloudAvailable) -TimeoutSeconds 60 -Arguments @(
+        'compute', 'ssh', $VmName, ('--project=' + $CloudProject), ('--zone=' + $Zone), '--quiet',
+        ('--command=echo ' + $payload + ' | base64 -d | bash'))
+    return (ConvertFrom-RemoteAppProbe -Output $result.stdout -Result $result)
+}
+
+function ConvertFrom-RemoteAppProbe {
+    param([string]$Output, $Result)
+    $line = ($Output -split "`r?`n" | Where-Object { $_ -match '^LOCALLIFE_PROBE ' } | Select-Object -Last 1)
+    if (-not $line) {
+        $why = if ($null -ne $Result -and $Result.timed_out) { 'the SSH probe timed out after 60 s' }
+               elseif ($null -ne $Result) { 'the SSH probe failed: ' + ((($Result.stderr + '') -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 1) + '') }
+               else { 'no probe output' }
+        return @{ ready = $false; stage = 'probing_vm'; http = $null; listen = $null; pid = $null; message = $why }
+    }
+    $fields = @{}
+    foreach ($pair in ($line -replace '^LOCALLIFE_PROBE ', '' -split ' ')) {
+        $key, $value = $pair -split '=', 2
+        $fields[$key] = $value
+    }
+    $http = $fields['http']; $listen = $fields['listen']; $appPid = $fields['pid']
+    if ($http -eq '200') {
+        return @{ ready = $true; stage = 'vm_app_ready'; http = $http; listen = $listen; pid = $appPid; message = ('VM app answers HTTP 200 on ' + $listen) }
+    }
+    if ($appPid -eq 'none') {
+        $message = 'the application is not running on the VM yet (Window 1 is still installing or starting it)'
+        $stage = 'vm_app_not_running'
+    }
+    elseif ($listen -eq 'none') {
+        $message = 'the application (pid ' + $appPid + ') is running but not listening on 127.0.0.1:' + $Port + ' yet (models loading)'
+        $stage = 'vm_app_loading'
+    }
+    else {
+        $message = 'the application listens on ' + $listen + ' but /health returned HTTP ' + $http
+        $stage = 'vm_app_unhealthy'
+    }
+    return @{ ready = $false; stage = $stage; http = $http; listen = $listen; pid = $appPid; message = $message }
+}
+
+function Test-LocalPortListening {
+    param([int]$LocalPort)
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $task = $client.ConnectAsync('127.0.0.1', $LocalPort)
+        return ($task.Wait(700) -and $client.Connected)
+    }
+    catch { return $false }
+    finally { $client.Dispose() }
+}
+
+function Get-LocalPortOwner {
+    param([int]$LocalPort)
+    try {
+        $connection = Get-NetTCPConnection -State Listen -LocalPort $LocalPort -ErrorAction Stop | Select-Object -First 1
+        $process = Get-Process -Id $connection.OwningProcess -ErrorAction Stop
+        return @{ pid = [int]$process.Id; name = [string]$process.ProcessName }
+    }
+    catch { return $null }
+}
+
+function Get-LocalDashboardStatus {
+    <#
+        Boundary B: does http://127.0.0.1:$Port on THIS laptop reach the VM's
+        app, and which processing mode does that app report for itself.
+    #>
+    param([int]$LocalPort)
+    $base = 'http://127.0.0.1:' + $LocalPort
+    try {
+        $health = Invoke-WebRequest -Uri ($base + '/health') -UseBasicParsing -TimeoutSec 4
+        if ($health.StatusCode -ne 200) { return @{ ok = $false; mode = $null; gpu = $null; error = ('HTTP ' + $health.StatusCode) } }
+    }
+    catch { return @{ ok = $false; mode = $null; gpu = $null; error = $_.Exception.Message } }
+    $mode = $null; $gpu = $null; $depth = $null
+    try {
+        $telemetry = (Invoke-WebRequest -Uri ($base + '/api/telemetry') -UseBasicParsing -TimeoutSec 4).Content | ConvertFrom-Json
+        $mode = [string]$telemetry.processing_mode
+        if ($null -ne $telemetry.gpu -and $telemetry.gpu.available) { $gpu = [string]$telemetry.gpu.name }
+        if ($telemetry.PSObject.Properties.Name -contains 'models' -and $null -ne $telemetry.models) {
+            $depth = [string]$telemetry.models.logitech_depth
+            if ($depth -eq 'OFF' -and $telemetry.models.logitech_depth_error) { $depth = 'OFF (' + $telemetry.models.logitech_depth_error + ')' }
+        }
+    }
+    catch { }
+    return @{ ok = $true; mode = $mode; gpu = $gpu; depth = $depth; error = $null }
+}
+
+function Get-CurrentCloudZone {
+    $zoneFile = Join-Path $script:SessionDirectory 'cloud-zone.txt'
+    if (Test-Path -LiteralPath $zoneFile) { return ((Get-Content -LiteralPath $zoneFile -Raw) + '').Trim() }
+    return ''
+}
+
+function Start-CloudTunnelProcess {
+    <#
+        Forward 127.0.0.1:$Port here to 127.0.0.1:$Port on the VM, as a child
+        process whose stderr goes to a log file (so refused-channel noise never
+        floods the window) and which is supervised below. Never the PuTTY GUI:
+        OpenSSH when the host key is pinned, otherwise gcloud with --command,
+        which on Windows runs console plink with the host key gcloud already
+        accepted for the authenticated probe; -batch makes plink fail instead of
+        waiting on a hidden prompt.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Zone)
+    $log = Join-Path $script:SessionDirectory 'cloud-tunnel-stderr.txt'
+    $outLog = Join-Path $script:SessionDirectory 'cloud-tunnel-stdout.txt'
+    $forward = '127.0.0.1:' + $Port + ':127.0.0.1:' + $Port
+    if (-not $script:CloudSshInteractive -and -not [string]::IsNullOrWhiteSpace($script:CloudSshHost)) {
+        $target = (Resolve-CloudSshUser -HostAddress $script:CloudSshHost) + '@' + $script:CloudSshHost
+        $arguments = (Get-CloudSshOptions) + @('-o', 'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=15',
+            '-o', 'ServerAliveCountMax=3', '-N', '-L', $forward, $target)
+        $file = 'ssh'
+        $via = 'OpenSSH (pinned host key)'
+    }
+    else {
+        $arguments = @('compute', 'ssh', $VmName, ('--project=' + $CloudProject), ('--zone=' + $Zone), '--quiet',
+            '--ssh-flag=-batch', '--ssh-flag=-L', ('--ssh-flag=' + $forward),
+            '--command=echo LOCALLIFE_TUNNEL_UP; exec sleep 2147483647')
+        $file = Assert-GcloudAvailable
+        $via = 'gcloud compute ssh (authenticated)'
+    }
+    $process = Start-Process -FilePath $file -ArgumentList (Join-ProcessArguments $arguments) -NoNewWindow -PassThru `
+        -RedirectStandardError $log -RedirectStandardOutput $outLog
+    return @{ process = $process; pid = $process.Id; via = $via; log = $log }
+}
+
+function Test-TunnelProcessAlive {
+    param($Tunnel)
+    return ($null -ne $Tunnel -and $null -ne $Tunnel.process -and -not $Tunnel.process.HasExited)
+}
+
+function Get-TunnelLogTail {
+    param($Tunnel)
+    if ($null -eq $Tunnel -or -not (Test-Path -LiteralPath $Tunnel.log)) { return '' }
+    $lines = @(Get-Content -LiteralPath $Tunnel.log -ErrorAction SilentlyContinue | Where-Object { $_.Trim() })
+    $refused = @($lines | Where-Object { $_ -match 'open failed' }).Count
+    $other = @($lines | Where-Object { $_ -notmatch 'open failed' } | Select-Object -Last 3)
+    $text = ($other -join ' | ')
+    if ($refused -gt 0) { $text = ($refused.ToString() + ' forwarded connection(s) refused by the VM; ' + $text) }
+    return $text
+}
+
+function Resolve-LocalPortConflict {
+    <#
+        Boundary D: something already listening on 127.0.0.1:$Port. A leftover
+        tunnel from an earlier run is stopped; a local Local Life server is
+        refused, because the browser would then show LOCAL results in a window
+        that says cloud.
+    #>
+    param([int]$LocalPort)
+    if (-not (Test-LocalPortListening -LocalPort $LocalPort)) { return 'free' }
+    $owner = Get-LocalPortOwner -LocalPort $LocalPort
+    if ($null -ne $owner -and $owner.name -match '^(ssh|plink|putty|gcloud)$') {
+        Write-Step ('Port ' + $LocalPort + ' is held by a stale tunnel from an earlier run (' + $owner.name + ' pid ' + $owner.pid + '); stopping it.')
+        Stop-ProcessTree -ProcessId $owner.pid
+        Start-Sleep -Seconds 1
+        return 'stale-stopped'
+    }
+    $status = Get-LocalDashboardStatus -LocalPort $LocalPort
+    if ($status.ok -and $status.mode -eq 'cloud') { return 'already-cloud' }
+    $who = if ($null -ne $owner) { $owner.name + ' pid ' + $owner.pid } else { 'an unknown process (run: netstat -ano | findstr :' + $LocalPort + ')' }
+    if ($status.ok -and $status.mode -eq 'local') {
+        throw ('Port ' + $LocalPort + ' is already used by a LOCAL Local Life server (' + $who + '). Stop it with STOP_LOCAL_LIFE_DEMO.cmd first; ' +
+               'otherwise the browser would show local results as if they came from the cloud.')
+    }
+    throw ('Port ' + $LocalPort + ' on this laptop is already in use by ' + $who + '. Close it, then start cloud mode again.')
+}
+
+function Invoke-CloudTunnelSupervisor {
+    <#
+        Boundaries C and E: follow the zone Window 1 records, wait until the VM
+        app answers HTTP, then forward, verify end to end through
+        http://127.0.0.1:$Port, and keep verifying. Every wait is bounded and
+        every failure names its stage. Recovers by itself when the app comes up
+        later than the tunnel or the tunnel drops.
+    #>
+    param(
+        [int]$ReadyTimeoutMinutes = 40,
+        [int]$PollSeconds = 10,
+        [int]$MaxConsecutiveTunnelFailures = 8,
+        [int]$MaxCycles = [int]::MaxValue
+    )
+    $localUrl = 'http://127.0.0.1:' + $Port + '/'
+    $zone = Get-CurrentCloudZone
+    $tunnel = $null
+    $announced = $false
+    $failures = 0
+    $healthMisses = 0
+    $lastMessage = ''
+    $waitStarted = Get-Date
+    for ($cycle = 1; $cycle -le $MaxCycles; $cycle++) {
+        $stage = Get-CloudStage
+        if ($null -ne $stage -and $stage.status -eq 'failed') {
+            if (Test-TunnelProcessAlive $tunnel) { Stop-ProcessTree -ProcessId $tunnel.pid }
+            throw ('Window 1 failed at stage "' + $stage.stage + '": ' + $stage.error_message)
+        }
+        $currentZone = Get-CurrentCloudZone
+        if (-not [string]::IsNullOrWhiteSpace($currentZone) -and $currentZone -ne $zone) {
+            Write-Step ('The VM is now in zone ' + $currentZone + ' (was ' + $zone + '); reconnecting.')
+            if (Test-TunnelProcessAlive $tunnel) { Stop-ProcessTree -ProcessId $tunnel.pid }
+            $tunnel = $null; $announced = $false
+            $zone = $currentZone
+            Assert-CloudSshIdentity -PythonExe (Assert-PythonAvailable) -Zone $zone | Out-Null
+        }
+
+        if (Test-TunnelProcessAlive $tunnel) {
+            $status = Get-LocalDashboardStatus -LocalPort $Port
+            if ($status.ok) {
+                $healthMisses = 0; $failures = 0
+                if (-not $announced) {
+                    $modeText = if ($status.mode) { $status.mode.ToUpper() } else { 'UNKNOWN (backend has no /api/telemetry)' }
+                    $gpuText = if ($status.gpu) { $status.gpu } else { 'not reported' }
+                    Write-Step ('DASHBOARD READY: ' + $localUrl + '  ->  ' + $VmName + ' (' + $zone + ') 127.0.0.1:' + $Port +
+                                ' via ' + $tunnel.via + '; processing mode ' + $modeText + '; GPU ' + $gpuText +
+                                '; Logitech depth ' + $(if ($status.depth) { $status.depth } else { 'not reported' }))
+                    if ($status.mode -and $status.mode -ne 'cloud') {
+                        Write-Host ('WARNING: the backend reports processing mode ' + $status.mode.ToUpper() + ', not CLOUD.') -ForegroundColor Red
+                    }
+                    Write-Host 'Keep this window open; it re-checks the tunnel every few seconds.' -ForegroundColor Yellow
+                    $announced = $true
+                }
+            }
+            else {
+                $healthMisses++
+                if ($healthMisses -ge 3) {
+                    Write-Step ('Tunnel up but ' + $localUrl + ' is not answering (' + $status.error + '). ' + (Get-TunnelLogTail $tunnel) + ' Restarting the tunnel.')
+                    Stop-ProcessTree -ProcessId $tunnel.pid
+                    $tunnel = $null; $announced = $false; $healthMisses = 0
+                }
+            }
+            Start-Sleep -Seconds $PollSeconds
+            continue
+        }
+
+        if ($null -ne $tunnel) {
+            $failures++
+            Write-Step ('Tunnel process exited (stage: local_forward). ' + (Get-TunnelLogTail $tunnel))
+            $tunnel = $null; $announced = $false
+            if ($failures -ge $MaxConsecutiveTunnelFailures) {
+                throw ('The tunnel failed ' + $failures + ' times in a row at stage local_forward. Last error: ' +
+                       (Get-Content -LiteralPath (Join-Path $script:SessionDirectory 'cloud-tunnel-stderr.txt') -ErrorAction SilentlyContinue | Select-Object -Last 1) +
+                       '. Check: gcloud compute ssh ' + $VmName + ' --zone=' + $zone)
+            }
+            Start-Sleep -Seconds ([math]::Min(60, 5 * [math]::Pow(2, $failures - 1)))
+        }
+
+        $probe = Get-RemoteAppProbe -Zone $zone
+        if (-not $probe.ready) {
+            if (((Get-Date) - $waitStarted).TotalMinutes -ge $ReadyTimeoutMinutes) {
+                throw ('The VM application never became HTTP-ready within ' + $ReadyTimeoutMinutes + ' min (stage ' + $probe.stage + '): ' + $probe.message)
+            }
+            if ($probe.message -ne $lastMessage) {
+                Write-Step ('Waiting for the VM app before forwarding (stage ' + $probe.stage + '): ' + $probe.message)
+                $lastMessage = $probe.message
+            }
+            Start-Sleep -Seconds $PollSeconds
+            continue
+        }
+        Write-Step ('VM check passed: ' + $probe.message + ' (app pid ' + $probe.pid + ').')
+        $portState = Resolve-LocalPortConflict -LocalPort $Port
+        if ($portState -eq 'already-cloud') {
+            Write-Step ('An existing tunnel on ' + $localUrl + ' already reaches the cloud app; reusing it and monitoring.')
+            while ((Get-LocalDashboardStatus -LocalPort $Port).ok) { Start-Sleep -Seconds $PollSeconds }
+            Write-Step 'That existing tunnel stopped answering; starting a new one.'
+            continue
+        }
+        $tunnel = Start-CloudTunnelProcess -Zone $zone
+        Write-Step ('Forwarding ' + $localUrl + ' -> ' + $VmName + ' (' + $zone + ') 127.0.0.1:' + $Port + ' via ' + $tunnel.via + ' (pid ' + $tunnel.pid + ')')
+        $verifyUntil = (Get-Date).AddSeconds(45)
+        while ((Get-Date) -lt $verifyUntil -and (Test-TunnelProcessAlive $tunnel)) {
+            if ((Get-LocalDashboardStatus -LocalPort $Port).ok) { break }
+            Start-Sleep -Seconds 2
+        }
+    }
+}
+
 function Start-CloudTunnelRole {
     $Host.UI.RawUI.WindowTitle = 'LOCAL LIFE 2 OF 3 - SECURE TUNNEL - KEEP OPEN'
     Write-Banner 'WINDOW 2 OF 3: SECURE LAPTOP-TO-CLOUD TUNNEL (DASHBOARD VIEWING ONLY)'
     Write-Host 'This window only lets your browser see the dashboard -- camera frames go' -ForegroundColor Yellow
     Write-Host 'straight from the Raspberry Pi to the cloud VM, not through here.' -ForegroundColor Yellow
-    Write-Host 'A quiet or blank window after connection is normal.' -ForegroundColor Yellow
+    Write-Host 'It waits until the VM application answers HTTP, then forwards and keeps checking.' -ForegroundColor Yellow
     Write-Host 'Keep this window open for the entire demonstration.' -ForegroundColor Yellow
 
     $zone = Wait-ForCloudZoneFile
-    Write-Step ('Tunneling to depth-l4 in ' + $zone)
+    Write-Step ('Tunneling to ' + $VmName + ' in ' + $zone + '; local dashboard will be http://127.0.0.1:' + $Port + '/')
     $stage = Get-CloudStage
     if ($null -ne $stage -and -not [string]::IsNullOrWhiteSpace($stage.stage)) {
         Write-Step ('Window 1 stage: ' + $stage.stage + ' (' + $stage.status + ')')
     }
-
     # This window is its own process, so it establishes the VM's identity for
-    # itself rather than trusting a variable Window 1 set. Window 1 has already
-    # pinned the same keys, so this is a fast re-verify that reports "unchanged"
-    # -- and if it ever does NOT match, this window stops instead of tunnelling
-    # to a host that is not the VM.
+    # itself rather than trusting a variable Window 1 set.
     Assert-CloudSshIdentity -PythonExe (Assert-PythonAvailable) -Zone $zone | Out-Null
-    $forward = '127.0.0.1:' + $Port + ':127.0.0.1:' + $Port
-    Invoke-VerifiedCloudSsh -Command '' -ExtraOptions @('-N', '-L', $forward)
-    if ($LASTEXITCODE -ne 0) {
-        throw 'The secure SSH tunnel stopped. Check cloud login and whether the laptop port is already occupied.'
-    }
+    Invoke-CloudTunnelSupervisor
 }
 
 # --------------------------------------------------------------------- #

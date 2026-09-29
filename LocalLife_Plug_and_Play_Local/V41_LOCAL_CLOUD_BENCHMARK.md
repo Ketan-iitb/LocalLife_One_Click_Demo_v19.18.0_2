@@ -49,3 +49,23 @@ python scripts\benchmark_local_cloud.py run --frames phase1_frames --expect-mode
 python scripts\benchmark_local_cloud.py compare artifacts\benchmark\<local_run> artifacts\benchmark\<cloud_run> --out artifacts\benchmark
 ```
 Outputs: `frames.csv` + `run_summary.json` per run; `local_vs_cloud_summary.csv/.md` for the thesis.
+
+## Cloud Window 2 (dashboard tunnel) and cloud Logitech depth
+
+Window 2 now: waits for Window 1's zone → checks the VM app over authenticated gcloud SSH
+(`LOCALLIFE_PROBE http=.. listen=.. pid=..`) and forwards only once `GET /health` is 200 on the VM →
+frees a stale ssh/plink tunnel on 127.0.0.1:8000 (refuses a LOCAL server there) → forwards with OpenSSH
+(pinned key) or console gcloud/plink (never the PuTTY GUI) → prints `DASHBOARD READY` only after HTTP
+through the laptop port answers, with zone, processing mode, GPU and Logitech depth state → re-checks
+every 10 s, reconnects on drop or zone change, and stops with a named stage after 8 failed restarts.
+Forwarding errors go to `%LOCALAPPDATA%\LocalLifeDemo\cloud-tunnel-stderr.txt`, not the console.
+
+Cloud depth: a torchaudio whose `_torchaudio.abi3.so` fails to load is disabled for the process before
+transformers is imported (Depth Anything V2 is image-only); a working or absent torchaudio is untouched.
+
+Manual checks (Windows, repository root):
+```
+gcloud compute ssh depth-l4 --zone=ZONE --command="curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/health; ss -ltn | grep :8000; pip3 show torch torchaudio transformers | grep -E 'Name|Version'"
+curl.exe -s http://127.0.0.1:8000/api/telemetry        (processing_mode, gpu, models.logitech_depth)
+netstat -ano | findstr :8000                           (who holds the laptop port)
+```
