@@ -14,9 +14,15 @@ between two constant flags, and it runs without a shell.
 
 from __future__ import annotations
 
+import json
+import os
+import re
 import shutil
 import socket
 import subprocess
+import sys
+import urllib.error
+import urllib.request
 import threading
 import time
 from dataclasses import dataclass, field
@@ -95,6 +101,35 @@ def _split_pi_host(pi_host: str) -> tuple[str, int]:
     return host, 22
 
 
+METRIC_MODES = ("local", "cloud")
+
+
+def fetch_backend_telemetry(port: int, window_s: float, timeout: float = 2.0) -> dict[str, Any]:
+    """The running backend's /api/telemetry; raises OSError/ValueError when unavailable."""
+    url = f"http://127.0.0.1:{port}/api/telemetry?window_s={window_s:g}"
+    with urllib.request.urlopen(url, timeout=timeout) as response:  # noqa: S310 - fixed localhost URL
+        return json.loads(response.read().decode("utf-8"))
+
+
+def cost_estimate(started_at: float | None, now: float | None = None) -> dict[str, Any]:
+    """A labelled estimate from an operator-supplied hourly rate, never a live bill."""
+    rate = os.environ.get("LOCALLIFE_CLOUD_COST_PER_HOUR", "").strip()
+    currency = os.environ.get("LOCALLIFE_COST_CURRENCY", "kr").strip() or "kr"
+    note = ("Estimate only: hours since this cloud launch x the rate in LOCALLIFE_CLOUD_COST_PER_HOUR. "
+            "Excludes the stopped-VM disk (gpu.py: about 7 kr/day), images, bucket and network egress; "
+            "the GCP billing console is authoritative.")
+    try:
+        hourly = float(rate) if rate else None
+    except ValueError:
+        hourly = None
+    if hourly is None or started_at is None:
+        return {"estimate": None, "currency": currency, "rate_per_hour": hourly,
+                "note": "N/A: set LOCALLIFE_CLOUD_COST_PER_HOUR to show an estimate. " + note}
+    hours = max(0.0, ((now or time.time()) - started_at) / 3600.0)
+    return {"estimate": round(hours * hourly, 2), "currency": currency, "rate_per_hour": hourly,
+            "hours": round(hours, 3), "note": note}
+
+
 class LaunchController:
     """Readiness probes and the local/cloud/auto start sequence.
 
@@ -114,6 +149,15 @@ class LaunchController:
         self.state = LaunchState()
         self._lock = threading.Lock()
         self._runner = runner or self._run_launcher
+        # Last telemetry seen from each mode's backend, so switching modes keeps
+        # the other mode's numbers on screen (clearly marked as not live).
+        self.metric_snapshots: dict[str, dict[str, Any]] = {}
+        for mode in METRIC_MODES:
+            try:
+                self.metric_snapshots[mode] = json.loads(
+                    (self._telemetry_dir() / f"last_{mode}.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                pass
         # Structured cloud startup state, so the welcome page shows which stage
         # is running and where it stopped instead of an unexplained spinner.
         # Served from here, the local control service, so it stays visible
@@ -342,6 +386,89 @@ class LaunchController:
         self.state.dashboard_url = f"http://127.0.0.1:{self.config.port}/"
         self._note(f"{mode.capitalize()} pipeline running")
 
+    # ------------------------------------------------------------- metrics
+    def _telemetry_dir(self) -> Path:
+        return Path(self.config.results_dir) / "telemetry"
+
+    def metrics(self, window_s: float = 60.0,
+                fetch: Callable[[int, float], dict[str, Any]] | None = None) -> dict[str, Any]:
+        """Live metrics from the running backend plus the last snapshot of the other mode.
+
+        The mode of a snapshot is the one the *backend* reports for itself,
+        never the one that was requested, so a local run can never be filed
+        under cloud.
+        """
+        backend: dict[str, Any] = {"reachable": False, "processing_mode": None, "error": None,
+                                   "port": self.config.port}
+        try:
+            summary = (fetch or fetch_backend_telemetry)(self.config.port, window_s)
+            mode = str(summary.get("processing_mode") or "")
+            backend.update(reachable=True, processing_mode=mode)
+            if mode in METRIC_MODES:
+                snapshot = {"fetched_at": time.time(), "summary": summary}
+                self.metric_snapshots[mode] = snapshot
+                try:
+                    self._telemetry_dir().mkdir(parents=True, exist_ok=True)
+                    (self._telemetry_dir() / f"last_{mode}.json").write_text(json.dumps(snapshot), encoding="utf-8")
+                except OSError:
+                    pass
+        except (OSError, ValueError) as exc:
+            backend["error"] = f"backend telemetry unavailable: {exc}"
+        launched = self.state.mode
+        mismatch = bool(backend["reachable"] and launched and backend["processing_mode"] != launched)
+        modes = {}
+        for mode in METRIC_MODES:
+            snapshot = self.metric_snapshots.get(mode)
+            modes[mode] = None if snapshot is None else {
+                **snapshot, "live": backend["reachable"] and backend["processing_mode"] == mode,
+                "age_s": round(time.time() - snapshot["fetched_at"], 1),
+            }
+        return {
+            "window_s": window_s, "backend": backend, "modes": modes,
+            "launched_mode": launched, "fallback_used": self.state.fallback_used,
+            "mode_mismatch": mismatch,
+            "benchmarks": self.latest_benchmarks(),
+            "cost": cost_estimate(self.state.started_at if launched == "cloud" else None),
+        }
+
+    def latest_benchmarks(self) -> dict[str, Any]:
+        """Newest replay-benchmark summary per mode from results/benchmark/*/run_summary.json."""
+        newest: dict[str, Any] = {}
+        root = Path(self.config.results_dir) / "benchmark"
+        for path in sorted(root.glob("*/run_summary.json")) if root.is_dir() else []:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            mode = data.get("metadata", {}).get("server_processing_mode")
+            if mode in METRIC_MODES:
+                newest[mode] = {**data, "path": str(path)}
+        return newest
+
+    def gpu_script(self) -> Path | None:
+        try:
+            root = self.resolve_launcher_script().parent
+        except FileNotFoundError:
+            root = Path(__file__).resolve().parent.parent.parent
+        for candidate in (root / "gpu.py", root.parent / "gpu.py", root / "app" / "gpu.py"):
+            if candidate.is_file():
+                return candidate
+        return None
+
+    def vm_status(self) -> dict[str, Any]:
+        """`python gpu.py status` (read-only, no charges); the zone is parsed, never assumed."""
+        script = self.gpu_script()
+        if script is None:
+            return {"ok": False, "error": "gpu.py not found next to the launcher"}
+        try:
+            completed = self._runner([sys.executable, str(script), "status"], 60.0)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {"ok": False, "error": f"gpu.py status failed: {exc}"}
+        output = (completed.stdout or "") + (completed.stderr or "")
+        match = re.search(r"^\S+: (\w+) in ([a-z0-9-]+)", output, re.MULTILINE)
+        return {"ok": completed.returncode == 0, "output": output.strip()[-2000:],
+                "vm_state": match.group(1) if match else None, "zone": match.group(2) if match else None}
+
     def cancel(self) -> dict[str, Any]:
         with self._lock:
             if self.state.phase == "running":
@@ -429,6 +556,18 @@ def create_launcher_app(
             return jsonify(ok=True, launch=control.start(mode))
         except ValueError as exc:
             return jsonify(error=str(exc)), 400
+
+    @app.get("/api/launcher/metrics")
+    def metrics() -> Any:
+        try:
+            window = min(3600.0, max(5.0, float(request.args.get("window_s", 60))))
+        except ValueError:
+            window = 60.0
+        return jsonify(control.metrics(window))
+
+    @app.post("/api/launcher/vm-status")
+    def vm_status() -> Any:
+        return jsonify(control.vm_status())
 
     @app.post("/api/launcher/cancel")
     def cancel() -> Any:

@@ -338,6 +338,21 @@ def iter_video(
         capture.release()
 
 
+def encode_frame(frame: CapturedFrame, jpeg_quality: int = 88) -> tuple[bytes, bytes | None]:
+    """The exact bytes uploaded: JPEG colour and, when present, compressed depth."""
+    import cv2
+
+    success, encoded = cv2.imencode(".jpg", frame.image, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality])
+    if not success:
+        raise RuntimeError("Could not JPEG-encode the camera frame")
+    depth_bytes = None
+    if frame.depth_m is not None:
+        compressed = io.BytesIO()
+        np.savez_compressed(compressed, depth_m=frame.depth_m.astype(np.float32))
+        depth_bytes = compressed.getvalue()
+    return encoded.tobytes(), depth_bytes
+
+
 def send_frame(
     session: requests.Session,
     endpoint: str,
@@ -345,20 +360,16 @@ def send_frame(
     *,
     jpeg_quality: int = 88,
     timeout_seconds: float = 90.0,
+    extra_metadata: dict[str, Any] | None = None,
+    encoded: tuple[bytes, bytes | None] | None = None,
 ) -> dict[str, Any]:
-    import cv2
-
-    success, encoded = cv2.imencode(".jpg", frame.image, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality])
-    if not success:
-        raise RuntimeError("Could not JPEG-encode the camera frame")
-
+    image_bytes, depth_bytes = encoded or encode_frame(frame, jpeg_quality)
     metadata = {"source": frame.source, "timestamp": time.time(), "intrinsics": frame.intrinsics,
-                "camera_id": frame.camera_id, "intrinsics_origin": frame.intrinsics_origin}
-    files: dict[str, Any] = {"image": ("frame.jpg", encoded.tobytes(), "image/jpeg")}
-    if frame.depth_m is not None:
-        compressed = io.BytesIO()
-        np.savez_compressed(compressed, depth_m=frame.depth_m.astype(np.float32))
-        files["depth"] = ("depth.npz", compressed.getvalue(), "application/octet-stream")
+                "camera_id": frame.camera_id, "intrinsics_origin": frame.intrinsics_origin,
+                **(extra_metadata or {})}
+    files: dict[str, Any] = {"image": ("frame.jpg", image_bytes, "image/jpeg")}
+    if depth_bytes is not None:
+        files["depth"] = ("depth.npz", depth_bytes, "application/octet-stream")
 
     response = session.post(
         endpoint.rstrip("/") + "/api/ingest",
@@ -368,6 +379,64 @@ def send_frame(
     )
     response.raise_for_status()
     return response.json()
+
+
+class EdgeStreamState:
+    """Per-camera frame numbering and transport counters for telemetry.
+
+    `frame_id` is unique per run and camera; `seq` increments on every send
+    attempt, so frames the server never received show up as sequence gaps.
+    The upload round trip is measured on this device's monotonic clock and
+    reported with the next frame.
+    """
+
+    def __init__(self, run_id: str, camera_id: str) -> None:
+        self.run_id, self.camera_id = run_id, camera_id
+        self.seq = 0
+        self.send_failures = 0
+        self.timeouts = 0
+        self.reconnects = 0
+        self.prev_upload_rtt_ms: float | None = None
+        self.failing = False
+
+    def next_metadata(self) -> dict[str, Any]:
+        self.seq += 1
+        from .telemetry import edge_resources
+
+        return {
+            "frame_id": f"{self.run_id}-{self.camera_id}-{self.seq:07d}",
+            "run_id": self.run_id, "seq": self.seq,
+            "client": {"prev_upload_rtt_ms": self.prev_upload_rtt_ms, "send_failures": self.send_failures,
+                       "timeouts": self.timeouts, "reconnects": self.reconnects,
+                       "reconnected": self.failing, "resources": edge_resources()},
+        }
+
+    def succeeded(self, rtt_ms: float) -> None:
+        self.prev_upload_rtt_ms = round(rtt_ms, 3)
+        if self.failing:
+            self.reconnects += 1
+        self.failing = False
+
+    def failed(self, timeout: bool) -> None:
+        self.send_failures += 1
+        self.timeouts += int(timeout)
+        self.failing = True
+        self.prev_upload_rtt_ms = None
+
+
+def record_frame(directory: Path, frame: CapturedFrame, metadata: dict[str, Any],
+                 encoded: tuple[bytes, bytes | None]) -> None:
+    """Save the exact uploaded bytes so the same frames can be replayed later."""
+    directory.mkdir(parents=True, exist_ok=True)
+    stem = directory / f"{frame.camera_id}_{metadata['seq']:07d}"
+    stem.with_suffix(".jpg").write_bytes(encoded[0])
+    if encoded[1] is not None:
+        Path(f"{stem}_depth.npz").write_bytes(encoded[1])
+    stem.with_suffix(".json").write_text(json.dumps({
+        "camera_id": frame.camera_id, "source": frame.source, "intrinsics": frame.intrinsics,
+        "intrinsics_origin": frame.intrinsics_origin, "original_frame_id": metadata["frame_id"],
+        "captured_wall": time.time(),
+    }, indent=1), encoding="utf-8")
 
 
 def main() -> None:
@@ -388,7 +457,14 @@ def main() -> None:
     parser.add_argument("--token", default="", help="Bearer token when the cloud API is not tunneled")
     parser.add_argument("--baseline-on-start", action="store_true", help="Capture the first empty frame as baseline")
     parser.add_argument("--raw-depth", action="store_true", help="Disable RealSense spatial/temporal noise filters")
+    parser.add_argument("--request-timeout", type=float, default=20.0,
+                        help="Seconds before an upload is abandoned (capture continues with the next frame)")
+    parser.add_argument("--run-id", default="", help="Telemetry run id (default: start time)")
+    parser.add_argument("--record-dir", default="",
+                        help="Also save every uploaded frame here for the local-versus-cloud replay benchmark")
     args = parser.parse_args()
+    if not args.run_id:
+        args.run_id = time.strftime("edge%Y%m%d-%H%M%S")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
     if args.upload_fps <= 0:
@@ -476,10 +552,34 @@ def main() -> None:
                                  fx=args.logitech_fx, fy=args.logitech_fy))
 
 
+_STREAM_STATES: dict[str, EdgeStreamState] = {}
+_STREAM_LOCK = threading.Lock()
+
+
+def _stream_state(args: Any, camera_id: str) -> EdgeStreamState:
+    with _STREAM_LOCK:
+        run_id = getattr(args, "run_id", "") or "edge"
+        if camera_id not in _STREAM_STATES:
+            _STREAM_STATES[camera_id] = EdgeStreamState(run_id, camera_id)
+        return _STREAM_STATES[camera_id]
+
+
 def _stream_one_frame(session: requests.Session, frame: CapturedFrame, args: Any, baseline_pending: bool) -> None:
         started = time.monotonic()
+        state = _stream_state(args, frame.camera_id)
+        extra = state.next_metadata()
         try:
-            result = send_frame(session, args.cloud, frame, jpeg_quality=args.jpeg_quality)
+            encoded = encode_frame(frame, args.jpeg_quality)
+            sent_at = time.monotonic()
+            result = send_frame(session, args.cloud, frame, jpeg_quality=args.jpeg_quality,
+                                timeout_seconds=getattr(args, "request_timeout", 20.0),
+                                extra_metadata=extra, encoded=encoded)
+            state.succeeded((time.monotonic() - sent_at) * 1000.0)
+            if getattr(args, "record_dir", ""):
+                try:
+                    record_frame(Path(args.record_dir), frame, extra, encoded)
+                except OSError as exc:
+                    LOGGER.warning("Could not record frame for replay: %s", exc)
             valid_depth_pixels = (
                 int(np.count_nonzero(np.isfinite(frame.depth_m) & (frame.depth_m > 0.10)))
                 if frame.depth_m is not None
@@ -490,13 +590,14 @@ def _stream_one_frame(session: requests.Session, frame: CapturedFrame, args: Any
                 frame.source,
                 valid_depth_pixels,
                 frame.intrinsics is not None,
-                result["visible_objects"],
-                result["automatic_count"],
-                result["realsense_volume_l"],
-                result["monocular_volume_l"],
-                result["inference_ms"],
+                result.get("visible_objects"),
+                result.get("automatic_count"),
+                result.get("realsense_volume_l"),
+                result.get("monocular_volume_l"),
+                result.get("inference_ms"),
             )
         except requests.RequestException as exc:
+            state.failed(isinstance(exc, requests.Timeout))
             LOGGER.warning("Laptop processing service unavailable; reconnecting: %s", exc)
             time.sleep(2)
             return

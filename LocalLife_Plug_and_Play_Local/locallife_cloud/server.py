@@ -24,6 +24,7 @@ from .operator_dashboard import OPERATOR_DASHBOARD
 from .pipeline import VisionPipeline
 from .storage import BucketSync
 from .streaming import LatestFrameProcessor
+from .telemetry import TELEMETRY_COLUMNS, TelemetryRecorder, export_json
 from .types import CameraIntrinsics
 
 
@@ -202,7 +203,16 @@ def create_app(
     app.config["VISION_PIPELINE"] = vision
     app.config["CAMERA_COORDINATOR"] = manager
     app.config["LOCALLIFE_CONFIG"] = settings
-    frame_processor = LatestFrameProcessor(manager)
+    # Per-frame transport telemetry, labelled with the mode this server really
+    # runs in (CLOUD_ENABLED is set by the launcher on the VM only), so a
+    # result can never be attributed to a mode that did not produce it.
+    server_run_id = time.strftime("%Y%m%d-%H%M%S")
+    telemetry = TelemetryRecorder(
+        settings.processing_mode,
+        csv_path=settings.results_dir / "telemetry" / f"telemetry_{settings.processing_mode}_{server_run_id}.csv",
+    )
+    app.extensions["locallife_telemetry"] = telemetry
+    frame_processor = LatestFrameProcessor(manager, telemetry=telemetry)
     app.extensions["locallife_frame_processor"] = frame_processor
     atexit.register(frame_processor.stop)
 
@@ -259,6 +269,31 @@ def create_app(
             return jsonify(ok=True, session=manager.start_new_operator_session())
         except (OSError, ValueError) as exc:
             return jsonify(error=str(exc)), 400
+
+    def _window() -> float:
+        try:
+            return min(3600.0, max(5.0, float(request.args.get("window_s", 60))))
+        except ValueError:
+            return 60.0
+
+    @app.get("/api/telemetry")
+    def telemetry_summary() -> Any:
+        """Rolling-window transport metrics, per camera and overall."""
+        return jsonify(telemetry.summary(_window()))
+
+    @app.get("/api/telemetry.csv")
+    def telemetry_csv() -> Any:
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=TELEMETRY_COLUMNS)
+        writer.writeheader()
+        writer.writerows(telemetry.rows())
+        return Response(output.getvalue(), mimetype="text/csv", headers={
+            "Content-Disposition":
+                f"attachment; filename=telemetry_{settings.processing_mode}_{server_run_id}.csv"})
+
+    @app.get("/api/telemetry.json")
+    def telemetry_json() -> Any:
+        return Response(export_json(telemetry, _window()), mimetype="application/json")
 
     @app.get("/health")
     def health() -> Any:
@@ -658,11 +693,23 @@ def create_app(
         if frame is None:
             return jsonify(error="The uploaded image could not be decoded"), 400
 
+        telemetry_key = None
         try:
             metadata = json.loads(request.form.get("metadata", "{}"))
             source = str(metadata.get("source", "edge"))
             target_id = infer_camera_id(source, camera_id or metadata.get("camera_id"))
             station = manager.camera(target_id)
+            frame_id = metadata.get("frame_id")
+            telemetry_key = telemetry.received(
+                None if frame_id is None else str(frame_id), target_id,
+                run_id=str(metadata.get("run_id") or ""), seq=metadata.get("seq"),
+                bytes_in=int(request.content_length or 0),
+                client=metadata.get("client") if isinstance(metadata.get("client"), dict) else None,
+            )
+            attribution = {"frame_id": frame_id, "processing_mode": settings.processing_mode}
+            if telemetry_key is None:
+                # A retransmitted frame id: acknowledged, never analysed twice.
+                return jsonify(camera_id=target_id, accepted=False, duplicate=True, **attribution), 200
             origin = str(metadata.get("intrinsics_origin", "")).strip()
             intrinsics = CameraIntrinsics.from_dict(metadata.get("intrinsics"))
             uploaded_depth = request.files.get("depth")
@@ -686,8 +733,11 @@ def create_app(
                 "timestamp": timestamp,
             }
             if request.args.get("sync", "").strip().lower() in {"1", "true", "yes"}:
+                telemetry.started(telemetry_key)
                 result = station.process_frame(**packet)
+                telemetry.completed(telemetry_key)
             else:
+                packet[LatestFrameProcessor.TELEMETRY_KEY] = telemetry_key
                 queue = frame_processor.submit(target_id, packet)
                 latest = None if station.latest_analysis is None else station.latest_analysis.to_dict()
                 if latest is None:
@@ -698,13 +748,20 @@ def create_app(
                         "monocular_volume_l": None,
                         "inference_ms": None,
                     }
-                return jsonify(camera_id=target_id, accepted=True, transport=queue, **latest), 202
+                response = jsonify(camera_id=target_id, accepted=True, transport=queue,
+                                   **{**latest, **attribution})
+                telemetry.response_bytes(telemetry_key, len(response.get_data()))
+                return response, 202
         except (ValueError, KeyError, json.JSONDecodeError) as exc:
+            telemetry.failed(telemetry_key, str(exc))
             return jsonify(error=str(exc)), 400
-        except Exception:
+        except Exception as exc:
+            telemetry.failed(telemetry_key, repr(exc))
             LOGGER.exception("Cloud inference failed")
             return jsonify(error="Cloud inference failed; inspect the server logs"), 500
-        return jsonify(camera_id=target_id, **result.to_dict())
+        response = jsonify(camera_id=target_id, **{**result.to_dict(), **attribution})
+        telemetry.response_bytes(telemetry_key, len(response.get_data()))
+        return response
 
     @app.post("/api/setup/auto")
     @protected

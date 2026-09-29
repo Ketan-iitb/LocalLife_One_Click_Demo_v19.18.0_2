@@ -105,6 +105,19 @@ summary{cursor:pointer;font-weight:800}details pre{overflow:auto;font-size:12px;
   </div>
 </section>
 
+<section class="checks" id="metrics-panel">
+  <h2 style="margin:0 0 4px">Local vs cloud comparison (automatic)</h2>
+  <div class="muted" id="m-backend" style="font-size:13px">Waiting for a running pipeline…</div>
+  <div style="overflow-x:auto"><table id="m-table" style="width:100%;border-collapse:collapse;font-size:13px;margin-top:8px"></table></div>
+  <div class="muted" id="m-notes" style="font-size:12px;margin-top:6px"></div>
+  <div style="margin-top:8px;display:flex;gap:10px;flex-wrap:wrap">
+    <button class="text-btn" onclick="vmStatus()">Check VM (gpu.py status, no charge)</button>
+    <a class="text-btn" id="m-csv" href="#" target="_blank">Export live telemetry CSV</a>
+    <a class="text-btn" id="m-json" href="#" target="_blank">Export live telemetry JSON</a>
+  </div>
+  <pre id="m-vm" style="display:none;font-size:12px;white-space:pre-wrap"></pre>
+</section>
+
 <details><summary>Diagnostics</summary><pre id="diag">—</pre></details>
 </div>
 <script>
@@ -174,5 +187,33 @@ async function choose(mode){
   catch(e){$('progress').classList.add('show');$('progress-note').className='callout bad';$('progress-note').textContent=e.message}
 }
 async function cancelStartup(){try{const d=await api('/api/launcher/cancel',{});launch=d.launch;renderLaunch()}catch(e){alert(e.message)}}
+const NA='N/A';
+const n=(v,d=1)=>v==null?NA:Number(v).toFixed(d);
+function cellFor(snap,fn){if(!snap)return 'no run yet';const s=snap.summary;const parts=[fn(s.all,s,'all')].filter(Boolean);for(const [c,m] of Object.entries(s.cameras||{})){const v=fn(m,s,c);if(v)parts.push(c+': '+v)}return parts.join('<br>')+(snap.live?'':'<br><i>last seen '+Math.round(snap.age_s)+' s ago</i>')}
+const ROWS=[
+ ['1. Latency p50 / p95 (ms)',m=>m.status!=='ok'?'insufficient data (n='+m.latency.n+')':n(m.latency.p50_ms)+' / '+n(m.latency.p95_ms)+' (n='+m.latency.n+', '+m.window_s+' s)'],
+ ['&nbsp;&nbsp;edge upload RTT p50 / p95 (ms)',m=>n(m.client_upload_rtt.p50_ms)+' / '+n(m.client_upload_rtt.p95_ms)+' (n='+m.client_upload_rtt.n+')'],
+ ['2. Throughput (unique frames/s)',m=>m.throughput.fps==null?'insufficient data':n(m.throughput.fps,2)+' ('+m.throughput.unique_completed+' frames)'],
+ ['3. Reliability completed/sent',m=>{const r=m.reliability;return (r.completed_pct==null?'insufficient data':n(r.completed_pct)+'%')+' ('+r.completed+'/'+r.sent+'; superseded '+r.superseded_by_newer_frame+', failed '+r.failed+', lost '+r.lost_in_transit+', reconnects '+r.reconnects+')'}],
+ ['4. Measurement quality',()=> 'Not evaluated live (no ground truth); see replay benchmark'],
+ ['5. Host CPU / RAM %',(m,s,c)=>c!=='all'?'':n(s.host_resources.cpu_percent)+' / '+n(s.host_resources.ram_percent)+' ('+(s.host.hostname||'?')+')'],
+ ['&nbsp;&nbsp;GPU util % / VRAM MB',(m,s,c)=>c!=='all'?'':(s.gpu&&s.gpu.available?n(s.gpu.utilization_percent)+' / '+n(s.gpu.memory_used_mb,0)+' ('+s.gpu.name+')':NA)],
+ ['&nbsp;&nbsp;Pi CPU / RAM %',(m,s,c)=>{const e=(s.edge_resources||{})[c];return c==='all'?'':(e?n(e.cpu_percent)+' / '+n(e.ram_percent):NA)}],
+ ['6. Bytes in / out per frame',m=>n(m.transfer.bytes_in_per_frame,0)+' / '+n(m.transfer.bytes_out_per_completed_frame,0)],
+ ['&nbsp;&nbsp;Bytes in / out per minute',m=>n(m.transfer.bytes_in_per_minute,0)+' / '+n(m.transfer.bytes_out_per_minute,0)],
+];
+function benchCell(b){if(!b)return 'no replay run';const q=b.quality||{};const l=b.latency_e2e||{};return 'e2e p50/p95 '+n(l.p50_ms)+'/'+n(l.p95_ms)+' ms (n='+(l.n||0)+'), '+n(b.throughput_fps,2)+' fps; quality: '+(q.status||'Not evaluated')}
+async function refreshMetrics(){try{const d=await api('/api/launcher/metrics');const b=d.backend;
+ $('m-backend').innerHTML=(b.reachable?'Backend on port '+b.port+' reports processing mode <b>'+b.processing_mode.toUpperCase()+'</b>':'Backend not reachable ('+(b.error||'not started')+')')+(d.fallback_used?' · <b style="color:#b45309">cloud failed; running LOCAL fallback</b>':'')+(d.mode_mismatch?' · <b style="color:#b91c1c">MODE MISMATCH: launched '+d.launched_mode+'</b>':'');
+ let h='<tr><th style="text-align:left">Metric</th><th style="text-align:left">Local</th><th style="text-align:left">Cloud</th></tr>';
+ for(const [label,fn] of ROWS)h+='<tr style="border-top:1px solid #edf1ef"><td>'+label+'</td><td>'+cellFor(d.modes.local,fn)+'</td><td>'+cellFor(d.modes.cloud,fn)+'</td></tr>';
+ h+='<tr style="border-top:2px solid #cfd8d4"><td>Replay benchmark (fair comparison)</td><td>'+benchCell(d.benchmarks.local)+'</td><td>'+benchCell(d.benchmarks.cloud)+'</td></tr>';
+ h+='<tr><td>Cloud cost</td><td>—</td><td>'+(d.cost.estimate==null?NA:'≈ '+d.cost.estimate+' '+d.cost.currency+' (estimate)')+'</td></tr>';
+ $('m-table').innerHTML=h;
+ const any=(d.modes.local||d.modes.cloud);$('m-notes').textContent=any?('Latency boundary: '+(any.summary.all.latency.boundary)+'. Edge RTT boundary: '+any.summary.all.client_upload_rtt.boundary+'. Reliability denominator: '+any.summary.all.reliability.denominator+'. '+d.cost.note):d.cost.note;
+ const base='http://127.0.0.1:'+b.port;$('m-csv').href=base+'/api/telemetry.csv';$('m-json').href=base+'/api/telemetry.json';
+}catch(e){$('m-backend').textContent='Metrics unavailable: '+e.message}}
+async function vmStatus(){const p=$('m-vm');p.style.display='block';p.textContent='Running gpu.py status…';try{const d=await api('/api/launcher/vm-status',{});p.textContent=(d.zone?'VM '+d.vm_state+' in zone '+d.zone+'\n\n':'')+(d.output||d.error||'')}catch(e){p.textContent=e.message}}
+setInterval(refreshMetrics,3000);refreshMetrics();
 setInterval(refresh,1500);refresh();
 </script></body></html>'''

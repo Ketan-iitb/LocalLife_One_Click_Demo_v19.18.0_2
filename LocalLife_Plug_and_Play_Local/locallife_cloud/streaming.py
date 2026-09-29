@@ -15,8 +15,12 @@ LOGGER = logging.getLogger(__name__)
 class LatestFrameProcessor:
     """Analyze the newest frame per camera while older queued frames are dropped."""
 
-    def __init__(self, manager: DualCameraCoordinator) -> None:
+    # Packet key carrying the telemetry handle; removed before analysis.
+    TELEMETRY_KEY = "_telemetry_key"
+
+    def __init__(self, manager: DualCameraCoordinator, telemetry: Any = None) -> None:
         self.manager = manager
+        self.telemetry = telemetry
         self.condition = threading.Condition()
         self.pending: dict[str, dict[str, Any]] = {}
         self.statistics: dict[str, dict[str, Any]] = {
@@ -39,6 +43,8 @@ class LatestFrameProcessor:
             stats["accepted"] += 1
             if camera_id in self.pending:
                 stats["dropped"] += 1
+                if self.telemetry is not None:
+                    self.telemetry.superseded(self.pending[camera_id].get(self.TELEMETRY_KEY))
             self.pending[camera_id] = packet
             self.condition.notify()
             return self.snapshot(camera_id)
@@ -79,17 +85,27 @@ class LatestFrameProcessor:
             if work is None:
                 return
             packets = dict(work)
+            keys = {camera_id: packet.pop(self.TELEMETRY_KEY, None) for camera_id, packet in packets.items()}
+            if self.telemetry is not None:
+                for key in keys.values():
+                    self.telemetry.started(key)
             try:
                 self.manager.process_packets(packets)
                 with self.condition:
                     for camera_id in packets:
                         self.statistics[camera_id]["processed"] += 1
                         self.statistics[camera_id]["last_error"] = None
+                if self.telemetry is not None:
+                    for key in keys.values():
+                        self.telemetry.completed(key)
             except Exception as exc:  # pragma: no cover - retains environment-specific failures
                 LOGGER.exception("Background inference failed for %s", ", ".join(packets))
                 with self.condition:
                     for camera_id in packets:
                         self.statistics[camera_id]["last_error"] = str(exc)
+                if self.telemetry is not None:
+                    for key in keys.values():
+                        self.telemetry.failed(key, str(exc))
             finally:
                 with self.condition:
                     for camera_id in packets:
