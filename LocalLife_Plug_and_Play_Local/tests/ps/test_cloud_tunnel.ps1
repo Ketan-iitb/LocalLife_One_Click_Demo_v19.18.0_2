@@ -136,6 +136,31 @@ $script:LocalMode = 'local'
 Invoke-CloudTunnelSupervisor -MaxCycles 2
 Assert-True (@($script:Log | Where-Object { $_ -match 'processing mode LOCAL' }).Count -eq 1) 'mode reported by the backend is shown as-is'
 
+# 9. Pi cloud-tunnel key setup reaches the Pi without raw double quotes (PowerShell 5.1 mangles
+#    them for ssh.exe) and, run by bash, creates the key once and prints the public half.
+$bootstrapFn = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'ConvertTo-RemoteBootstrap' }, $true) | Select-Object -First 1
+. ([scriptblock]::Create($bootstrapFn.Extent.Text))
+$keyAssign = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$keySetupCommand' }, $true) | Select-Object -First 1
+$keySetupCommand = & ([scriptblock]::Create($keyAssign.Right.Extent.Text))
+$keyCall = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.Extent.Text -match 'keySetupCommand' -and $n.GetCommandName() -eq 'ssh' }, $true) | Select-Object -First 1
+Assert-True ($null -ne $keyCall -and $keyCall.Extent.Text -match 'ConvertTo-RemoteBootstrap') 'Pi key setup is sent base64-wrapped'
+$wire = ConvertTo-RemoteBootstrap -Command $keySetupCommand
+Assert-True ($wire -notmatch '"' -and $keySetupCommand -match '""') 'bootstrap removes the embedded double quotes'
+$bash = Get-Command bash -ErrorAction SilentlyContinue
+$keygen = Get-Command ssh-keygen -ErrorAction SilentlyContinue
+if ($bash -and $keygen -and -not $IsWindows) {
+    $fakeHome = Join-Path ([IO.Path]::GetTempPath()) ('pi-home-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $fakeHome | Out-Null
+    $env:HOME_BACKUP = $env:HOME; $env:HOME = $fakeHome
+    try {
+        $first = (& bash -c $wire) -join "`n"
+        $second = (& bash -c $wire) -join "`n"
+    }
+    finally { $env:HOME = $env:HOME_BACKUP }
+    Assert-True ($first -match '^ssh-ed25519 \S+ locallife-cloud-tunnel$' -and $first -eq $second) 'key setup runs in bash, creates the key once, prints it'
+    Remove-Item -Recurse -Force $fakeHome
+}
+
 if ($script:Failures) { Write-Output "$($script:Failures) FAILED"; exit 1 }
 Write-Output 'ALL PASSED'
 exit 0

@@ -2078,7 +2078,11 @@ function Initialize-PiCloudTunnel {
     $keySetupCommand = 'test -f ~/.ssh/id_locallife_cloud || ' +
         '(umask 077; mkdir -p ~/.ssh; ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_locallife_cloud -C locallife-cloud-tunnel -q); ' +
         'cat ~/.ssh/id_locallife_cloud.pub'
-    $keyOutput = & ssh '-o' 'StrictHostKeyChecking=accept-new' $PiHost $keySetupCommand
+    # Base64-wrapped like every other remote command: Windows PowerShell 5.1
+    # mangles embedded double quotes (the empty -N "" passphrase) when it
+    # passes an argument to ssh.exe, and the Pi's bash then failed with
+    # "unexpected EOF while looking for matching `"'".
+    $keyOutput = & ssh '-o' 'StrictHostKeyChecking=accept-new' $PiHost (ConvertTo-RemoteBootstrap -Command $keySetupCommand)
     $piPublicKey = (@($keyOutput) -join "`n").Trim()
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($piPublicKey)) {
         throw 'Could not prepare the Raspberry Pi''s cloud-tunnel SSH key.'
