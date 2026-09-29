@@ -74,6 +74,8 @@ from .colour_evidence import describe_colour
 from .depth_edges import drop_depth_edge_pixels
 from .shape_router import refine_shape
 from .crowded_scene import bound_recovered_mask
+from .logitech_depth_gain import DepthGainStore, GainSample, fit_object_gain
+from .logitech_pose import PoseFingerprint, pose_difference
 from .logitech_pose import touches_frame_border
 from .material_evidence import reconcile_material
 from .logitech_pose import (AXIS_ALIGNMENT_MAX_TILT_DEG, FloorScaleTracker, PoseGuard, ViewChangeGuard,
@@ -759,6 +761,12 @@ class VisionPipeline:
         self._pose_check_frames = 0
         # Each frame's depth re-anchored on the floor it can still see.
         self._floor_scale = FloorScaleTracker()
+        # The Logitech's object-depth gain, measured once in the fixed pose
+        # with known-height objects (logitech_depth_gain.py).
+        self._depth_gain = DepthGainStore(
+            config.results_dir / "calibration" / "logitech_depth_gain.json" if camera_id == "logitech" else None
+        )
+        self._last_gain_context: dict[str, Any] = {}
         # Has the Logitech been moved since its empty-scene reference?
         self._logitech_view = ViewChangeGuard()
         self.logitech_view_reason: str | None = None
@@ -1025,6 +1033,7 @@ class VisionPipeline:
             self._box_measurement_history.clear()
             self._box_frames_considered.clear()
             self._geometry_lock.clear()
+            self._logitech_geometry.clear()
             self._track_signatures.clear()
             self._color_history.clear()
             self._material_history.clear()
@@ -1475,6 +1484,7 @@ class VisionPipeline:
                 measurement_mask=bin_region,
             )
             original_count = len(detections)
+            proposals = list(detections)
             # BUGFIX (round 21): `allow_unclassified` used to also turn True
             # off `self.tracker.has_active_counted_track()` alone -- a plain
             # "is anything, anywhere, already counted?" boolean. Once any
@@ -1512,6 +1522,7 @@ class VisionPipeline:
             # neural match, or two fused scene objects whose merged masks
             # still touch). Collapse those before tracking so one bag is
             # never counted or displayed twice.
+            detections += self._depthless_proposals(proposals, detections, scene_depth, frame.shape[:2])
             fused_count = len(detections)
             detections = deduplicate_overlapping_detections(detections, frame.shape[:2])
             # Where a crowded bin loses bags, frame by frame: how many changed
@@ -2307,8 +2318,22 @@ class VisionPipeline:
                             f"metric_scale_unavailable_{self.logitech_floor_scale.get('reason')}")
                         detection.measurement_quality = "metric-scale-unavailable"
                         continue
+                    self._last_gain_context = {
+                        "depth": calibrated_prediction, "mask": volume_mask.copy(),
+                        "plane": plane_for_volume, "intrinsics": measure_intrinsics,
+                        "region": bin_region,
+                    }
+                    gain, _ = self.logitech_depth_gain()
+                    object_depth = calibrated_prediction
+                    if gain is not None:
+                        # The one-time gain seats the object at its true depth;
+                        # the floor around it is left as it is.
+                        object_depth = calibrated_prediction.astype(np.float32, copy=True)
+                        object_depth[volume_mask] *= np.float32(gain)
+                        detection.dimension_flags = tuple(dict.fromkeys(
+                            tuple(detection.dimension_flags or ()) + ("object_depth_gain_applied",)))
                     result = metric_object_volume(
-                        calibrated_prediction, measure_intrinsics, volume_mask, plane_for_volume,
+                        object_depth, measure_intrinsics, volume_mask, plane_for_volume,
                         reference_depth_m=self.reference_monocular,
                         measurement_mask=bin_region,
                         min_height_m=self.config.logitech_min_object_height_m,
@@ -3008,6 +3033,7 @@ class VisionPipeline:
             self._box_measurement_history.clear()
             self._box_frames_considered.clear()
             self._geometry_lock.clear()
+            self._logitech_geometry.clear()
             self._track_signatures.clear()
             self._color_history.clear()
             self._material_history.clear()
@@ -3063,6 +3089,7 @@ class VisionPipeline:
             self._box_measurement_history.clear()
             self._box_frames_considered.clear()
             self._geometry_lock.clear()
+            self._logitech_geometry.clear()
             self._track_signatures.clear()
             self._color_history.clear()
             self._material_history.clear()
@@ -3099,6 +3126,7 @@ class VisionPipeline:
             self._box_measurement_history.clear()
             self._box_frames_considered.clear()
             self._geometry_lock.clear()
+            self._logitech_geometry.clear()
             self._track_signatures.clear()
             self._color_history.clear()
             self._material_history.clear()
@@ -3562,6 +3590,7 @@ class VisionPipeline:
             self._box_frames_considered.clear()
             if self.camera_id != "logitech":
                 self._geometry_lock.clear()
+                self._logitech_geometry.clear()
                 self._track_signatures.clear()
             else:
                 # A Logitech object's geometry is measured in metres and does
@@ -4050,6 +4079,7 @@ class VisionPipeline:
             # The zone defines what may be measured, so anything fitted or
             # smoothed under the previous one is no longer about this scene.
             self._geometry_lock.clear()
+            self._logitech_geometry.clear()
             self._track_signatures.clear()
             self.deposit_state.reset()
         return self.measurement_zone.describe()
@@ -4758,6 +4788,10 @@ class VisionPipeline:
             self.last_metric_context["homography_width_cm"] = round(footprint[1] * 100.0, 2)
 
         calibration = self.height_calibration
+        if calibration is not None and self.logitech_depth_gain()[0] is not None:
+            # The depth gain already corrected length, width and height
+            # together; the older signal-to-height mapping would undo that.
+            calibration = None
         if calibration is None:
             detection.calibration_version = None
             if detection.measurement_quality in (None, "", "measured"):
@@ -4849,6 +4883,43 @@ class VisionPipeline:
         if scale is None:
             return depth
         return (depth * scale).astype(depth.dtype, copy=False)
+
+    DEPTHLESS_MAX_VALID = 0.30
+
+    def _depthless_proposals(self, proposals: list[Detection], fused: list[Detection],
+                             depth: np.ndarray | None, shape: tuple[int, int]) -> list[Detection]:
+        """Detector bags that fusion dropped only because the stereo saw nothing there.
+
+        Fusion keeps a detection only where depth changed. Black and shiny
+        polythene returns no stereo depth at all, so no change could exist and
+        a bag the detector clearly saw vanished from the RealSense panel -- the
+        crowded-bin symptom. It is kept as a visible object whose volume is
+        unavailable, with the reason, never with a number.
+        """
+        if depth is None or not proposals:
+            return []
+        taken = np.zeros(shape, dtype=bool)
+        for item in fused:
+            taken |= combined_mask([item], shape)
+        kept = []
+        for item in proposals:
+            if item.accepted_class is None or _is_phantom_detection(item):
+                continue
+            mask = combined_mask([item], shape)
+            area = int(np.count_nonzero(mask))
+            if area == 0 or np.count_nonzero(mask & taken) > 0.3 * area:
+                continue
+            valid = float(np.mean(np.isfinite(depth[mask]) & (depth[mask] > 0.1)))
+            if valid > self.DEPTHLESS_MAX_VALID:
+                continue
+            item.volume_rejection_reason = "no_valid_stereo_depth_dark_or_shiny_surface"
+            item.measurement_quality = item.volume_rejection_reason
+            item.depth_coverage_percent = round(100.0 * valid, 1)
+            item.source = "yoloe-no-depth"
+            kept.append(item)
+            taken |= mask
+        self.stage_counters["depthless_proposals_kept_last_frame"] = len(kept)
+        return kept
 
     def _without_depth_edges(self, detection: Detection, depth: np.ndarray | None,
                              mask: np.ndarray, *, radius: int) -> np.ndarray:
@@ -5032,7 +5103,10 @@ class VisionPipeline:
             artefacts=self._save_sample_artefacts(name, context),
         )
         stored = self.metric_store.add_sample(sample)
-        return {"sample": stored.to_dict(), **self.metric_status()}
+        gain = None
+        if sample.kind == CALIBRATION_SET and self.camera_id == "logitech":
+            gain = self._add_gain_sample(sample.name, float(true_height_cm))
+        return {"sample": stored.to_dict(), "depth_gain_sample": gain, **self.metric_status()}
 
     def _save_sample_artefacts(self, name: str, context: dict[str, Any]) -> dict[str, str]:
         """Keep the evidence behind a calibration sample, so a fit can be audited."""
@@ -5078,11 +5152,67 @@ class VisionPipeline:
         self._validate_height_calibration()
         return {"ok": frozen is not None, **self.metric_status()}
 
+    def logitech_depth_gain(self) -> tuple[float | None, dict[str, Any]]:
+        """The active object-depth gain for the current pose, and its status."""
+        store = self.__dict__.get("_depth_gain")
+        if store is None or self.camera_id != "logitech":
+            return None, {"state": "not_applicable"}
+        if self.logitech_pose.changed_reason or getattr(self, "logitech_view_reason", None):
+            return None, {"state": "suspended_camera_moved", "samples": len(store.samples)}
+        recorded = self.logitech_pose.recorded
+
+        def same_pose(pose: dict | None) -> bool:
+            if recorded is None or pose is None:
+                return recorded is None and pose is None
+            try:
+                return pose_difference(PoseFingerprint(**{**pose, "normal": tuple(pose["normal"]),
+                                                          "resolution": tuple(pose["resolution"])}),
+                                       recorded) is None
+            except (KeyError, TypeError):
+                return False
+
+        return store.active(same_pose)
+
+    def _add_gain_sample(self, name: str, true_height_cm: float) -> dict[str, Any] | None:
+        """Find the depth gain that gives the object in view its ruler height."""
+        context = self._last_gain_context
+        depth, mask, plane = context.get("depth"), context.get("mask"), context.get("plane")
+        if depth is None or mask is None or plane is None or not np.any(mask):
+            return None
+        intrinsics, region = context.get("intrinsics"), context.get("region")
+
+        def height_at(gain: float) -> float | None:
+            trial = depth.astype(np.float32, copy=True)
+            trial[mask] *= np.float32(gain)
+            result = metric_object_volume(
+                trial, intrinsics, mask, plane, measurement_mask=region,
+                min_height_m=0.0, max_height_m=5.0, min_pixels=10,
+                cell_size_m=self.config.logitech_height_map_cell_m,
+            )
+            value = result.diagnostics.get("height_p90_m")
+            # Pushed behind the floor: nothing stands up, which is height 0.
+            return 0.0 if value is None else float(value)
+
+        measured = height_at(1.0)
+        gain = fit_object_gain(height_at, float(true_height_cm) / 100.0)
+        if gain is None or measured is None:
+            return {"state": "gain_not_found", "measured_height_m": measured}
+        from dataclasses import asdict as _asdict
+
+        recorded = self.logitech_pose.recorded
+        self._depth_gain.add(GainSample(
+            name=str(name), gain=float(gain), true_height_m=float(true_height_cm) / 100.0,
+            measured_height_m=float(measured), pose=None if recorded is None else _asdict(recorded),
+        ))
+        return {"state": "added", "gain": round(float(gain), 4), "measured_height_m": round(measured, 4)}
+
     def reset_height_calibration(self, *, samples: bool = False) -> dict[str, Any]:
         with self.lock:
             self.metric_store.save_calibration(None)
             if samples:
                 self.metric_store.clear_samples()
+                if "_depth_gain" in self.__dict__:
+                    self._depth_gain.reset()
             self.height_calibration, self.height_calibration_reason = None, None
         return self.metric_status()
 
@@ -5113,6 +5243,7 @@ class VisionPipeline:
             ),
             "floor_plane_source": self._logitech_plane_source,
             "camera_pose": self.logitech_pose.status(),
+            "object_depth_gain": self.logitech_depth_gain()[1],
             "floor_plane_reason": self._logitech_plane_reason,
             "auto_baseline": self.auto_baseline_state,
         })
