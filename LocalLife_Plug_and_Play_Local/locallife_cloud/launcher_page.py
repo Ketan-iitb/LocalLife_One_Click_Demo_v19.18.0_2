@@ -220,6 +220,8 @@ const ROWS=[
  ['3. Reliability completed / sent',m=>{const r=m.reliability;return (r.completed_pct==null?'insufficient data':n(r.completed_pct)+'%')+' ('+r.completed+'/'+r.sent+'; failed '+r.failed+', lost '+r.lost_in_transit+', reconnects '+r.reconnects+')'},{get:s=>s.all.reliability.completed_pct,better:'higher'}],
  ['Frames dropped for a newer frame',m=>{const r=m.reliability;const v=pct(r.superseded_by_newer_frame,r.received);return v==null?NA:n(v)+'% ('+r.superseded_by_newer_frame+'/'+r.received+')'},{get:s=>pct(s.all.reliability.superseded_by_newer_frame,s.all.reliability.received),better:'lower'},true],
  ['Frames received / in flight / duplicates',m=>{const r=m.reliability;return r.received+' / '+r.in_flight+' / '+r.duplicates_ignored},null,true],
+ ['Detections: raw → after filters → tracks',(m,s,c)=>{const g=(s.stages||{})[c];return c==='all'?'':(g?(g.raw_detections??0)+' → '+(g.after_filters??0)+' → '+(g.confirmed_tracks??0)+' (frames '+(g.frames_processed??0)+')':NA)},null,true],
+ ['Pipeline blocking reason',(m,s,c)=>{const g=(s.stages||{})[c];if(c==='all'||!g)return c==='all'?'':NA;const top=Object.entries(g.last_frame_rejections||{}).sort((a,b)=>b[1]-a[1])[0];return (g.blocking_reason||'none: objects reach history')+(top?' (last frame: '+top[0]+' ×'+top[1]+')':'')},null,true],
  ['4. Measurement quality',()=> 'Not evaluated live (no ground truth); see replay benchmark'],
  ['5. Host CPU / RAM %',(m,s,c)=>c!=='all'?'':n(s.host_resources.cpu_percent)+' / '+n(s.host_resources.ram_percent)+' ('+(s.host.hostname||'?')+')'],
  ['GPU util % / VRAM MB',(m,s,c)=>c!=='all'?'':(s.gpu&&s.gpu.available?n(s.gpu.utilization_percent)+' / '+n(s.gpu.memory_used_mb,0)+' of '+n(s.gpu.memory_total_mb,0):NA),null,true],

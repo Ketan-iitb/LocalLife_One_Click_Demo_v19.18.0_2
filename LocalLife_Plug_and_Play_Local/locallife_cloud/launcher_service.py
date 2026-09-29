@@ -111,6 +111,29 @@ def fetch_backend_telemetry(port: int, window_s: float, timeout: float = 2.0) ->
         return json.loads(response.read().decode("utf-8"))
 
 
+def fetch_camera_stages(port: int, timeout: float = 2.0) -> dict[str, Any]:
+    """Each camera's production-path counters and its single blocking reason, or {}."""
+    stages: dict[str, Any] = {}
+    for camera in ("realsense", "logitech"):
+        url = f"http://127.0.0.1:{port}/api/cameras/{camera}/stages"
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as response:  # noqa: S310 - fixed localhost URL
+                report = json.loads(response.read().decode("utf-8"))
+        except (OSError, ValueError):
+            continue
+        counters = report.get("counters") or {}
+        stages[camera] = {
+            "blocking_reason": report.get("blocking_reason"),
+            "frames_processed": counters.get("frames_processed"),
+            "raw_detections": counters.get("raw_detections"),
+            "after_filters": counters.get("after_class_confidence_roi_area"),
+            "valid_masks": counters.get("valid_masks"),
+            "confirmed_tracks": counters.get("confirmed_tracks_total"),
+            "last_frame_rejections": report.get("last_frame_rejections") or {},
+        }
+    return stages
+
+
 def cost_estimate(started_at: float | None, now: float | None = None) -> dict[str, Any]:
     """A labelled estimate from an operator-supplied hourly rate, never a live bill."""
     rate = os.environ.get("LOCALLIFE_CLOUD_COST_PER_HOUR", "").strip()
@@ -439,6 +462,9 @@ class LaunchController:
             mode = str(summary.get("processing_mode") or "")
             backend.update(reachable=True, processing_mode=mode)
             if mode in METRIC_MODES:
+                if fetch is None:
+                    # Where each camera loses its objects, from the backend's own stage report.
+                    summary["stages"] = fetch_camera_stages(self.config.port)
                 snapshot = {"fetched_at": time.time(), "summary": summary}
                 self.metric_snapshots[mode] = snapshot
                 try:

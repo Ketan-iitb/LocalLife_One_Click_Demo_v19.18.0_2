@@ -286,7 +286,10 @@ class AppConfig:
     local_api_port: int = 8765
     default_run_mode: str = "ask"
     allow_local_fallback: bool = True
-    cloud_startup_timeout_seconds: int = 90
+    # The white page's "Run with Cloud GPU" waits for the whole launcher: VM
+    # start (gpu.py can hunt zones for 15+ minutes), upload, model load and the
+    # Pi's first frames. 90 s killed every real cloud start from that page.
+    cloud_startup_timeout_seconds: int = 2700
     # Local start includes loading the detection/depth models and waiting for
     # the Pi's first frames; the old shared 90 s limit killed the launcher
     # mid-start on a slower laptop, so the system never finished opening.
