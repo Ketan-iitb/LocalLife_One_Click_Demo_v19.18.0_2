@@ -163,7 +163,7 @@ from pathlib import Path  # noqa: E402
 
 from locallife_cloud.config import AppConfig  # noqa: E402
 from locallife_cloud.pipeline import VisionPipeline  # noqa: E402
-from locallife_cloud.types import CameraIntrinsics  # noqa: E402
+from locallife_cloud.types import CameraIntrinsics  # noqa: E402,F811
 
 SIZE = (240, 320)
 FLOOR = 1.2
@@ -298,6 +298,84 @@ class CrowdedPipelineTests(unittest.TestCase):
             deposits = station.ledger.summary()["deposited_count"]
         self.assertEqual(len(set(ids)), 1)
         self.assertEqual(deposits, 1)
+
+
+class DepthlessBagTests(unittest.TestCase):
+    def test_a_black_bag_with_no_stereo_depth_stays_visible_without_a_volume(self):
+        dark, light = _mask(60, 160, 60, 150), _mask(70, 170, 150, 240)
+        with tempfile.TemporaryDirectory() as directory:
+            station, frame, depth = _station(directory, _Detector([_bag(dark), _bag(light)]))
+            frame, depth = frame.copy(), depth.copy()
+            _paint(frame, depth, dark, 0.20, (15, 15, 15))
+            _paint(frame, depth, light, 0.15, (200, 200, 200))
+            depth[dark] = 0.0                    # black polythene: no stereo return at all
+            for index in range(4):
+                result = station.process_frame(frame, depth_m=depth, intrinsics=CAMERA, timestamp=1.0 + index)
+        tracked = [item for item in result.detections if item.track_id is not None]
+        self.assertEqual(len(tracked), 2)        # v40 before this fix: the black bag vanished
+        black = min(tracked, key=lambda item: item.box[0])
+        self.assertIsNone(black.realsense_volume_l)
+        self.assertEqual(black.volume_rejection_reason, "no_valid_stereo_depth_dark_or_shiny_surface")
+
+
+class LogitechDepthGainTests(unittest.TestCase):
+    """A model that puts objects 15 % too near; one known-height sample fixes the next object."""
+
+    def test_one_known_object_corrects_a_different_one(self):
+        import sys
+        from pathlib import Path as _Path
+        sys.path.insert(0, str(_Path(__file__).resolve().parent))
+        from test_v31_logitech_measurement_cascade import _run, _station as _logitech_station
+
+        class PopDepth:
+            device = "cpu"
+
+            def estimate_batch(self, frames):
+                out = []
+                for f in frames:
+                    d = np.full(f.shape[:2], 1.5, np.float32)
+                    d[(f[..., 2] == 210) & (f[..., 0] == 40)] = 1.38 * 0.85    # 120 mm object
+                    d[(f[..., 0] == 210) & (f[..., 2] == 40)] = 1.30 * 0.85    # 200 mm object
+                    out.append(d)
+                return out
+
+        def place(colour, box):
+            frame = np.zeros((120, 160, 3), np.uint8)
+            mask = np.zeros((120, 160), bool)
+            x1, y1, x2, y2 = box
+            mask[y1:y2, x1:x2] = True
+            frame[mask] = colour
+            return frame, Detection("cosmetic bottle", 0.7, box, mask)
+
+        camera = CameraIntrinsics(fx=160, fy=160, ppx=80, ppy=60, width=160, height=120)
+        empty = np.zeros((120, 160, 3), np.uint8)
+        with tempfile.TemporaryDirectory() as directory:
+            manager, detector, _, _ = _logitech_station(directory, depth=PopDepth(),
+                                                        logitech_reference_distance_m=1.5)
+            station = manager.camera("logitech")
+            detector.items = []
+            station.process_frame(empty, intrinsics=camera, persist=False, timestamp=1)
+            station.set_baseline()
+            station._expect_logitech_pose()
+            station.process_frame(empty, intrinsics=camera, persist=False, timestamp=2)
+            frame, item = place((40, 40, 210), (60, 40, 110, 90))
+            detector.items = [item]
+            before = _run(station, frame, camera, start=10).detections[0]
+            self.assertGreater(before.physical_height_mm, 300)      # 327 mm for a 120 mm object
+            added = station.add_height_sample(name="known", true_length_cm=0, true_width_cm=0,
+                                              true_height_cm=12.0)["depth_gain_sample"]
+            self.assertAlmostEqual(added["gain"], 1 / 0.85, places=3)
+            detector.items = []
+            for index in range(40):
+                station.process_frame(empty, intrinsics=camera, timestamp=30 + index)
+            frame, item = place((210, 40, 40), (5, 5, 45, 45))
+            detector.items = [item]
+            after = _run(station, frame, camera, start=80).detections[0]
+            self.assertAlmostEqual(after.physical_height_mm, 200.0, delta=10.0)
+            self.assertIn("object_depth_gain_applied", after.dimension_flags)
+            # A moved camera suspends it.
+            station.logitech_pose.changed_reason = "camera_pose_changed_camera_tilt_changed"
+            self.assertIsNone(station.logitech_depth_gain()[0])
 
 
 if __name__ == "__main__":
