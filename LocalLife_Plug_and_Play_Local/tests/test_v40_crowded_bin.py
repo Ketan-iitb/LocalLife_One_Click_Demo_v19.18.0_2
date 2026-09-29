@@ -470,5 +470,42 @@ class ImplausibleScaleAndRangeTests(unittest.TestCase):
         self.assertEqual(pillow.volume_rejection_reason, "implausible_footprint_5.9m_for_one_object")
 
 
+class MovedCameraFloorScaleTests(unittest.TestCase):
+    """The v37 floor rescale trusted a recorded pose after the camera was moved."""
+
+    def test_a_camera_moved_closer_to_the_floor_is_not_rescaled_to_the_old_height(self):
+        import sys
+        from pathlib import Path as _Path
+        sys.path.insert(0, str(_Path(__file__).resolve().parent))
+        from test_v31_logitech_measurement_cascade import _run, _station as _logitech_station
+
+        class Floor:
+            device = "cpu"
+            floor = 1.5
+
+            def estimate_batch(self, frames):
+                return [np.where(f.max(axis=2) > 0, self.floor - 0.12, self.floor).astype(np.float32)
+                        for f in frames]
+
+        depth = Floor()
+        with tempfile.TemporaryDirectory() as directory:
+            manager, detector, frame, camera = _logitech_station(directory, depth=depth,
+                                                                 logitech_reference_distance_m=1.5)
+            station = manager.camera("logitech")
+            items, detector.items = detector.items, []
+            station.process_frame(np.zeros_like(frame), intrinsics=camera, persist=False, timestamp=1)
+            station.set_baseline()
+            station._expect_logitech_pose()
+            station.process_frame(np.zeros_like(frame), intrinsics=camera, persist=False, timestamp=2)
+            depth.floor = 0.5                          # camera now 0.5 m up, same tilt
+            detector.items = items
+            found = _run(station, frame, camera, start=10, frames=10).detections[0]
+        # Before: floor rescaled x3.0 -> 1.14 m away and 360 mm tall for a 120 mm object.
+        self.assertAlmostEqual(found.monocular_distance_m, 0.38, delta=0.02)
+        self.assertIsNone(found.physical_height_mm)
+        self.assertIsNone(found.monocular_volume_l)
+        self.assertEqual(found.volume_rejection_reason, "camera_pose_changed_floor_distance")
+
+
 if __name__ == "__main__":
     unittest.main()
