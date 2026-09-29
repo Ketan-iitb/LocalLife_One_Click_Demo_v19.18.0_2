@@ -1395,6 +1395,8 @@ class VisionPipeline:
                 )
         if self.camera_id == "logitech":
             self._check_logitech_view(frame, detections, warnings)
+            calibrated_prediction = self._guard_metric_scale(
+                calibrated_prediction, predicted_depth, bin_region, warnings)
             calibrated_prediction = self._rescale_on_visible_floor(
                 frame, calibrated_prediction, measure_intrinsics, detections, bin_region,
             )
@@ -2657,6 +2659,7 @@ class VisionPipeline:
                 _object_signature(detection, self.camera_id),
             )
             self._apply_cylinder_geometry(detection)
+            self._withhold_unreliable_geometry(detection)
             detection.canonical_type = canonical_object_type(detection.label, detection.confidence)
             if self.camera_id == "logitech" and self.volume_factors is not None:
                 # Raw geometry first, then the frozen factor -- both kept.
@@ -4980,6 +4983,63 @@ class VisionPipeline:
                 tuple(detection.dimension_flags or ()) + ("depth_edges_dominate_mask",)))
         self.stage_counters["depth_edge_pixels_removed"] += int(info.get("removed_pixels", 0) if info.get("applied") else 0)
         return filtered if filtered is not None else mask
+
+    METRIC_SCALE_LIMITS = (0.5, 2.0)
+
+    def _guard_metric_scale(self, calibrated: np.ndarray | None, raw: np.ndarray | None,
+                            region: np.ndarray | None, warnings: list[str]) -> np.ndarray | None:
+        """Refuse a calibration that moves the metric model's depth by more than 2x.
+
+        Several steps rescale the Logitech's metric depth (the camera-height
+        anchor, the per-frame floor rescale, a stored empty-scene fit). None was
+        bounded, and a fit made in another view -- a plane fitted to walls in a
+        room-wide view, an inverse-depth mapping near its singularity -- turned
+        objects a metre away into 9-13 m. A metric checkpoint is not that
+        wrong by itself, so a correction beyond 2x is the calibration being
+        wrong: the model's own metric depth is used instead, and the reason
+        is shown.
+        """
+        self.metric_scale_reason = None
+        if (calibrated is None or raw is None or calibrated.shape != raw.shape
+                or depth_output_kind(self.config.depth_model) != METRIC_OUTPUT):
+            return calibrated
+        use = np.isfinite(calibrated) & np.isfinite(raw) & (raw > 0.1) & (calibrated > 0)
+        if region is not None and region.shape == use.shape:
+            use &= region
+        if np.count_nonzero(use) < 100:
+            return calibrated
+        ratio = float(np.median(calibrated[use] / raw[use]))
+        if self.METRIC_SCALE_LIMITS[0] <= ratio <= self.METRIC_SCALE_LIMITS[1]:
+            return calibrated
+        self.metric_scale_reason = f"metric_scale_implausible_x{ratio:.2f}"
+        self.stage_counters["logitech_metric_scale_refused"] += 1
+        warnings.append(f"{self.metric_scale_reason}: the Logitech calibration rescales depth by {ratio:.2f}x; "
+                        "using the model's own metric depth -- recapture the empty zone in this pose")
+        return raw
+
+    def _withhold_unreliable_geometry(self, detection: Detection) -> None:
+        """Show the object, but not dimensions no depth at that range or size can support."""
+        logitech = self.camera_id == "logitech"
+        distance = detection.monocular_distance_m if logitech else detection.depth_distance_m
+        reason = None
+        if distance is not None and distance > self.config.max_measuring_range_m:
+            reason = f"beyond_reliable_measuring_range_{distance:.1f}m"
+        else:
+            longest = max(detection.footprint_length_mm or 0.0, detection.footprint_width_mm or 0.0)
+            if longest > 1000.0 * self.config.max_object_footprint_m:
+                reason = f"implausible_footprint_{longest / 1000.0:.1f}m_for_one_object"
+        if logitech and getattr(self, "metric_scale_reason", None):
+            reason = reason or self.metric_scale_reason
+        if reason is None:
+            return
+        detection.footprint_length_mm = detection.footprint_width_mm = None
+        detection.physical_height_mm = detection.height_above_baseline_cm = None
+        if logitech:
+            detection.monocular_volume_l = None
+        else:
+            detection.realsense_volume_l = None
+        detection.volume_rejection_reason = reason
+        detection.measurement_quality = reason
 
     def _check_logitech_view(self, frame: np.ndarray, detections: list[Detection],
                              warnings: list[str]) -> None:

@@ -415,5 +415,60 @@ class CalibrationSlipTests(unittest.TestCase):
         self.assertIsNotNone(result.detections[0].realsense_volume_l)
 
 
+class ImplausibleScaleAndRangeTests(unittest.TestCase):
+    def test_a_calibration_that_puts_objects_metres_away_is_refused(self):
+        import sys
+        from pathlib import Path as _Path
+        sys.path.insert(0, str(_Path(__file__).resolve().parent))
+        from test_v31_logitech_measurement_cascade import _run, _station as _logitech_station
+
+        with tempfile.TemporaryDirectory() as directory:
+            manager, detector, frame, camera = _logitech_station(directory, logitech_reference_distance_m=1.5)
+            station = manager.camera("logitech")
+            items, detector.items = detector.items, []
+            station.process_frame(np.zeros_like(frame), intrinsics=camera, persist=False, timestamp=1)
+            station.set_baseline()
+            station.calibration.scale *= 6.0          # the field's 9-13 m for objects ~1.5 m away
+            detector.items = items
+            found = _run(station, frame, camera, start=10).detections[0]
+        self.assertLess(found.monocular_distance_m, 2.0)
+        self.assertIsNone(found.monocular_volume_l)
+        self.assertTrue(found.volume_rejection_reason.startswith("metric_scale_implausible_x"))
+
+    def _realsense(self, floor, mask, height):
+        with tempfile.TemporaryDirectory() as directory:
+            station, frame, depth = _station(directory, _Detector([_bag(mask)]), None,
+                                             np.full(SIZE, floor, np.float32))
+            frame, depth = frame.copy(), depth.copy()
+            frame[mask] = (200, 200, 200)
+            depth[mask] = floor - height
+            for index in range(4):
+                result = station.process_frame(frame, depth_m=depth, intrinsics=CAMERA, timestamp=1.0 + index)
+        return result.detections[0]
+
+    def test_an_object_beyond_the_reliable_range_is_shown_without_dimensions(self):
+        far = self._realsense(3.2, _mask(100, 140, 140, 180), 0.2)
+        self.assertIsNone(far.footprint_length_mm)
+        self.assertIsNone(far.realsense_volume_l)
+        self.assertTrue(far.volume_rejection_reason.startswith("beyond_reliable_measuring_range"))
+        near = self._realsense(FLOOR, _mask(80, 180, 100, 200), 0.15)
+        self.assertIsNotNone(near.realsense_volume_l)
+
+    def test_a_room_sized_footprint_is_refused_not_published(self):
+        from locallife_cloud.pipeline import VisionPipeline
+
+        station = VisionPipeline.__new__(VisionPipeline)
+        station.camera_id = "realsense"
+        station.config = AppConfig()
+        pillow = Detection("pillow", 0.8, (0, 0, 10, 10))
+        pillow.depth_distance_m = 2.0
+        pillow.footprint_length_mm, pillow.footprint_width_mm, pillow.physical_height_mm = 5888.0, 3194.0, 729.0
+        pillow.realsense_volume_l = 40.0
+        station._withhold_unreliable_geometry(pillow)            # the field reading
+        self.assertIsNone(pillow.footprint_length_mm)
+        self.assertIsNone(pillow.realsense_volume_l)
+        self.assertEqual(pillow.volume_rejection_reason, "implausible_footprint_5.9m_for_one_object")
+
+
 if __name__ == "__main__":
     unittest.main()
