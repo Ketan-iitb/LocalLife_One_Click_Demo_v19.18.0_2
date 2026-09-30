@@ -6,3 +6,6 @@
 # leaves the tree dirty with binary churn that hides real changes in a diff.
 __pycache__/
 *.py[cod]
+
+# Runtime results (default results_dir): session state, CSVs, profiles
+artifacts/
