@@ -773,7 +773,7 @@ def create_app(
             return jsonify(error=f"Invalid fill profile: {exc}"), 400
         # Default notes stay only for values the operator did not replace.
         notes = [n for n in (current.notes or [])
-                 if not (n.startswith("floor distance") and "camera_to_empty_floor_m" in changes)
+                 if not (n.startswith("floor reference") and "camera_to_empty_floor_m" in changes)
                  and not (n.startswith("usable height") and "usable_height_m" in changes)]
         profile = _replace(current, camera_id=camera_id, notes=notes, **changes)
         frame = station.latest_frame

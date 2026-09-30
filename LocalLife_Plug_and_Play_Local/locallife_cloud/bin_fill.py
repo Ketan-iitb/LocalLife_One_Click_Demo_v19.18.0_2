@@ -39,6 +39,10 @@ CELL_M = 0.05
 RIM_TOLERANCE_M = 0.15          # above rim + this: rim, tripod or outside the bin
 MIN_COVERAGE = 0.30              # of bin-region pixels with valid depth
 OCCUPIED_MIN_CELL_SHARE = 0.60   # of the measured inner floor area seen
+BELOW_FLOOR_M = 0.10            # a pixel this far below the floor reference is not a surface
+BELOW_FLOOR_SHARE = 0.05         # more than this share of such pixels -> visible quality warning
+INCONSISTENT_M = 0.15            # a single frame this far from the recent median is not trusted
+SMOOTH_FRAMES = 5
 STABLE_MOTION = 0.02             # scene motion fraction below which a frame is "settled"
 MOVED_EDGE_CORRELATION = 0.45    # thumbnail edge correlation outside the bin below this: camera moved
 HEIGHT_FILL_LABEL = "rough height-based equivalent; assumes roughly uniform filling"
@@ -145,18 +149,42 @@ def heights_above_floor(depth_m: np.ndarray, intrinsics: Any, profile: FillProfi
 
 
 def cell_tops(height: np.ndarray, hx: np.ndarray, hy: np.ndarray) -> dict[tuple[int, int], float]:
+    """Per 5 cm floor cell, the 90th-percentile height (one noisy pixel does not set a cell's top)."""
+    if height.size == 0:
+        return {}
+    ix, iy = np.floor(hx / CELL_M).astype(np.int64), np.floor(hy / CELL_M).astype(np.int64)
+    keys = (ix + 100_000) * 1_000_000 + (iy + 100_000)
+    order = np.lexsort((height, keys))
+    keys, values = keys[order], height[order]
+    starts = np.r_[0, np.nonzero(np.diff(keys))[0] + 1]
+    ends = np.r_[starts[1:], len(keys)]
     cells: dict[tuple[int, int], float] = {}
-    for key, value in zip(zip(np.floor(hx / CELL_M).astype(int), np.floor(hy / CELL_M).astype(int)), height):
-        if value > cells.get(key, -1e9):
-            cells[key] = float(value)
+    for a, b in zip(starts, ends):
+        if b - a < 2:
+            continue                                # a lone pixel is not a surface
+        top = float(values[a + int(0.9 * (b - a - 1))])
+        key = int(keys[a])
+        cells[(key // 1_000_000 - 100_000, key % 1_000_000 - 100_000)] = top
     return cells
 
 
-def fill_reading(cells: dict[tuple[int, int], float], coverage: float, profile: FillProfile) -> dict[str, Any]:
+def heights_above_plane(depth_m: np.ndarray, intrinsics: Any, coefficients, region=None):
+    """(height above the saved empty-bin floor plane, x, y) -- the measured pose, when one exists."""
+    a, b, c = (float(v) for v in coefficients)
+    rows, cols = np.nonzero((depth_m > 0.05) & np.isfinite(depth_m) & (True if region is None else region))
+    z = depth_m[rows, cols].astype(np.float64)
+    x = (cols - intrinsics.ppx) * z / intrinsics.fx
+    y = (rows - intrinsics.ppy) * z / intrinsics.fy
+    return (a * x + b * y + c - z) / math.sqrt(a * a + b * b + 1.0), x, y
+
+
+def fill_reading(cells: dict[tuple[int, int], float], coverage: float, profile: FillProfile,
+                 fill_m: float | None = None) -> dict[str, Any]:
     """The labelled fill quantities from one settled grid of cell tops (heights in metres)."""
     usable = float(profile.usable_height_m)
+    # Cells above the rim are waste heaped over it: the height fill saturates at 100 %.
     tops = np.clip(np.fromiter(cells.values(), dtype=np.float64), 0.0, usable)
-    fill = float(np.percentile(tops, 95))
+    fill = float(np.percentile(tops, 95)) if fill_m is None else float(min(max(fill_m, 0.0), usable))
     fraction = fill / usable
     reading = {
         "status": "ok", "reason": None, "coverage_pct": round(100 * coverage, 1),
@@ -216,15 +244,26 @@ class FillEstimator:
         self.profile = self._load()
         self.reading: dict[str, Any] = self._na("no settled frame processed yet")
         self.history: deque[tuple[float, dict[tuple[int, int], float]]] = deque(maxlen=60)
+        self.fill_history: deque[tuple[float, float]] = deque(maxlen=SMOOTH_FRAMES)
+        self.inconsistent = 0
 
     def _load(self) -> FillProfile:
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             saved = FillProfile(**{k: v for k, v in data.items() if k in FillProfile.__dataclass_fields__})
-            saved.source = "saved"            # a saved profile always wins over the defaults
+            saved.source = data.get("source") or "saved"     # an existing file always wins over the defaults
             return saved
+        except FileNotFoundError:
+            # First start: persist the defaults ONCE so later runs show the same values;
+            # an existing file (saved or defaulted) is never overwritten by defaults.
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self.path.write_text(json.dumps(asdict(self.default)), encoding="utf-8")
+            except OSError:
+                pass
+            return self.default
         except (OSError, ValueError, TypeError):
-            return self.default                # never written to disk: defaults cannot overwrite a saved profile
+            return self.default
 
     def save_profile(self, profile: FillProfile, frame: np.ndarray | None, region: np.ndarray | None) -> list[str]:
         problems = profile.problems()
@@ -239,6 +278,7 @@ class FillEstimator:
         os.replace(temporary, self.path)
         self.profile = profile
         self.history.clear()
+        self.fill_history.clear()
         self.reading = self._na("profile saved; waiting for a settled frame")
         return problems
 
@@ -265,42 +305,73 @@ class FillEstimator:
         return _correlation(saved, now) < MOVED_EDGE_CORRELATION
 
     def update(self, frame: np.ndarray, depth_m: np.ndarray | None, intrinsics: Any, region: np.ndarray | None,
-               motion: float | None, timestamp: float, *, depth_reason: str | None = None) -> dict[str, Any]:
+               motion: float | None, timestamp: float, *, depth_reason: str | None = None,
+               floor_plane=None, depth_label: str = "hardware depth") -> dict[str, Any]:
         self.last_processed_at = timestamp
         problems = self.profile.blocking()
         if problems:
-            self.reading = self._na("fill profile incomplete: " + "; ".join(problems))
-            return self.reading
+            return self._hold("fill profile incomplete: " + "; ".join(problems))
         if depth_m is None or intrinsics is None:
-            self.reading = self._na(depth_reason or "no calibrated metric depth for this camera")
-            return self.reading
+            return self._hold(depth_reason or "no metric depth for this camera")
         if self.camera_moved(frame, region):
-            self.reading = self._na("camera or bin moved since the fill profile was saved: re-measure and save it")
-            return self.reading
+            return self._hold("camera or bin moved since the fill profile was saved: re-save it")
         if motion is not None and motion > STABLE_MOTION:
-            if self.reading.get("status") == "ok":
-                self.reading["stale"] = True       # keep the last settled reading, marked
-            return self.reading
-        height, hx, hy = heights_above_floor(depth_m, intrinsics, self.profile, region)
+            return self._hold("scene moving", stale_only=True)
+        depth_m, intrinsics, region = _subsample(depth_m, intrinsics, region)
+        if floor_plane is not None:
+            height, hx, hy = heights_above_plane(depth_m, intrinsics, floor_plane, region)
+            geometry = "saved empty-bin floor plane (measured pose)"
+        else:
+            height, hx, hy = heights_above_floor(depth_m, intrinsics, self.profile, region)
+            geometry = ("camera assumed looking straight down (tilt not measured)"
+                        if self.profile.tilt_from_vertical_deg is None else "measured tilt")
         total = int(np.count_nonzero(region)) if region is not None else depth_m.size
-        keep = (height > -0.10) & (height < self.profile.usable_height_m + RIM_TOLERANCE_M)
+        usable = self.profile.usable_height_m
+        below = height < -BELOW_FLOOR_M
+        keep = ~below & (height < usable + RIM_TOLERANCE_M)
         coverage = float(np.count_nonzero(keep)) / max(1, total)
+        warnings = []
+        below_share = float(np.count_nonzero(below)) / max(1, height.size)
+        if below_share > BELOW_FLOOR_SHARE:
+            deep = float(-np.percentile(height[below], 50)) * 100
+            warnings.append(f"depth quality: {below_share:.0%} of pixels lie ~{deep:.0f} cm below the assumed floor "
+                            f"({geometry}; floor reference {self.profile.camera_to_empty_floor_m * 100:.0f} cm). "
+                            "Likely a tilted camera read as straight down, or the floor reference is short -- "
+                            "enter tilt or capture an empty-bin baseline. These pixels are excluded, not clamped.")
         if coverage < MIN_COVERAGE:
-            self.reading = self._na(f"only {coverage:.0%} of the bin region has valid depth")
-            return self.reading
+            return self._hold(f"only {coverage:.0%} of the bin region has valid depth", warnings=warnings)
         cells = cell_tops(height[keep], hx[keep], hy[keep])
+        if len(cells) < 8:
+            return self._hold("too few surface cells with valid depth", warnings=warnings)
+        reading = fill_reading(cells, coverage, self.profile)
+        frame_fill = reading["max_fill_height_cm"] / 100.0
+        recent = [v for _, v in self.fill_history]
+        if len(recent) >= 3 and abs(frame_fill - float(np.median(recent))) > INCONSISTENT_M:
+            self.inconsistent += 1
+            if self.inconsistent < 5:           # a lasting change (5 frames) is accepted as real
+                return self._hold(f"inconsistent depth frame ignored ({frame_fill * 100:.0f} cm vs "
+                                  f"{np.median(recent) * 100:.0f} cm recent)", warnings=warnings, stale_only=True)
+            self.fill_history.clear()
+        self.inconsistent = 0
+        self.fill_history.append((timestamp, frame_fill))
+        smoothed = float(np.median([v for _, v in self.fill_history]))
+        reading = fill_reading(cells, coverage, self.profile, fill_m=smoothed)
         self.history.append((timestamp, cells))
         self.last_valid_at = timestamp
-        warnings = []
-        # Plausibility of the assumed floor distance, from this camera's own depth:
-        # the empty floor cannot be seen much farther away than the measured distance.
-        far = float(np.percentile(height[(height > -1.0)], 1)) if height.size else 0.0
-        if far < -0.15:
-            warnings.append(f"depth reaches {-far * 100:.0f} cm below the assumed floor: the floor distance "
-                            "may belong to the other camera or be too short")
-        self.reading = {**fill_reading(cells, coverage, self.profile), "camera_id": self.camera_id,
-                        "updated_at": timestamp, "stale": False, "warnings": warnings}
-        self._decorate(self.reading)
+        self.reading = {**reading, "camera_id": self.camera_id, "updated_at": timestamp, "stale": False,
+                        "warnings": warnings, "geometry": geometry, "depth_source": depth_label,
+                        "frames_smoothed": len(self.fill_history)}
+        return self._decorate(self.reading)
+
+    def _hold(self, reason: str, *, warnings: list[str] | None = None, stale_only: bool = False) -> dict[str, Any]:
+        """Keep the last valid reading (marked stale, with its age) instead of inventing a fresh one."""
+        if self.reading.get("status") == "ok":
+            self.reading.update(stale=True, stale_reason=reason, warnings=warnings or self.reading.get("warnings", []))
+            return self._decorate(self.reading)
+        if stale_only and self.reading.get("status") == "na" and self.reading.get("reason"):
+            return self._decorate(self.reading)
+        self.reading = self._na(reason)
+        self.reading["warnings"] = warnings or []
         return self.reading
 
     def added_height_m(self, started_at: float, finalized_at: float) -> tuple[float | None, str | None]:
@@ -316,37 +387,43 @@ class FillEstimator:
 
 
 def default_profile(camera_id: str, config: Any) -> FillProfile:
-    """Provisional installation defaults for one camera (never written to disk).
+    """Shared installation defaults, per camera (persisted once on first start).
 
-    The ~110 cm floor distance was measured from ONE camera. Which one comes
-    from configuration, in this order: LOCALLIFE_FLOOR_DISTANCE_CAMERA; else a
-    Logitech operator-measured reference distance (that value, not 110 cm); else
-    the RealSense, the only camera with hardware metric depth -- stated as an
-    assumption on the dashboard. The other camera gets no invented distance.
+    One bin, so the usable floor-to-rim height (100 cm) and capacity (660 L,
+    nominal) are shared. The camera-to-floor reference is the RealSense's
+    measured ~110 cm; the Logitech starts from the same value as an explicitly
+    APPROXIMATE shared-installation assumption (its tripod may differ), unless
+    its own operator-measured reference distance is configured. 100 cm usable
+    height and 110 cm camera range are different quantities and stay separate.
+    Intrinsics, pose and depth scaling stay per camera.
     """
-    named = os.environ.get("LOCALLIFE_FLOOR_DISTANCE_CAMERA", "").strip().lower()
-    logitech_m = float(getattr(config, "logitech_reference_distance_m", 0.0) or 0.0)
     try:
         distance_m = float(os.environ.get("LOCALLIFE_FLOOR_DISTANCE_CM", "110")) / 100.0
     except ValueError:
         distance_m = DEFAULT_FLOOR_DISTANCE_M
-    notes = [f"usable height {DEFAULT_USABLE_HEIGHT_M * 100:.0f} cm is approximate "
-             f"({distance_m * 100:.0f} cm to floor minus an estimated {DEFAULT_ABOVE_RIM_M * 100:.0f} cm above the rim)"]
-    if named in ("realsense", "logitech"):
-        owner, why = named, "camera named by LOCALLIFE_FLOOR_DISTANCE_CAMERA"
-    elif logitech_m > 0:
-        owner, distance_m, why = "logitech", logitech_m, "Logitech operator-measured reference distance"
+    notes = [f"usable height {DEFAULT_USABLE_HEIGHT_M * 100:.0f} cm (shared bin value, approximate)"]
+    logitech_m = float(getattr(config, "logitech_reference_distance_m", 0.0) or 0.0)
+    if camera_id == "logitech" and logitech_m > 0:
+        distance_m, why = logitech_m, "Logitech operator-measured reference distance"
+    elif camera_id == "logitech":
+        why = "approximate shared-installation assumption copied from the RealSense reference; edit if the tripods differ"
     else:
-        owner, why = "realsense", ("assigned to the RealSense by default (no camera named in configuration); "
-                                   "if it was measured from the Logitech, correct it in Installation settings")
-    profile = FillProfile(camera_id=camera_id, usable_height_m=DEFAULT_USABLE_HEIGHT_M, source="default-provisional")
-    if camera_id == owner:
-        profile.camera_to_empty_floor_m = distance_m
-        profile.camera_above_rim_m = DEFAULT_ABOVE_RIM_M
-        profile.notes = [f"floor distance {distance_m * 100:.0f} cm: {why}"] + notes
-    else:
-        profile.notes = notes
-    return profile
+        why = "RealSense measured reference"
+    return FillProfile(camera_id=camera_id, camera_to_empty_floor_m=distance_m, usable_height_m=DEFAULT_USABLE_HEIGHT_M,
+                       camera_above_rim_m=DEFAULT_ABOVE_RIM_M, source="default-provisional",
+                       notes=[f"floor reference {distance_m * 100:.0f} cm: {why}"] + notes)
+
+
+def _subsample(depth_m: np.ndarray, intrinsics: Any, region: np.ndarray | None, target: int = 160):
+    """At most ~target px wide: the fill needs 5 cm cells, not every pixel (keeps each frame cheap)."""
+    step = max(1, int(depth_m.shape[1] // target))
+    if step == 1:
+        return depth_m, intrinsics, region
+    from types import SimpleNamespace
+    small = depth_m[::step, ::step]
+    geometry = SimpleNamespace(fx=intrinsics.fx / step, fy=intrinsics.fy / step,
+                               ppx=intrinsics.ppx / step, ppy=intrinsics.ppy / step)
+    return small, geometry, None if region is None else region[::step, ::step]
 
 
 def height_map(depth_m: np.ndarray, intrinsics: Any, profile: FillProfile) -> np.ndarray:

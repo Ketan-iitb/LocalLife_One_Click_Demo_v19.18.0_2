@@ -19,10 +19,11 @@ Each camera runs its own time-based watcher, fed on EVERY processed frame
   rise where depth exists) not explained by a known bag moving. Nothing needs
   a fill profile, litres or a rise of the bin's maximum height.
 
-Both cameras confirming within MERGE_WINDOW_S count once (evidence kept per
-camera; "ambiguous" when more than one pairing was possible). The session and
-its events persist to JSON and resume after a restart; a CSV row is appended
-once per event (after the merge window) and once per rejected candidate.
+Each camera counts INDEPENDENTLY (its own counter and events; nothing copied
+between cameras). Sizes arriving a few frames later update the same event.
+The session and events persist to JSON and resume after a restart; a CSV row
+(camera + session + event id) is appended once per event, after FINALISE_S,
+and once per rejected candidate.
 """
 
 from __future__ import annotations
@@ -46,9 +47,9 @@ LOGGER = logging.getLogger(__name__)
 SMALL = (160, 120)             # evaluation resolution (w, h)
 WARMUP_S = 4.0                 # minimum time before the baseline is taken
 BASELINE_MAX_S = 20.0          # take the baseline even if the scene never stills
-SETTLE_S = 1.5                 # stillness needed to evaluate a candidate
+SETTLE_S = 1.0                 # stillness needed to evaluate a candidate
 CANDIDATE_TIMEOUT_S = 30.0     # candidate that never settles -> rejected
-MERGE_WINDOW_S = 12.0          # two cameras' confirmations this close are one bag
+FINALISE_S = 12.0              # late measurements update an event this long; then its CSV row is written
 PIXEL_DIFF = 28                # grey-level change counted as changed
 MOTION_ENTER = 0.02            # changed fraction between frames that opens a candidate
 MOTION_STILL = 0.008           # below this the frame is still
@@ -65,7 +66,8 @@ ENVELOPE_LABEL = "new-bag outer envelope (visible L x W x added height box)"
 DELTA_LABEL = "net before/after change in bin occupancy (whole-bin surface, separate method)"
 
 CSV_FIELDS = (
-    "session_id", "event_id", "counted", "count_after", "deposit_time", "cameras", "association", "evidence",
+    "session_id", "camera", "event_id", "counted", "count_after", "deposit_time", "cameras", "association",
+    "confidence", "evidence",
     "track_id", "colour", "object_type", "detector_label", "material", "length_cm", "width_cm", "height_cm",
     "height_source", "envelope_l", "delta_occupancy_l", "measurement_status", "reason",
 )
@@ -103,8 +105,14 @@ class FrameEvidence:
 
 
 def _changed(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Per-pixel change: the largest per-channel difference (a red bag can match the grey level)."""
-    diff = np.abs(a.astype(np.int16) - b.astype(np.int16))
+    """Per-pixel change: the largest per-channel difference (a red bag can match the grey level).
+
+    The median difference is removed first, per channel: an auto-exposure or
+    lighting step shifts the whole view and is not an object.
+    """
+    diff = a.astype(np.int16) - b.astype(np.int16)
+    offset = np.median(diff.reshape(-1, diff.shape[-1]) if diff.ndim == 3 else diff.ravel(), axis=0)
+    diff = np.abs(diff - offset.astype(np.int16))
     return (diff.max(axis=-1) if diff.ndim == 3 else diff) > PIXEL_DIFF
 
 
@@ -145,6 +153,8 @@ class CameraWatcher:
         self.last_frame_at: float | None = None
         self.resync = False
         self.votes: dict[int, dict[str, Counter]] = {}
+        self.noise = 0.0                    # typical frame-to-frame change of a still scene (sensor/JPEG)
+        self.pending: list[tuple[dict[str, Any], int, float]] = []   # (event, track id, until) for late sizes
 
     # ----------------------------------------------------------- helpers
     def _vote(self, tracks: list[TrackInfo]) -> None:
@@ -188,7 +198,12 @@ class CameraWatcher:
             diff = _changed(ev.grey, self.prev_grey)
             self.motion = float(np.count_nonzero(diff & region)) / max(1, int(np.count_nonzero(region)))
         self.prev_grey = ev.grey
-        still = self.motion < MOTION_STILL
+        # Thresholds follow this camera's own noise floor, so a noisy dark view still settles.
+        if self.motion < max(MOTION_ENTER, 4 * self.noise):
+            self.noise = 0.9 * self.noise + 0.1 * self.motion
+        still_limit = max(MOTION_STILL, 2.5 * self.noise)
+        enter_limit = max(MOTION_ENTER, 4 * self.noise)
+        still = self.motion < still_limit
         if still:
             self.still_since = self.still_since if self.still_since is not None else now
         else:
@@ -215,10 +230,10 @@ class CameraWatcher:
                     self.resync = False
                 return None
             unknown = [t for t in ev.tracks if bag_like(t.label) and not self._known(t)]
-            if self.motion >= MOTION_ENTER or unknown:
+            if self.motion >= enter_limit or unknown:
                 self.state = "candidate"
                 self.candidate_since = now
-                self.candidate_trigger = "motion" if self.motion >= MOTION_ENTER else "new track"
+                self.candidate_trigger = "motion" if self.motion >= enter_limit else "new track"
                 self.reason = f"candidate: {self.candidate_trigger}"
             else:
                 # Known tracks drift a little between frames; keep boxes current while nothing happens.
@@ -317,32 +332,35 @@ class CameraWatcher:
             reason = ("new track id but the scene is unchanged (re-detection / ID switch)" if new_tracks
                       else "no persistent change after settling (hand, occlusion or transient)")
             return "rejected", {**details, "reason": reason}
-        explained = np.zeros_like(change)
-        for t in ev.tracks:
-            prior = old.get(t.track_id)
-            if prior is not None and (_iou(prior.box, t.box) < 0.85):
-                explained |= _box_mask(prior.box, change.shape) | _box_mask(t.box, change.shape)
-        rest = change & ~explained
-        if float(np.count_nonzero(rest)) / total < MIN_CHANGE:
-            return "rejected", {**details, "reason": "change explained by an existing bag moving"}
+        # Known boxes jitter on a crowded pile; that is not an explanation for new
+        # material. A real move is recognised by the spot it vacated (_vacated).
+        rest = change
+        depth_note = ""
         if rise is not None:
-            risen = rest & (rise >= MIN_RISE_M)
-            if np.count_nonzero(risen) < 0.5 * np.count_nonzero(rest):
-                return "rejected", {**details, "reason": "change without a local surface rise (lighting or an item shifted)"}
-            rest = risen
+            valid = (ev.depth > 0.05) & (before.depth > 0.05) & rest
+            if np.count_nonzero(valid) >= 0.3 * np.count_nonzero(rest):
+                risen = valid & (rise >= MIN_RISE_M)
+                if np.count_nonzero(risen) < 0.35 * np.count_nonzero(valid):
+                    return "rejected", {**details, "reason": "change without a local surface rise where depth "
+                                                             "is valid (lighting, shadow or an item shifted)"}
+                rest = risen
+            else:
+                depth_note = ", depth too sparse there to check the rise"
         try:
             import cv2
             n, labels, stats, _ = cv2.connectedComponentsWithStats(rest.astype(np.uint8), 8)
             largest = int(stats[1:, cv2.CC_STAT_AREA].max()) if n > 1 else 0
         except ImportError:  # pragma: no cover
-            largest, labels = int(np.count_nonzero(rest)), None
+            largest, labels, n, stats = int(np.count_nonzero(rest)), None, 0, None
         if largest < 0.6 * np.count_nonzero(rest) or largest < MIN_CHANGE * total:
             return "rejected", {**details, "reason": "scattered change, not one new object"}
         if self._vacated(ev, before, change, rest, region):
             return "rejected", {**details, "reason": "an existing bag moved: its old spot was vacated"}
+        second = int(np.sort(stats[1:, cv2.CC_STAT_AREA])[-2]) if n > 2 else 0
+        details["ambiguous"] = second >= 0.4 * largest and second >= MIN_CHANGE * total
         return "confirmed", {**details, "evidence": "persistent new foreground region"
-                             + (" with local depth rise" if rise is not None else " (no depth)"),
-                             "track": None, "mask": rest, "rise": rise}
+                             + (" with local depth rise" if rise is not None and not depth_note else " (no depth)")
+                             + depth_note, "track": None, "mask": rest, "rise": rise}
 
 
 class SessionDeposits:
@@ -418,6 +436,8 @@ class SessionDeposits:
                 # and a resumed session re-takes its baseline: track ids do not survive a restart).
                 watcher = self.watchers[ev.camera] = CameraWatcher(ev.camera, ev.timestamp)
             outcome = watcher.observe(ev)
+            if watcher.pending:
+                self._late_sizes(ev, watcher)
             self._flush_csv()
             if outcome is None:
                 return None
@@ -427,7 +447,7 @@ class SessionDeposits:
                 return None
             if kind == "rejected":
                 row = {"session_id": self.session_id, "event_id": f"R-{ev.camera}-{uuid.uuid4().hex[:8]}",
-                       "counted": False, "deposit_time": ev.timestamp, "cameras": [ev.camera],
+                       "counted": False, "deposit_time": ev.timestamp, "cameras": [ev.camera], "camera": ev.camera,
                        "reason": details["reason"], "evidence": details.get("trigger")}
                 self.rejected.append(row)
                 self._write_csv(row)
@@ -435,36 +455,55 @@ class SessionDeposits:
                 return None
             return self._confirm(ev, watcher, details)
 
+    def count_for(self, camera: str) -> int:
+        return sum(1 for e in self.events if e["camera"] == camera)
+
     def _confirm(self, ev: FrameEvidence, watcher: CameraWatcher, details: dict[str, Any]) -> dict[str, Any]:
+        """Each camera counts its own deposits: nothing is merged with, or copied from, the other camera."""
         track: TrackInfo | None = details.get("track")
         record = self._measure(ev, watcher, details, track)
-        twins = [e for e in self.events if ev.camera not in e["cameras"]
-                 and abs(e["deposit_time"] - record["deposit_time"]) <= MERGE_WINDOW_S]
-        if twins:
-            twin = min(twins, key=lambda e: abs(e["deposit_time"] - record["deposit_time"]))
-            twin["cameras"].append(ev.camera)
-            twin["evidence"][ev.camera] = record["evidence"][ev.camera]
-            if len(twins) > 1:
-                twin["association"] = f"ambiguous: {len(twins)} possible matches, merged with the nearest"
-            rank = {"measured": 3, "approximate": 2, "partial": 1, "na": 0}
-            if rank[record["measurement_status"]] > rank[twin["measurement_status"]]:
-                for key in ("length_cm", "width_cm", "height_cm", "height_source", "envelope_l",
-                            "measurement_status", "reason"):
-                    twin[key] = record[key]
-            for key in ("colour", "material", "object_type", "detector_label"):
-                if twin[key] in (None, "unknown", "UNKNOWN") and record[key] not in (None, "unknown", "UNKNOWN"):
-                    twin[key] = record[key]
-            self._save()
-            LOGGER.info("%s confirmed the same deposit as %s", ev.camera, twin["event_id"])
-            return twin
-        record["count_after"] = len(self.events) + 1
+        number = self.count_for(ev.camera) + 1
+        record["event_id"] = f"{'RS' if ev.camera == 'realsense' else 'LG'}-{self.session_id[-6:]}-{number:03d}"
+        record["count_after"] = number
+        if details.get("ambiguous"):
+            record["association"] = "ambiguous: may be 2 bags seen as one observation (counted once, check)"
         self.events.append(record)
         self.last_confirmed_at = record["deposit_time"]
+        if track is not None:
+            # Sizes often settle a few frames after the count: update this same event later.
+            watcher.pending.append((record, track.track_id, ev.timestamp + FINALISE_S))
         self._pending_csv.append(record)
         self._save()
-        LOGGER.info("NEW bag %s confirmed by %s (%s); session count %d", record["event_id"], ev.camera,
-                    details["evidence"], len(self.events))
+        LOGGER.info("NEW bag %s confirmed by %s (%s); %s count %d", record["event_id"], ev.camera,
+                    details["evidence"], ev.camera, number)
         return record
+
+    def _late_sizes(self, ev: FrameEvidence, watcher: CameraWatcher) -> None:
+        keep = []
+        changed = False
+        for record, track_id, until in watcher.pending:
+            if ev.timestamp > until:
+                continue
+            track = next((t for t in ev.tracks if t.track_id == track_id), None)
+            if track is not None and not track.rejection and track.length_mm and track.width_mm:
+                if record["length_cm"] is None:
+                    record["length_cm"], record["width_cm"] = _r(track.length_mm / 10), _r(track.width_mm / 10)
+                    changed = True
+                if record["height_cm"] is None and track.height_mm:
+                    record["height_cm"] = _r(track.height_mm / 10)
+                    record["height_source"] = "detector height (surface under the bag not measured)"
+                    changed = True
+                if record["length_cm"] and record["width_cm"] and record["height_cm"]:
+                    record["envelope_l"] = round(record["length_cm"] * record["width_cm"] * record["height_cm"]
+                                                 / 1000.0, 1)
+                    if record["measurement_status"] in ("na", "partial"):
+                        record["measurement_status"] = "approximate"
+                        record["reason"] = "size added after the count (same event)"
+                    continue                       # complete: stop following it
+            keep.append((record, track_id, until))
+        watcher.pending = keep
+        if changed:
+            self._save()
 
     def _measure(self, ev, watcher, details, track) -> dict[str, Any]:
         reasons: list[str] = []
@@ -507,9 +546,13 @@ class SessionDeposits:
             status = "approximate"
         track_id = None if track is None else track.track_id
         label = "unknown" if track is None else track.label
+        evidence = details["evidence"]
+        confidence = ("high" if track is not None and "rise" in evidence or (track is not None and ev.depth is not None)
+                      else "medium" if track is not None or "depth rise" in evidence else "low (foreground only)")
         material = watcher.consensus(track_id, "material", "UNKNOWN")
         return {
-            "session_id": self.session_id, "event_id": f"D-{uuid.uuid4().hex[:8]}", "counted": True,
+            "session_id": self.session_id, "event_id": None, "counted": True, "camera": ev.camera,
+            "confidence": confidence,
             "count_after": None, "deposit_time": float(ev.timestamp), "cameras": [ev.camera],
             "association": "single camera", "track_id": track_id,
             "colour": watcher.consensus(track_id, "colour", "unknown" if track is None else track.colour),
@@ -526,8 +569,8 @@ class SessionDeposits:
     def attach_occupancy(self, camera: str, event: Any, extra: dict[str, Any] | None = None) -> None:
         """A whole-bin before/after occupancy event is EVIDENCE only; it never counts on its own."""
         with self._lock:
-            near = [e for e in self.events if abs(e["deposit_time"] - event.finalized_at) <= MERGE_WINDOW_S
-                    and camera in e["cameras"] and e["delta_occupancy_l"] is None]
+            near = [e for e in self.events if abs(e["deposit_time"] - event.finalized_at) <= FINALISE_S
+                    and e["camera"] == camera and e["delta_occupancy_l"] is None]
             if near and event.delta_occupancy_l is not None:
                 near[-1]["delta_occupancy_l"] = event.delta_occupancy_l
                 self._save()
@@ -537,7 +580,7 @@ class SessionDeposits:
         now = max(self.clock(), self._last_frame_at)      # frame time: the clock the events use
         keep = []
         for record in self._pending_csv:
-            if force or now - record["deposit_time"] > MERGE_WINDOW_S:
+            if force or now - record["deposit_time"] > FINALISE_S:
                 self._write_csv(record)
             else:
                 keep.append(record)
@@ -561,7 +604,7 @@ class SessionDeposits:
                                  if isinstance(evidence, dict) else evidence,
                                  "deposit_time": time.strftime("%Y-%m-%d %H:%M:%S",
                                                                time.localtime(record["deposit_time"]))})
-            self.written.add(record["event_id"])
+            self.written.add(record["event_id"])        # event ids carry camera + session
         except OSError:
             LOGGER.exception("could not append the deposit CSV")
 
@@ -577,6 +620,13 @@ class SessionDeposits:
             status = ("initialising" if not states or "initialising" in states else
                       "settling" if "settling" in states else "candidate" if "candidate" in states else "watching")
             frames = [w["last_frame_at"] for w in cams.values() if w["last_frame_at"]]
+            for camera, block in cams.items():
+                mine = [e for e in self.events if e["camera"] == camera]
+                block.update(new_bags=len(mine), last_confirmed_at=mine[-1]["deposit_time"] if mine else None,
+                             events=[dict(e) for e in mine],
+                             rejected=sum(1 for r in self.rejected if r["cameras"][0] == camera),
+                             latest_rejection=next((r["reason"] for r in reversed(self.rejected)
+                                                    if r["cameras"][0] == camera), None))
             return {
                 "session_id": self.session_id, "session_started_at": self.session_started_at,
                 "elapsed_s": round(now - self.session_started_at, 1), "resumed": self.resumed,

@@ -28,8 +28,8 @@ Every processed frame of each camera feeds a time-based watcher (`session_deposi
 
   Detector ID churn is counted, not logged per row.
 - **Pillow/textile labels** count as bag-like (they are misread bags); person/hand never.
-- **Both cameras within 12 s** count once, with evidence kept per camera. If more than one pairing
-  is possible the event is marked "ambiguous" and merged with the nearest.
+- **Independent cameras:** RealSense and Logitech each keep their own counter and events (ids `RS-…` / `LG-…`); nothing is merged or copied. A change that looks like two bags in one observation is counted once and flagged "ambiguous".
+- Sizes that arrive after the count update the same event for 12 s; then its CSV row (camera + session + event id) is written.
 - **Persistence:** the session and events are saved to `results/session/session_state.json` and
   resumed after a restart; a browser refresh changes nothing. The CSV
   `results/session/session_deposits.csv` gets one row per event (written after the merge window)
@@ -49,6 +49,14 @@ Every processed frame of each camera feeds a time-based watcher (`session_deposi
   polygon. A missing polygon never disables counting.
 
 ## Fill level (per camera)
+- **Shared defaults (both cameras, persisted once):** 110 cm camera→floor reference (Logitech: approximate
+  shared-installation assumption), 100 cm usable height, 660 L. Editable in one collapsed section.
+- **Geometry:** the saved empty-bin floor plane when one exists; otherwise straight-down approximation.
+  Logitech uses its own model depth (approximate scale), never the RealSense's.
+- **Robustness:** p90 per 5 cm cell, p95 over cells, median of the last 5 settled frames; a frame
+  15 cm off the recent median is ignored (the last valid value is shown with its age); pixels more
+  than 10 cm below the floor are excluded and raise a visible depth-quality warning.
+
 - **Provisional defaults**, shown at start-up and never written to disk:
   - floor distance 110 cm for the camera named by `LOCALLIFE_FLOOR_DISTANCE_CAMERA`; otherwise
     the Logitech's own measured reference distance if one is set; otherwise the RealSense, shown as

@@ -112,7 +112,7 @@ class SequenceTests(unittest.TestCase):
             scene.bags[2]["box"] = (120, 10, 150, 40)
             run(counter, scene, 18.0, 22.0)
             self.assertEqual(counter.count, 2)
-            self.assertIn("existing bag moving", counter.rejected[-1]["reason"])
+            self.assertIn("existing bag moved", counter.rejected[-1]["reason"])
 
             # Temporary disappearance + ID switch of bag 3: still 2
             hidden = scene.bags.pop(3)
@@ -227,10 +227,12 @@ class SequenceTests(unittest.TestCase):
             lg.add(77, (70, 50, 110, 85))
             run(counter, rs, 8.0, 12.0)
             run(counter, lg, 8.5, 12.5)
-            self.assertEqual(counter.count, 1)
-            event = counter.events[0]
-            self.assertEqual(sorted(event["cameras"]), ["logitech", "realsense"])
-            self.assertEqual(event["height_cm"], 25.0)                  # the measured camera's size kept
+            # Independent counters: each observing camera counts the drop once, nothing copied across.
+            self.assertEqual((counter.count_for("realsense"), counter.count_for("logitech")), (1, 1))
+            rs_event, lg_event = (next(e for e in counter.events if e["camera"] == c) for c in ("realsense", "logitech"))
+            self.assertTrue(rs_event["event_id"].startswith("RS-") and lg_event["event_id"].startswith("LG-"))
+            self.assertEqual(rs_event["height_cm"], 25.0)
+            self.assertTrue(lg_event["height_source"].startswith("detector"))  # its own, never RealSense's
 
 
 class DimensionTests(unittest.TestCase):

@@ -3037,8 +3037,12 @@ class VisionPipeline:
 
         self._apply_bin_bounds(detections)
         self._emit_deposit_evidence(frame, detections, depth_m, intrinsics, bin_region)
+        # The saved EMPTY-bin floor plane is the measured pose; a plane fitted through
+        # today's waste is not a floor and is never used for the fill.
+        fill_plane = (occupancy_plane.coefficients if self.last_occupancy_absolute and occupancy_plane is not None
+                      else None)
         self._update_fill(frame, depth_m, intrinsics, calibrated_prediction, measure_intrinsics,
-                          bin_region, time.time())    # same wall clock as occupancy events
+                          bin_region, time.time(), fill_plane)    # same wall clock as occupancy events
         if persist:
             self.store.append_jsonl("frames.jsonl", analysis.to_dict())
             self._finalise_settled_measurements(detections, timestamp)
@@ -3409,26 +3413,33 @@ class VisionPipeline:
             LOGGER.exception("%s deposit evidence failed", self.camera_id)
 
     def _update_fill(self, frame, depth_m, intrinsics, calibrated_prediction, measure_intrinsics,
-                     bin_region, timestamp: float) -> None:
-        """Refresh this camera's fill reading from its own metric depth (settled frames only).
+                     bin_region, timestamp: float, floor_plane=None) -> None:
+        """Refresh this camera's fill reading from its OWN depth (settled frames only).
 
-        RealSense: aligned hardware depth. Logitech: only a depth map scaled by
-        its OWN measured camera-to-floor distance; a scale borrowed from the
-        RealSense or an unverified model scale gives N/A with the reason.
+        RealSense: aligned hardware depth. Logitech: its own monocular depth in
+        the scale its existing calibration produced (approximate); a scale borrowed
+        from the RealSense, or unscaled relative depth, gives "unavailable".
         """
         try:
-            if self.camera_id == "logitech":
-                if self.calibration_mode != "independent-measured-distance":
-                    self.fill.update(frame, None, None, bin_region, self._last_motion, timestamp,
-                                     depth_reason=f"Logitech depth not independently metric-calibrated "
-                                                  f"(mode: {self.calibration_mode})")
-                    return
-                depth, geometry = calibrated_prediction, measure_intrinsics
-            else:
-                depth, geometry = depth_m, intrinsics
             motion = self.__dict__.get("_frame_motion", self._last_motion)
-            self.fill.update(frame, depth, geometry, bin_region, motion, timestamp,
-                             depth_reason="no aligned depth frame")
+            if self.camera_id == "logitech":
+                mode = self.calibration_mode
+                if mode in ("aligned-realsense-reference", "relative-depth-unscaled-unavailable"):
+                    self.fill.update(frame, None, None, bin_region, motion, timestamp,
+                                     depth_reason=f"Logitech depth has no own metric scale (mode: {mode})")
+                    return
+                if calibrated_prediction is None or calibrated_prediction.shape[:2] != frame.shape[:2]:
+                    self.fill.update(frame, None, None, bin_region, motion, timestamp,
+                                     depth_reason="no Logitech depth-model output for this frame")
+                    return
+                geometry = measure_intrinsics or self._field_of_view_intrinsics(frame.shape)
+                self.fill.update(frame, calibrated_prediction, geometry, bin_region, motion, timestamp,
+                                 floor_plane=floor_plane,
+                                 depth_label=f"monocular model depth, approximate scale ({mode})")
+                return
+            self.fill.update(frame, depth_m, intrinsics, bin_region, motion, timestamp,
+                             depth_reason="no aligned depth frame", floor_plane=floor_plane,
+                             depth_label="RealSense aligned hardware depth")
         except Exception:  # noqa: BLE001 - the fill panel must never stop the pipeline
             LOGGER.exception("%s fill update failed", self.camera_id)
 

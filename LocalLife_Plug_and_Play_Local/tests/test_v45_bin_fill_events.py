@@ -108,7 +108,9 @@ class EstimatorTests(unittest.TestCase):
             self.assertEqual((moving["updated_at"], moving["stale"]), (3.0, True))      # not refreshed
             moved = np.zeros_like(frame)
             moved[80:100, 100:150] = 255
-            self.assertIn("moved", est.update(moved, depth, K, region, 0.0, 5.0)["reason"])
+            held = est.update(moved, depth, K, region, 0.0, 5.0)
+            self.assertEqual((held["updated_at"], held["stale"]), (3.0, True))          # last valid kept, marked
+            self.assertIn("moved", held["stale_reason"])
 
     def test_new_bag_height_is_after_top_minus_before_surface_under_it(self) -> None:
         with TemporaryDirectory() as d:
@@ -148,16 +150,23 @@ class ServerTests(unittest.TestCase):
                 "camera_to_empty_floor_cm": 110, "distance_kind": "vertical", "tilt_from_vertical_deg": 0,
                 "usable_height_cm": 80}).get_json()
             self.assertTrue(saved["ok"], saved)
-            self.assertIsNone(manager.camera("logitech").fill.profile.camera_to_empty_floor_m)  # not invented
+            self.assertEqual(manager.camera("logitech").fill.profile.camera_to_empty_floor_m, 1.10)  # shared default
 
             station = manager.camera("realsense")
             depth = _render(_profile(camera_to_empty_floor_m=1.10, usable_height_m=0.80), lambda x, y: 0.24 + 0 * x)
             station._update_fill(np.zeros((K.height, K.width, 3), np.uint8), depth, K, None, None, None, 5.0)
             self.assertEqual(station.fill.reading["height_fill_pct"], 30.0)
             logi = manager.camera("logitech")
-            logi._update_fill(np.zeros((K.height, K.width, 3), np.uint8), None, None, depth, K, None, 5.0)
+            logi._update_fill(np.zeros((K.height, K.width, 3), np.uint8), None, None, None, K, None, 5.0)
             self.assertEqual(logi.fill.reading["status"], "na")
-            self.assertIn("distance not measured", logi.fill.reading["reason"])
+            self.assertIn("no Logitech depth-model output", logi.fill.reading["reason"])
+            # Its own model depth + the shared 110 cm / 100 cm defaults: an independent, approximate reading.
+            logi_depth = _render(_profile(camera_to_empty_floor_m=1.10), lambda x, y: 0.50 + 0 * x)
+            logi._update_fill(np.zeros((K.height, K.width, 3), np.uint8), None, None, logi_depth, K, None, 6.0)
+            self.assertEqual(logi.fill.reading["height_fill_pct"], 50.0)
+            self.assertEqual(logi.fill.reading["rough_litres"], 330.0)
+            self.assertIn("monocular model depth, approximate", logi.fill.reading["depth_source"])
+            self.assertEqual(station.fill.reading["height_fill_pct"], 30.0)        # RealSense unaffected
 
             # Every processed frame reaches the counter, with no fill profile or zone needed.
             frame = np.full((K.height, K.width, 3), 90, np.uint8)
@@ -180,17 +189,19 @@ class ServerTests(unittest.TestCase):
             self.assertEqual((default.camera_to_empty_floor_m, default.usable_height_m), (1.10, 1.00))
             self.assertEqual(default.status, "approximate")
             self.assertTrue(any("tilt not measured" in a for a in default.assumptions()))
-            self.assertTrue(any("assigned to the RealSense by default" in n for n in default.notes))
-            self.assertIsNone(bf.default_profile("logitech", config).camera_to_empty_floor_m)
-            config.logitech_reference_distance_m = 1.12       # the Logitech's own measured distance
+            logi = bf.default_profile("logitech", config)          # shared installation defaults, no form needed
+            self.assertEqual((logi.camera_to_empty_floor_m, logi.usable_height_m), (1.10, 1.00))
+            self.assertTrue(any("approximate shared-installation assumption" in n for n in logi.notes))
+            self.assertEqual(logi.blocking(), [])
+            config.logitech_reference_distance_m = 1.12       # the Logitech's own measured distance wins
             self.assertEqual(bf.default_profile("logitech", config).camera_to_empty_floor_m, 1.12)
-            self.assertIsNone(bf.default_profile("realsense", config).camera_to_empty_floor_m)
+            self.assertEqual(bf.default_profile("realsense", config).camera_to_empty_floor_m, 1.10)
             config.logitech_reference_distance_m = 0.0
 
             store = Path(d) / "realsense" / "bin_profile"          # where the RealSense station keeps it
             est = bf.FillEstimator("realsense", store, default)
             self.assertEqual(est.profile.source, "default-provisional")
-            self.assertFalse(est.path.exists())                       # defaults are never written
+            self.assertTrue(est.path.exists())                        # defaults persisted once
             est.save_profile(_profile(camera_to_empty_floor_m=1.30, usable_height_m=1.05, tilt_from_vertical_deg=10),
                              None, None)
             again = bf.FillEstimator("realsense", store, default)
@@ -202,6 +213,31 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(got["status"], "measured")
             profile = client.get("/api/bin-fill").get_json()["cameras"]["realsense"]["profile"]
             self.assertEqual((profile["camera_to_empty_floor_m"], profile["usable_height_m"]), (1.30, 0.98))
+
+
+class FillQualityTests(unittest.TestCase):
+    def test_50cm_is_50pct_and_330l(self) -> None:
+        cells = {(i, j): 0.50 for i in range(10) for j in range(10)}
+        r = bf.fill_reading(cells, 0.9, _profile())
+        self.assertEqual((r["height_fill_pct"], r["rough_litres"], r["rough_remaining_litres"]), (50.0, 330.0, 330.0))
+
+    def test_below_floor_depth_warns_and_one_bad_frame_is_not_trusted(self) -> None:
+        with TemporaryDirectory() as d:
+            est = bf.FillEstimator("realsense", Path(d), _profile())
+            frame = np.zeros((K.height, K.width, 3), np.uint8)
+            good = _render(_profile(), lambda x, y: 0.40 + 0 * x)
+            for t in range(4):
+                self.assertEqual(est.update(frame, good, K, None, 0.0, float(t))["height_fill_pct"], 40.0)
+            deep = good.copy()
+            deep[:, :60] = 1.60                                  # 20 cm-plus below the assumed floor
+            warned = est.update(frame, deep, K, None, 0.0, 5.0)
+            self.assertTrue(any("below the assumed floor" in w for w in warned["warnings"]))
+            self.assertEqual(warned["height_fill_pct"], 40.0)    # excluded, not clamped into the reading
+            spike = _render(_profile(), lambda x, y: 0.90 + 0 * x)
+            held = est.update(frame, spike, K, None, 0.0, 6.0)
+            self.assertTrue(held["stale"])
+            self.assertIn("inconsistent depth frame ignored", held["stale_reason"])
+            self.assertEqual(held["height_fill_pct"], 40.0)
 
 
 if __name__ == "__main__":
