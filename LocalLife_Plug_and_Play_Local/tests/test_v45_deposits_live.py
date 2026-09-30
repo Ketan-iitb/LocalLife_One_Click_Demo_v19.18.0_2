@@ -207,6 +207,19 @@ class SequenceTests(unittest.TestCase):
                 self.assertEqual(counter.count, 0)
                 self.assertIn("vacated", counter.rejected[-1]["reason"])
 
+    def test_state_saved_by_an_older_version_resumes_without_breaking_the_panel(self) -> None:
+        # Live bug: events saved before per-camera counting had no "camera" -> /api/bin-fill 500
+        # -> "Bin fill data unavailable".
+        import json
+        with TemporaryDirectory() as d:
+            (Path(d) / "session_state.json").write_text(json.dumps({
+                "session_id": "old", "session_started_at": 1.0, "rejected": [],
+                "events": [{"event_id": "D-1", "deposit_time": 2.0, "cameras": ["logitech"]}]}))
+            counter = sd.SessionDeposits(Path(d), clock=lambda: 3.0)
+            counter.observe(Scene("logitech", depth=False).evidence(3.0))
+            snap = counter.snapshot()
+            self.assertEqual(snap["cameras"]["logitech"]["new_bags"], 1)
+
     def test_a_person_is_not_a_bag(self) -> None:
         self.assertFalse(sd.bag_like("person"))
         self.assertFalse(sd.bag_like("hand"))

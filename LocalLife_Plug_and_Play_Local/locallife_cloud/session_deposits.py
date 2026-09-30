@@ -394,6 +394,16 @@ class SessionDeposits:
             data = json.loads(self.state_path.read_text(encoding="utf-8"))
             self.session_id, self.session_started_at = data["session_id"], float(data["session_started_at"])
             self.events, self.rejected = list(data["events"]), list(data.get("rejected", []))
+            # Records saved by an earlier version lack newer fields: fill them, never crash the panel.
+            for record in self.events + self.rejected:
+                cameras = record.get("cameras") or [record.get("camera") or "unknown"]
+                record.setdefault("cameras", cameras)
+                record.setdefault("camera", cameras[0])
+                for key in ("colour", "object_type", "detector_label", "material", "confidence",
+                            "measurement_status", "association", "reason", "length_cm", "width_cm",
+                            "height_cm", "height_source", "envelope_l", "delta_occupancy_l", "track_id"):
+                    record.setdefault(key, None)
+                record.setdefault("evidence", {})
             self.written = set(data.get("written", []))
             self.last_confirmed_at = data.get("last_confirmed_at")
             self.ignored_redetections = 0

@@ -715,7 +715,11 @@ def create_app(
     @app.get("/api/bin-fill")
     def bin_fill() -> Any:
         """Per-camera fill readings and the session's new-bag count and events."""
-        return jsonify(manager.bin_fill())
+        try:
+            return jsonify(manager.bin_fill())
+        except Exception as exc:  # noqa: BLE001 - the panel shows the reason instead of going blank
+            LOGGER.exception("bin fill state failed")
+            return jsonify(error=f"bin fill state failed: {exc}"), 500
 
     @app.get("/api/session-deposits.csv")
     def session_deposits_csv() -> Any:

@@ -51,11 +51,11 @@ function card(id,r,w){w=w||{};let h='<b>'+name(id)+'</b> <span class="bf-muted">
  if(!ev.length)h+='<tr><td colspan="7">No new bags yet</td></tr>';return h+'</tbody></table></div>';}
 function form(id,p){const cm=m=>m==null?'':Math.round(m*1000)/10;const f=[['camera_to_empty_floor_cm','camera→empty floor cm',cm(p.camera_to_empty_floor_m)],['usable_height_cm','usable floor→rim cm',cm(p.usable_height_m)],['tilt_from_vertical_deg','tilt °',p.tilt_from_vertical_deg??''],['capacity_l','capacity L',p.capacity_l]];
  return '<form data-cam="'+id+'"><b>'+name(id)+'</b> '+f.map(([k,l,val])=>'<label>'+l+' <input name="'+k+'" data-orig="'+val+'" value="'+val+'"></label>').join('')+'<button type="submit">Save</button></form>';}
-async function load(){try{const d=await (await fetch('/api/bin-fill',{cache:'no-store'})).json();const s=d.deposits;
+async function load(){try{const d=await (await fetch('/api/bin-fill',{cache:'no-store'})).json();if(d.error)throw new Error(d.error);const s=d.deposits;
  for(const id of ['realsense','logitech'])$('bf-cam-'+id).innerHTML=card(id,d.cameras[id]||{},(s.cameras||{})[id]);
  if(!$('bf-settings').open)$('bf-forms').innerHTML=['realsense','logitech'].map(id=>form(id,(d.cameras[id]||{}).profile||{})).join('');
  $('bf-session').textContent='Session started '+new Date(s.session_started_at*1000).toLocaleString()+(s.resumed?' (resumed)':'')+' · bags present at start count toward fill, not as new';
-}catch(err){$('bf-session').textContent='Bin fill data unavailable';}}
+}catch(err){$('bf-session').textContent='Bin fill data unavailable: '+err.message;}}
 document.addEventListener('submit',async ev=>{const f=ev.target;if(!f.dataset||!f.dataset.cam||!f.closest('#bf-panel'))return;ev.preventDefault();const body={};
  for(const el of f.elements){if(el.name&&el.value!==el.dataset.orig)body[el.name]=el.value;}
  if(!Object.keys(body).length)return;const r=await fetch('/api/cameras/'+f.dataset.cam+'/fill-profile',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});

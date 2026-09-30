@@ -3041,7 +3041,12 @@ class VisionPipeline:
         # today's waste is not a floor and is never used for the fill.
         fill_plane = (occupancy_plane.coefficients if self.last_occupancy_absolute and occupancy_plane is not None
                       else None)
-        self._update_fill(frame, depth_m, intrinsics, calibrated_prediction, measure_intrinsics,
+        # Logitech: its calibrated depth, else the metric model's own output (approximate, never relative depth).
+        fill_monocular = calibrated_prediction
+        if (fill_monocular is None and self.camera_id == "logitech" and predicted_depth is not None
+                and depth_output_kind(self.config.depth_model) == "metric"):
+            fill_monocular = predicted_depth
+        self._update_fill(frame, depth_m, intrinsics, fill_monocular, measure_intrinsics,
                           bin_region, time.time(), fill_plane)    # same wall clock as occupancy events
         if persist:
             self.store.append_jsonl("frames.jsonl", analysis.to_dict())
