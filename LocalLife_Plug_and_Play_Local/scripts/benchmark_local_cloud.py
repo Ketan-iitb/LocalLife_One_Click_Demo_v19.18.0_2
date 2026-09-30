@@ -48,7 +48,8 @@ from locallife_cloud.benchmark import _percentile  # noqa: E402
 
 FRAME_COLUMNS = [
     "run_id", "frame_file", "camera_id", "frame_id", "warmup", "status", "server_processing_mode",
-    "e2e_ms", "server_inference_ms", "bytes_in", "bytes_out", "detections",
+    "e2e_ms", "server_inference_ms", "server_latency_ms", "server_queue_ms", "server_processing_ms",
+    "bytes_in", "bytes_out", "detections",
     "pred_length_mm", "pred_width_mm", "pred_height_mm", "pred_volume_l", "pred_colour", "error",
 ]
 
@@ -64,6 +65,20 @@ def load_frames(directory: Path, camera: str | None) -> list[dict[str, Any]]:
         frames.append({"stem": meta_path.stem, "meta": meta, "image": image.read_bytes(),
                        "depth": depth.read_bytes() if depth.exists() else None})
     return frames
+
+
+def input_identity(frames: list[dict[str, Any]], repeat: int) -> str:
+    """Same recorded frames (names and bytes) and repeat count -> same id, on any machine."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    for frame in frames:
+        digest.update(frame["stem"].encode())
+        digest.update(hashlib.sha256(frame["image"]).digest())
+        if frame["depth"] is not None:
+            digest.update(hashlib.sha256(frame["depth"]).digest())
+    digest.update(str(repeat).encode())
+    return "replay-" + digest.hexdigest()[:16]
 
 
 def best_detection(result: dict[str, Any]) -> dict[str, Any] | None:
@@ -130,6 +145,8 @@ def summarise(rows: list[dict[str, Any]], camera: str | None = None) -> dict[str
     done = [r for r in measured if r["status"] == "ok"]
     e2e = [r["e2e_ms"] for r in done]
     inference = [r["server_inference_ms"] for r in done if r["server_inference_ms"] is not None]
+    server = {key: [r[key] for r in done if r.get(key) is not None]
+              for key in ("server_latency_ms", "server_queue_ms", "server_processing_ms")}
     wall = sum(e2e) / 1000.0
     return {
         "camera_id": camera or "all",
@@ -137,11 +154,23 @@ def summarise(rows: list[dict[str, Any]], camera: str | None = None) -> dict[str
         "completed_pct": round(100.0 * len(done) / len(measured), 2) if measured else None,
         "timeouts": sum(r["status"] == "timeout" for r in measured),
         "failed": sum(r["status"] not in {"ok", "timeout"} for r in measured),
-        "latency_e2e": {"boundary": "client send -> analysis result received (client monotonic clock)",
+        "latency_e2e": {"boundary": "client send -> analysis result received (one client monotonic clock; "
+                                    "includes upload, server processing and reply transport)",
                         "p50_ms": _percentile(e2e, 0.5), "p95_ms": _percentile(e2e, 0.95), "n": len(e2e)},
         "server_inference": {"boundary": "server-reported inference_ms",
                              "p50_ms": _percentile(inference, 0.5), "p95_ms": _percentile(inference, 0.95),
                              "n": len(inference)},
+        "server_latency": {"boundary": "server receipt -> result ready (server monotonic clock)",
+                           "p50_ms": _percentile(server["server_latency_ms"], 0.5),
+                           "p95_ms": _percentile(server["server_latency_ms"], 0.95), "n": len(server["server_latency_ms"])},
+        "queue_wait": {"boundary": "server receipt -> processing start (0 on the synchronous replay path)",
+                       "p50_ms": _percentile(server["server_queue_ms"], 0.5),
+                       "p95_ms": _percentile(server["server_queue_ms"], 0.95), "n": len(server["server_queue_ms"])},
+        "processing": {"boundary": "processing start -> result ready (detection + depth + measurement)",
+                       "p50_ms": _percentile(server["server_processing_ms"], 0.5),
+                       "p95_ms": _percentile(server["server_processing_ms"], 0.95),
+                       "n": len(server["server_processing_ms"])},
+        "uncorrelated": sum(r["status"] == "uncorrelated" for r in measured),
         "throughput_fps": round(len(done) / wall, 3) if wall > 0 else None,
         "throughput_definition": "completed unique frames / summed e2e time (one request at a time)",
         "bytes_in_per_frame": round(statistics.mean(r["bytes_in"] for r in done), 1) if done else None,
@@ -223,6 +252,7 @@ def run(args: argparse.Namespace) -> int:
         with open(args.truth, newline="", encoding="utf-8") as handle:
             truth = {row["frame"]: row for row in csv.DictReader(handle)}
 
+    input_id = input_identity(frames, args.repeat)
     rows: list[dict[str, Any]] = []
     started_wall = time.time()
     for index, frame in enumerate(frames * args.repeat):
@@ -231,7 +261,8 @@ def run(args: argparse.Namespace) -> int:
         frame_id = f"{run_id}-{camera}-{index:06d}"
         metadata = {"source": meta.get("source", "replay"), "intrinsics": meta.get("intrinsics"),
                     "camera_id": camera, "intrinsics_origin": meta.get("intrinsics_origin", ""),
-                    "frame_id": frame_id, "run_id": run_id, "seq": index + 1, "timestamp": time.time()}
+                    "frame_id": frame_id, "run_id": run_id, "seq": index + 1, "timestamp": time.time(),
+                    "input_id": input_id}
         files = {"image": ("frame.jpg", frame["image"], "image/jpeg")}
         if frame["depth"] is not None:
             files["depth"] = ("depth.npz", frame["depth"], "application/octet-stream")
@@ -255,6 +286,12 @@ def run(args: argparse.Namespace) -> int:
                            server_processing_mode=result.get("processing_mode"),
                            server_inference_ms=result.get("inference_ms"),
                            detections=len(result.get("detections") or []), **prediction(result))
+                timing = result.get("server_timing") or {}
+                row.update(server_latency_ms=timing.get("server_latency_ms"), server_queue_ms=timing.get("queue_ms"),
+                           server_processing_ms=timing.get("processing_ms"))
+                if result.get("frame_id") != frame_id:
+                    # A reply that does not carry the frame id it answers cannot be correlated.
+                    row.update(status="uncorrelated", error=f"reply frame_id {result.get('frame_id')!r}")
                 if result.get("processing_mode") != args.expect_mode:
                     row.update(status="mode_mismatch", error=f"server said {result.get('processing_mode')}")
         except requests.Timeout:
@@ -288,7 +325,8 @@ def run(args: argparse.Namespace) -> int:
             "detector_model": _find(state, "detector_model"), "depth_model": _find(state, "depth_model"),
             "runtime": _find(state, "runtime"),
             "client_host": {"hostname": socket.gethostname(), "platform": platform.platform()},
-            "network": args.network, "url": base, "timeout_s": args.timeout,
+            "network": args.network, "url": base, "timeout_s": args.timeout, "input_id": input_id,
+            "superseded_note": "the replay posts synchronously (?sync=1), so no frame is superseded",
         },
         "all": summarise(rows),
         "cameras": {camera: summarise(rows, camera) for camera in cameras},
@@ -298,8 +336,53 @@ def run(args: argparse.Namespace) -> int:
     }
     summary.update(latency_e2e=summary["all"]["latency_e2e"], throughput_fps=summary["all"]["throughput_fps"])
     (out / "run_summary.json").write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
+    write_run_summary_csv(out / "run_summary.csv", summary)
     print(f"Wrote {out / 'frames.csv'} and {out / 'run_summary.json'}")
     return 0 if any(r["status"] == "ok" for r in rows) else 1
+
+
+RUN_SUMMARY_COLUMNS = [
+    "run_id", "processing_mode", "camera_id", "input_id", "server_host", "server_gpu", "detector_model",
+    "depth_model", "server_code_commit", "measured_frames", "warmup_frames", "run_start_wall", "duration_s",
+    "sent", "completed", "timeouts", "failed", "uncorrelated", "superseded",
+    "e2e_p50_ms", "e2e_p95_ms", "e2e_n", "server_latency_p50_ms", "server_latency_p95_ms",
+    "queue_p50_ms", "queue_p95_ms", "processing_p50_ms", "processing_p95_ms", "server_n",
+    "edge_upload_rtt_p50_ms", "throughput_fps", "na_reasons",
+]
+
+
+def write_run_summary_csv(path: Path, summary: dict[str, Any]) -> None:
+    """One row per camera and one for all cameras, with N/A reasons instead of blanks."""
+    meta = summary["metadata"]
+    rows = []
+    for camera, s in [("all", summary["all"]), *summary["cameras"].items()]:
+        rows.append({
+            "run_id": meta["run_id"], "processing_mode": meta["server_processing_mode"], "camera_id": camera,
+            "input_id": meta.get("input_id"), "server_host": (meta.get("server_host") or {}).get("hostname"),
+            "server_gpu": (meta.get("server_gpu") or {}).get("name"), "detector_model": meta.get("detector_model"),
+            "depth_model": meta.get("depth_model"), "server_code_commit": meta.get("server_code_commit"),
+            "measured_frames": s["sent"], "warmup_frames": meta["warmup_frames"],
+            "run_start_wall": meta["started_wall"], "duration_s": meta["duration_s"],
+            "sent": s["sent"], "completed": s["completed"], "timeouts": s["timeouts"], "failed": s["failed"],
+            "uncorrelated": s["uncorrelated"], "superseded": 0,
+            "e2e_p50_ms": s["latency_e2e"]["p50_ms"], "e2e_p95_ms": s["latency_e2e"]["p95_ms"],
+            "e2e_n": s["latency_e2e"]["n"], "server_latency_p50_ms": s["server_latency"]["p50_ms"],
+            "server_latency_p95_ms": s["server_latency"]["p95_ms"], "queue_p50_ms": s["queue_wait"]["p50_ms"],
+            "queue_p95_ms": s["queue_wait"]["p95_ms"], "processing_p50_ms": s["processing"]["p50_ms"],
+            "processing_p95_ms": s["processing"]["p95_ms"], "server_n": s["server_latency"]["n"],
+            "edge_upload_rtt_p50_ms": None, "throughput_fps": s["throughput_fps"],
+            "na_reasons": json.dumps({
+                "edge_upload_rtt": "replay runs from this client, not the Pi edge sender",
+                "superseded": "0 by design: synchronous replay does not supersede frames",
+                "capture_to_display": "not measured: no shared clock or frame correlation with the browser",
+                **({"server_timing": "server returned no per-frame timing (older server)"}
+                   if not s["server_latency"]["n"] and s["completed"] else {}),
+            }),
+        })
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=RUN_SUMMARY_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def compare(args: argparse.Namespace) -> int:
@@ -310,7 +393,7 @@ def compare(args: argparse.Namespace) -> int:
         return 2
     local, cloud = by_mode["local"], by_mode["cloud"]
     warnings = []
-    for key in ("frames_dir", "unique_frames", "warmup_frames", "repeat", "detector_model", "depth_model"):
+    for key in ("input_id", "unique_frames", "warmup_frames", "repeat", "detector_model", "depth_model"):
         if local["metadata"].get(key) != cloud["metadata"].get(key):
             warnings.append(f"{key} differs: local={local['metadata'].get(key)} cloud={cloud['metadata'].get(key)}")
     if local["metadata"].get("server_code_commit") != cloud["metadata"].get("server_code_commit"):
@@ -323,6 +406,9 @@ def compare(args: argparse.Namespace) -> int:
             ("latency e2e p50 ms", lambda s: (s.get("latency_e2e") or {}).get("p50_ms")),
             ("latency e2e p95 ms", lambda s: (s.get("latency_e2e") or {}).get("p95_ms")),
             ("server inference p50 ms", lambda s: (s.get("server_inference") or {}).get("p50_ms")),
+            ("server-side result latency p50 ms", lambda s: (s.get("server_latency") or {}).get("p50_ms")),
+            ("queue wait p50 ms", lambda s: (s.get("queue_wait") or {}).get("p50_ms")),
+            ("processing p50 ms", lambda s: (s.get("processing") or {}).get("p50_ms")),
             ("throughput fps", lambda s: s.get("throughput_fps")),
             ("completed/sent %", lambda s: s.get("completed_pct")),
             ("completed / sent", lambda s: f"{s.get('completed')}/{s.get('sent')}" if s else None),
@@ -330,16 +416,20 @@ def compare(args: argparse.Namespace) -> int:
             ("bytes in per frame", lambda s: s.get("bytes_in_per_frame")),
             ("bytes out per frame", lambda s: s.get("bytes_out_per_frame")),
         ]:
-            table.append({"scope": scope, "metric": label, "local": fn(a), "cloud": fn(b)})
+            table.append({"scope": scope, "metric": label, "local": fn(a), "cloud": fn(b),
+                          "matched": not warnings, "match_notes": "; ".join(warnings)})
     for key in ("detection_success", "colour_correct", "dimension_pct_error_median", "volume_pct_error_median"):
         table.append({"scope": "quality", "metric": key, "local": local["quality"].get(key, local["quality"]["status"]),
-                      "cloud": cloud["quality"].get(key, cloud["quality"]["status"])})
+                      "cloud": cloud["quality"].get(key, cloud["quality"]["status"]),
+                      "matched": not warnings, "match_notes": "; ".join(warnings)})
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     with (out / "local_vs_cloud_summary.csv").open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["scope", "metric", "local", "cloud"])
+        writer = csv.DictWriter(handle, fieldnames=["scope", "metric", "local", "cloud", "matched", "match_notes"])
         writer.writeheader()
         writer.writerows(table)
+    lines.append("**MATCHED comparison**: same recorded input, models, warm-up and repeat." if not warnings else
+                 "**NOT MATCHED**: differences below; do not draw a better/worse conclusion.")
     lines.append("| Scope | Metric | Local | Cloud |\n|---|---|---|---|")
     lines += [f"| {r['scope']} | {r['metric']} | {r['local']} | {r['cloud']} |" for r in table]
     lines.append("\nLatency boundary: client send -> analysis result received (client monotonic clock).")

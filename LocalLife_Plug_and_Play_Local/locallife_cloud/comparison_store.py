@@ -44,14 +44,28 @@ CAMERAS = ("realsense", "logitech")
 OUTAGE_GAP_S = 10.0          # no completed result for this long counts as a disconnect
 
 BOUNDARIES = {
-    "latency": "server receipt -> analysis result ready (server monotonic clock; excludes network)",
-    "inference": "inference start -> result ready (server monotonic clock; shared camera batch)",
+    "latency": "server receipt -> analysis result ready (server monotonic clock; excludes upload and "
+               "return transport, so it is NOT end-to-end)",
+    "inference": "batch start -> result ready (server monotonic clock): detection, depth and measurement "
+                 "for the camera batch, not model forward time alone",
     "queue": "server receipt -> inference start (server monotonic clock)",
-    "upload": "edge send -> HTTP 202 accepted (edge monotonic clock; upload + enqueue)",
+    "upload": "edge upload request RTT: edge send -> HTTP 202 received (one edge monotonic clock); "
+              "includes server enqueue, not one-way network latency",
     "startup": "server process start -> first completed result for the camera (server monotonic clock); "
                "GPU provisioning / stockout wait is NOT included",
     "recovery": "last completed result before an outage (edge reconnect or >10 s without a result) -> "
                 "next completed result (server monotonic clock)",
+    "capture_to_display": "not measured: Pi capture and browser display share no clock, and displayed "
+                          "results are not correlated to frame ids",
+    "window": "unique completed frame ids / (last result - first receipt) for this camera, server clock",
+    "superseded": "frames replaced in the latest-frame queue by a newer frame before analysis (policy, not "
+                  "failure); denominator = frames received by the server",
+    "failed": "frames whose analysis raised an error on the server; denominator = failure_denominator",
+    "lost": "edge sequence numbers never received by the server; needs the v41 edge client",
+    "host": "CPU/RAM % of the machine running the server (laptop in local mode, VM in cloud mode); not "
+            "comparable capacity",
+    "gpu": "nvidia-smi on the machine running the server; says nothing about whether the pipeline used it",
+    "bytes": "HTTP request size received / reply size sent by the server (excludes TCP/TLS overhead)",
 }
 
 RAW_COLUMNS = [
@@ -59,7 +73,7 @@ RAW_COLUMNS = [
     "status", "edge_run_id", "seq", "received_wall", "elapsed_s", "server_latency_ms", "queue_ms",
     "processing_ms", "upload_rtt_ms", "bytes_in", "bytes_out", "reconnected", "error",
     "cpu_percent", "ram_percent", "ram_used_mb", "gpu_util_percent", "vram_used_mb", "gpu_name",
-    "detector", "depth_model", "code_commit",
+    "detector", "depth_model", "code_commit", "input_id",
 ]
 
 SUMMARY_COLUMNS = [
@@ -74,44 +88,60 @@ SUMMARY_COLUMNS = [
     "gpu_util_avg_pct", "gpu_util_peak_pct", "vram_avg_mb", "vram_peak_mb", "gpu_n",
     "bytes_in_per_frame", "bytes_out_per_frame", "mb_in_per_min", "mb_out_per_min",
     "latency_spread_ms", "quality", "computed_at",
+    # appended in the telemetry-labels revision (earlier columns keep their order)
+    "failure_basis_note", "capture_to_display_ms", "frames_window_s", "window_start_wall", "window_end_wall",
+    "input_id", "na_reasons",
 ]
 
-# (key, label, unit, favourable direction, sample-count key)
+# (key, label, unit, favourable direction, sample-count key, boundary key).
+# Keys are unchanged for CSV compatibility; labels say what is actually measured.
 METRICS = [
-    ("startup_to_first_result_s", "1. Startup to first successful result", "s", "lower", None),
-    ("latency_p50_ms", "2. End-to-end result latency p50", "ms", "lower", "latency_n"),
-    ("latency_p95_ms", "2. End-to-end result latency p95", "ms", "lower", "latency_n"),
-    ("inference_p50_ms", "3. Model inference time p50", "ms", "lower", "inference_n"),
-    ("inference_p95_ms", "3. Model inference time p95", "ms", "lower", "inference_n"),
-    ("queue_p50_ms", "4. Queue waiting time p50", "ms", "lower", "queue_n"),
-    ("queue_p95_ms", "4. Queue waiting time p95", "ms", "lower", "queue_n"),
-    ("upload_p50_ms", "5. Frame upload/transport time p50", "ms", "lower", "upload_n"),
-    ("upload_p95_ms", "5. Frame upload/transport time p95", "ms", "lower", "upload_n"),
-    ("fps", "6. Completed unique frames per second", "frames/s", "higher", "completed_unique"),
-    ("superseded", "7. Superseded frames (not errors)", "frames", None, "received"),
-    ("superseded_pct", "7. Superseded frames", "%", None, "received"),
-    ("failure_count", "8. Failed/timed-out/lost frames", "frames", "lower", "failure_denominator"),
-    ("failure_pct", "8. Failed/timed-out/lost frames", "%", "lower", "failure_denominator"),
-    ("recovery_p50_s", "9. Recovery time after disconnect p50", "s", "lower", "recovery_n"),
-    ("recovery_max_s", "9. Recovery time after disconnect max", "s", "lower", "recovery_n"),
-    ("cpu_avg_pct", "10. Host CPU average", "%", None, "cpu_n"),
-    ("cpu_peak_pct", "10. Host CPU peak", "%", None, "cpu_n"),
-    ("ram_avg_pct", "11. Host RAM average", "%", None, "ram_n"),
-    ("ram_peak_pct", "11. Host RAM peak", "%", None, "ram_n"),
-    ("gpu_util_avg_pct", "11. GPU utilisation average", "%", None, "gpu_n"),
-    ("gpu_util_peak_pct", "11. GPU utilisation peak", "%", None, "gpu_n"),
-    ("vram_avg_mb", "11. VRAM average", "MB", None, "gpu_n"),
-    ("vram_peak_mb", "11. VRAM peak", "MB", None, "gpu_n"),
-    ("bytes_in_per_frame", "12. Data received by server per completed frame", "bytes", None, "completed_unique"),
-    ("bytes_out_per_frame", "12. Data sent by server per completed frame", "bytes", None, "completed_unique"),
-    ("mb_in_per_min", "12. Data received by server", "MB/min", None, "completed_unique"),
-    ("mb_out_per_min", "12. Data sent by server", "MB/min", None, "completed_unique"),
-    ("latency_spread_ms", "13. Latency variation (p95 - p50)", "ms", "lower", "latency_n"),
+    ("startup_to_first_result_s", "1. Server start to first result", "s", "lower", None, "startup"),
+    ("latency_p50_ms", "2. Server-side result latency p50", "ms", "lower", "latency_n", "latency"),
+    ("latency_p95_ms", "2. Server-side result latency p95", "ms", "lower", "latency_n", "latency"),
+    ("inference_p50_ms", "3. Batch processing time p50 (detection + depth + measurement)", "ms", "lower",
+     "inference_n", "inference"),
+    ("inference_p95_ms", "3. Batch processing time p95 (detection + depth + measurement)", "ms", "lower",
+     "inference_n", "inference"),
+    ("queue_p50_ms", "4. Queue waiting time p50", "ms", "lower", "queue_n", "queue"),
+    ("queue_p95_ms", "4. Queue waiting time p95", "ms", "lower", "queue_n", "queue"),
+    ("upload_p50_ms", "5. Edge upload request RTT p50", "ms", "lower", "upload_n", "upload"),
+    ("upload_p95_ms", "5. Edge upload request RTT p95", "ms", "lower", "upload_n", "upload"),
+    ("capture_to_display_ms", "5b. Camera capture -> dashboard-visible result", "ms", "lower", None,
+     "capture_to_display"),
+    ("fps", "6. Completed unique frames per second (observation window)", "frames/s", "higher",
+     "completed_unique", "window"),
+    ("superseded", "7. Superseded frames (replaced by a newer frame; not failures)", "frames", None,
+     "received", "superseded"),
+    ("superseded_pct", "7. Superseded frames, % of frames received", "%", None, "received", "superseded"),
+    ("failed", "8a. Observed failed/timed-out frames (server side)", "frames", "lower", "received", "failed"),
+    ("lost", "8b. Lost frames (edge sequence gaps; unobservable without sequence numbers)", "frames",
+     "lower", "failure_denominator", "lost"),
+    ("failure_pct", "8. Failed + lost, % of denominator", "%", "lower", "failure_denominator", "failed"),
+    ("recovery_p50_s", "9. Recovery time after an outage p50", "s", "lower", "recovery_n", "recovery"),
+    ("recovery_max_s", "9. Recovery time after an outage max", "s", "lower", "recovery_n", "recovery"),
+    ("cpu_avg_pct", "10. Host CPU average (% of that machine; different machines)", "%", None, "cpu_n", "host"),
+    ("cpu_peak_pct", "10. Host CPU peak (% of that machine; different machines)", "%", None, "cpu_n", "host"),
+    ("ram_avg_pct", "11. Host RAM average (% of that machine; different machines)", "%", None, "ram_n", "host"),
+    ("ram_peak_pct", "11. Host RAM peak (% of that machine; different machines)", "%", None, "ram_n", "host"),
+    ("gpu_util_avg_pct", "11. GPU utilisation average", "%", None, "gpu_n", "gpu"),
+    ("gpu_util_peak_pct", "11. GPU utilisation peak", "%", None, "gpu_n", "gpu"),
+    ("vram_avg_mb", "11. VRAM used average", "MB", None, "gpu_n", "gpu"),
+    ("vram_peak_mb", "11. VRAM used peak", "MB", None, "gpu_n", "gpu"),
+    ("bytes_in_per_frame", "12. Request bytes received by server per completed frame", "bytes", None,
+     "completed_unique", "bytes"),
+    ("bytes_out_per_frame", "12. Reply bytes sent by server per completed frame", "bytes", None,
+     "completed_unique", "bytes"),
+    ("mb_in_per_min", "12. Request data received by server", "MB/min", None, "completed_unique", "bytes"),
+    ("mb_out_per_min", "12. Reply data sent by server", "MB/min", None, "completed_unique", "bytes"),
+    ("latency_spread_ms", "13. Server-side latency variation (p95 - p50, same samples)", "ms", "lower",
+     "latency_n", "latency"),
 ]
 
 _NUMERIC_SUMMARY = {c for c in SUMMARY_COLUMNS if c not in {
     "source", "source_host", "run_id", "processing_mode", "camera_id", "host_machine", "gpu_name", "detector",
-    "depth_model", "code_commit", "failure_denominator_basis", "quality"}}
+    "depth_model", "code_commit", "failure_denominator_basis", "quality", "failure_basis_note", "input_id",
+    "na_reasons"}}
 
 
 def _num(value: Any) -> float | None:
@@ -191,6 +221,30 @@ def summarise_run(records: list[dict[str, Any]], camera_id: str,
     bytes_out = [v for r in done if (v := _num(r.get("bytes_out"))) is not None]
     minutes = span / 60.0 if span else None
     gpu_names = [r.get("gpu_name") for r in resources if r.get("gpu_name")]
+    inputs = {str(r.get("input_id")) for r in frames if r.get("input_id")}
+    walls = [w for r in frames if (w := _num(r.get("received_wall"))) is not None]
+    old_edge = bool(frames) and not seqs and not upload
+    edge_note = ("the Pi's edge client sends no frame ids or upload RTT (pre-v41 edge client: the launcher only "
+                 "copies the project to the Pi when it is missing)")
+    na: dict[str, str] = {"capture_to_display": BOUNDARIES["capture_to_display"]}
+    if not done:
+        for group in ("latency", "inference", "queue", "window", "startup", "bytes"):
+            na[group] = "no completed frames for this camera in this run"
+    if not upload:
+        na["upload"] = (edge_note if old_edge else
+                        "replay run: frames came from the benchmark client, not the Pi edge sender" if inputs
+                        else "no upload RTT samples reported by the edge client")
+    if not seqs:
+        na["lost"] = edge_note if frames else "no frames received"
+    if not recoveries:
+        na["recovery"] = "no outage observed in this run"
+    if not resources:
+        na["host"] = na["gpu"] = "no resource samples in this run"
+    else:
+        if cpu[2] == 0 and ram[2] == 0:
+            na["host"] = "CPU/RAM not readable on this machine (no /proc and no psutil)"
+        if gpu[2] == 0 and vram[2] == 0:
+            na["gpu"] = "no NVIDIA GPU readable on this machine (nvidia-smi absent or failed)"
     all_times = [e for r in records if (e := _num(r.get("elapsed_s"))) is not None]
     return {
         "source": "own", "source_host": start.get("source_host"), "run_id": start.get("run_id"),
@@ -226,6 +280,14 @@ def summarise_run(records: list[dict[str, Any]], camera_id: str,
         "latency_spread_ms": _r(lat95 - lat50, 3) if lat50 is not None and lat95 is not None else None,
         "quality": "Not evaluated (no labelled ground truth)",
         "computed_at": time.time(),
+        "failure_basis_note": "zero recorded losses is not proof of zero actual losses when lost frames are "
+                              "unobservable",
+        "capture_to_display_ms": None,
+        "frames_window_s": _r(span, 2) if span else None,
+        "window_start_wall": _r(min(walls), 3) if walls else None,
+        "window_end_wall": _r(max(walls), 3) if walls else None,
+        "input_id": next(iter(inputs)) if len(inputs) == 1 else (None if not inputs else "mixed"),
+        "na_reasons": na,
     }
 
 
@@ -238,6 +300,13 @@ def _clean_summary(item: dict[str, Any]) -> dict[str, Any] | None:
         value = item.get(column)
         if column in _NUMERIC_SUMMARY:
             out[column] = _num(value)
+        elif column == "na_reasons":
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except ValueError:
+                    value = {}
+            out[column] = {str(k)[:40]: str(v)[:300] for k, v in (value or {}).items()} if isinstance(value, dict) else {}
         else:
             out[column] = None if value in (None, "") else str(value)[:160]
     if out["processing_mode"] not in ("local", "cloud") or out["camera_id"] not in CAMERAS or not out["run_id"]:
@@ -338,7 +407,8 @@ class ComparisonStore:
             "server_latency_ms": row["server_latency_ms"], "queue_ms": row["queue_ms"],
             "processing_ms": row["processing_ms"], "upload_rtt_ms": frame.client_prev_upload_rtt_ms,
             "bytes_in": frame.bytes_in, "bytes_out": frame.bytes_out, "reconnected": frame.reconnected,
-            "error": frame.error, **{k: self.meta.get(k) for k in ("detector", "depth_model")},
+            "error": frame.error, "input_id": frame.input_id,
+            **{k: self.meta.get(k) for k in ("detector", "depth_model")},
         })
 
     def record_resources(self, host: dict[str, Any], gpu: dict[str, Any], sequence: int) -> bool:
@@ -443,12 +513,24 @@ class ComparisonStore:
         chosen = {"local": local_key if local_key in valid["local"] else latest("local"),
                   "cloud": cloud_key if cloud_key in valid["cloud"] else latest("cloud")}
         rows = []
+        matches = {}
         for camera in CAMERAS:
             picked = {mode: next((s for s in summaries if f"{s.get('source_host')}|{s.get('run_id')}" == key
                                   and s.get("camera_id") == camera), None) for mode, key in chosen.items()}
-            for key, label, unit, better, n_key in METRICS:
+            matched, notes = match_runs(picked["local"], picked["cloud"])
+            matches[camera] = {"matched": matched, "notes": notes}
+            for key, label, unit, better, n_key, boundary in METRICS:
                 local = _num(picked["local"].get(key)) if picked["local"] else None
                 cloud = _num(picked["cloud"].get(key)) if picked["cloud"] else None
+                if better and local is not None and cloud is not None and local != cloud and matched:
+                    cloud_better = cloud < local if better == "lower" else cloud > local
+                    verdict = f"{'cloud' if cloud_better else 'local'} better ({better} is better)"
+                elif better and local is not None and cloud is not None and matched:
+                    verdict = "equal"
+                elif better:
+                    verdict = f"not matched: no verdict ({better} is better)" if local is not None and cloud is not None else "—"
+                else:
+                    verdict = "context only"
                 rows.append({
                     "camera_id": camera, "metric": key, "label": label, "unit": unit, "favourable": better,
                     "local": local, "cloud": cloud,
@@ -462,6 +544,12 @@ class ComparisonStore:
                     "cloud_run": chosen["cloud"] if picked["cloud"] else None,
                     "local_machine": (picked["local"] or {}).get("host_machine"),
                     "cloud_machine": (picked["cloud"] or {}).get("host_machine"),
+                    "boundary": BOUNDARIES.get(boundary, ""),
+                    "matched": matched, "match_notes": "; ".join(notes), "verdict": verdict,
+                    "local_na_reason": _na_reason(picked["local"], boundary, local),
+                    "cloud_na_reason": _na_reason(picked["cloud"], boundary, cloud),
+                    "local_window_s": (picked["local"] or {}).get("frames_window_s"),
+                    "cloud_window_s": (picked["cloud"] or {}).get("frames_window_s"),
                 })
         other = "cloud" if self.processing_mode == "local" else "local"
         other_runs = [r for r in runs if r["processing_mode"] == other]
@@ -473,6 +561,7 @@ class ComparisonStore:
                                   + (" (imported)" if any(r["source"] == "imported" for r in other_runs) else "")
                                   if other_runs else f"Other mode's data not imported ({other})"),
             "quality": "Not evaluated (no labelled ground truth)",
+            "matches": matches,
             "counts": self.counts(),
         }
 
@@ -501,13 +590,49 @@ def to_csv(rows: Iterable[dict[str, Any]], columns: list[str]) -> str:
     writer = csv.DictWriter(output, fieldnames=columns, extrasaction="ignore")
     writer.writeheader()
     for row in rows:
-        writer.writerow({c: ("" if row.get(c) is None else row.get(c)) for c in columns})
+        writer.writerow({c: ("" if row.get(c) is None else
+                             json.dumps(row.get(c), sort_keys=True) if isinstance(row.get(c), (dict, list))
+                             else row.get(c)) for c in columns})
     return output.getvalue()
 
 
 COMPARISON_COLUMNS = ["camera_id", "metric", "label", "unit", "favourable", "local", "cloud", "abs_difference",
                       "pct_difference", "local_n", "cloud_n", "local_duration_s", "cloud_duration_s",
-                      "local_run", "cloud_run", "local_machine", "cloud_machine"]
+                      "local_run", "cloud_run", "local_machine", "cloud_machine",
+                      # appended: definitions, matching and N/A reasons
+                      "boundary", "matched", "match_notes", "verdict", "local_na_reason", "cloud_na_reason",
+                      "local_window_s", "cloud_window_s"]
+
+
+def _na_reason(summary: dict[str, Any] | None, boundary: str, value: float | None) -> str:
+    if value is not None:
+        return ""
+    if summary is None:
+        return "no run selected for this mode and camera"
+    reasons = summary.get("na_reasons") or {}
+    if isinstance(reasons, str):
+        try:
+            reasons = json.loads(reasons)
+        except ValueError:
+            reasons = {}
+    return str(reasons.get(boundary) or "not measured in this run")
+
+
+def match_runs(local: dict[str, Any] | None, cloud: dict[str, Any] | None) -> tuple[bool, list[str]]:
+    """Whether two runs are a like-for-like comparison. Unmatched runs get no better/worse verdict."""
+    if local is None or cloud is None:
+        return False, ["a run is missing for one mode"]
+    notes = []
+    if not local.get("input_id") or local.get("input_id") != cloud.get("input_id") or local.get("input_id") == "mixed":
+        notes.append("camera inputs differ or are unidentified (live runs); replay the same recorded frames "
+                     "with scripts/benchmark_local_cloud.py for a matched comparison")
+    for key, name in (("detector", "detector model"), ("depth_model", "depth model")):
+        if local.get(key) != cloud.get(key):
+            notes.append(f"{name} differs ({local.get(key)} vs {cloud.get(key)})")
+    lr, cr = _num(local.get("received")) or 0, _num(cloud.get("received")) or 0
+    if max(lr, cr) and abs(lr - cr) > 0.05 * max(lr, cr):
+        notes.append(f"run lengths differ ({int(lr)} vs {int(cr)} frames received)")
+    return not notes, notes
 
 
 def parse_summary_csv(text: str) -> list[dict[str, Any]]:

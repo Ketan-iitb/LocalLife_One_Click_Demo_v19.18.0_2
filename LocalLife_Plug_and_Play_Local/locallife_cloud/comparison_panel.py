@@ -31,7 +31,7 @@ COMPARISON_PANEL = r"""{% raw %}
 </div>
 <div style="overflow-x:auto"><table id="lc-table"></table></div>
 <div class="lc-charts">
- <div class="lc-chart"><strong>Latency p50 / p95 over runs (ms)</strong><div id="lc-ch-lat"></div></div>
+ <div class="lc-chart"><strong>Server-side result latency p50 / p95 over runs (ms)</strong><div id="lc-ch-lat"></div></div>
  <div class="lc-chart"><strong>Completed frames / s over runs</strong><div id="lc-ch-fps"></div></div>
  <div class="lc-chart"><strong>Failure % and superseded % over runs</strong><div id="lc-ch-fail"></div></div>
 </div>
@@ -64,10 +64,11 @@ async function sync(mode){
   if(other.length){const h={'Content-Type':'application/json'};if(token())h['X-API-Token']=token();await fetch('/api/local-cloud/import',{method:'POST',headers:h,body:JSON.stringify({summaries:other})})}
  }catch(e){}
 }
-function favour(row){if(row.local==null||row.cloud==null||!row.favourable)return row.favourable?'—':'context only';if(row.local===row.cloud)return 'equal';const cloudBetter=row.favourable==='lower'?row.cloud<row.local:row.cloud>row.local;return '<span class="'+(cloudBetter?'lc-good':'lc-bad')+'">'+(cloudBetter?'cloud':'local')+' better</span> ('+row.favourable+' is better)'}
-function renderTable(v){let h='<tr><th>Metric</th><th>Unit</th><th>Local</th><th>Cloud</th><th>Cloud − Local</th><th>% diff (Cloud−Local)/Local</th><th>Favourable</th><th>n (L / C)</th><th>Run duration s (L / C)</th></tr>';let cam='';
- for(const r of v.rows){if(r.camera_id!==cam){cam=r.camera_id;h+='<tr class="lc-cam"><td colspan="9">'+(cam==='realsense'?'RealSense D435':'Logitech C920')+' · local machine '+esc(r.local_machine||'—')+' · cloud machine '+esc(r.cloud_machine||'—')+'</td></tr>'}
-  h+='<tr><td>'+esc(r.label)+'</td><td>'+esc(r.unit)+'</td><td>'+fmt(r.local)+'</td><td>'+fmt(r.cloud)+'</td><td>'+fmt(r.abs_difference)+'</td><td>'+(r.pct_difference==null?'N/A':fmt(r.pct_difference)+' %')+'</td><td>'+favour(r)+'</td><td>'+esc(r.local_n??'N/A')+' / '+esc(r.cloud_n??'N/A')+'</td><td>'+fmt(r.local_duration_s)+' / '+fmt(r.cloud_duration_s)+'</td></tr>'}
+function favour(row){const v=row.verdict||'—';const m=v.match(/^(cloud|local) better(.*)$/);return m?'<span class="'+(m[1]==='cloud'?'lc-good':'lc-bad')+'">'+m[1]+' better</span>'+esc(m[2]):esc(v)}
+const na=(v,reason)=>v==null?'N/A'+(reason?'<div class="lc-muted" style="font-size:11px;max-width:220px">'+esc(reason)+'</div>':''):fmt(v);
+function renderTable(v){let h='<tr><th>Metric and measured boundary</th><th>Unit</th><th>Local</th><th>Cloud</th><th>Cloud − Local</th><th>% diff (Cloud−Local)/Local</th><th>Favourable direction / verdict</th><th>n (L / C)</th><th>Run / window s (L / C)</th></tr>';let cam='';
+ for(const r of v.rows){if(r.camera_id!==cam){cam=r.camera_id;h+='<tr class="lc-cam"><td colspan="9">'+(cam==='realsense'?'RealSense D435':'Logitech C920')+' · local machine '+esc(r.local_machine||'—')+' · cloud machine '+esc(r.cloud_machine||'—')+'<div class="lc-muted" style="font-weight:400">'+(r.matched?'Matched runs (same recorded input, models and length).':'NOT MATCHED — no better/worse verdict: '+esc(r.match_notes))+'</div></td></tr>'}
+  h+='<tr><td>'+esc(r.label)+'<div class="lc-muted" style="font-size:11px;max-width:420px">'+esc(r.boundary)+'</div></td><td>'+esc(r.unit)+'</td><td>'+na(r.local,r.local_na_reason)+'</td><td>'+na(r.cloud,r.cloud_na_reason)+'</td><td>'+fmt(r.abs_difference)+'</td><td>'+(r.pct_difference==null?'N/A':fmt(r.pct_difference)+' %')+'</td><td>'+favour(r)+'</td><td>'+esc(r.local_n??'N/A')+' / '+esc(r.cloud_n??'N/A')+'</td><td>'+fmt(r.local_duration_s)+' / '+fmt(r.local_window_s)+'<br>'+fmt(r.cloud_duration_s)+' / '+fmt(r.cloud_window_s)+'</td></tr>'}
  h+='<tr><td>Detection / colour / volume accuracy</td><td>—</td><td colspan="7">'+esc(v.quality)+'</td></tr>';el('lc-table').innerHTML=h}
 function chart(target,series,unit){
  // series: [{name, mode, points:[{x,y}]}]; x = run order; missing values leave gaps.
@@ -75,14 +76,17 @@ function chart(target,series,unit){
  if(!all.length){el(target).innerHTML='<div class="lc-muted" style="padding:40px 0;text-align:center">No run yet</div>';return}
  const xs=all.map(p=>p.x),ys=all.map(p=>p.y);const x0=Math.min(...xs),x1=Math.max(...xs,x0+1),y1=Math.max(...ys)*1.1||1;
  const X=x=>P+(W-P-8)*(x-x0)/(x1-x0),Y=y=>H-P+4-(H-P-4)*y/y1;
- let s='<svg viewBox="0 0 '+W+' '+H+'"><line x1="'+P+'" y1="'+(H-P+4)+'" x2="'+W+'" y2="'+(H-P+4)+'" stroke="currentColor" opacity=".3"/><text x="2" y="12" font-size="9" fill="currentColor">'+fmt(y1)+' '+unit+'</text><text x="'+P+'" y="'+(H-6)+'" font-size="9" fill="currentColor">runs (oldest → newest)</text>';
+ let s='<svg viewBox="0 0 '+W+' '+H+'"><line x1="'+P+'" y1="'+(H-P+4)+'" x2="'+W+'" y2="'+(H-P+4)+'" stroke="currentColor" opacity=".3"/><text x="2" y="12" font-size="9" fill="currentColor">'+fmt(y1)+' '+unit+'</text><text x="'+P+'" y="'+(H-6)+'" font-size="9" fill="currentColor">run number (oldest → newest; hover a point for run id and n)</text>';
  const colours={local:'#4aa3ff',cloud:'#f0a13a'};let legend='';
  for(const se of series){const pts=se.points.filter(p=>p.y!=null);const c=colours[se.mode];legend+='<span style="color:'+c+'">■ '+esc(se.name)+(pts.length?'':' — No run yet')+'</span> ';
   let path='';for(const p of se.points){if(p.y==null){path+=' ';continue}path+=(path.endsWith(' ')||!path?'M':'L')+X(p.x).toFixed(1)+','+Y(p.y).toFixed(1)}
-  s+='<path d="'+path.trim()+'" fill="none" stroke="'+c+'" stroke-width="1.6"'+(se.dash?' stroke-dasharray="4 3"':'')+'/>';for(const p of pts)s+='<circle cx="'+X(p.x).toFixed(1)+'" cy="'+Y(p.y).toFixed(1)+'" r="2.6" fill="'+c+'"><title>'+esc(se.name)+': '+fmt(p.y)+' '+unit+'</title></circle>'}
+  s+='<path d="'+path.trim()+'" fill="none" stroke="'+c+'" stroke-width="1.6"'+(se.dash?' stroke-dasharray="4 3"':'')+'/>';for(const p of pts)s+='<circle cx="'+X(p.x).toFixed(1)+'" cy="'+Y(p.y).toFixed(1)+'" r="2.6" fill="'+c+'"><title>'+esc(se.name)+': '+fmt(p.y)+' '+unit+' · run '+esc(p.run)+' · n='+esc(p.n)+'</title></circle>'}
  el(target).innerHTML=s+'</svg><div style="font-size:11px">'+legend+'</div>'}
-let camPicked=false;function renderCharts(v){if(!camPicked){const has=c=>v.summaries.some(s=>s.camera_id===c);if(!has(el('lc-cam').value)&&has('logitech'))el('lc-cam').value='logitech';}const cam=el('lc-cam').value;const sums=v.summaries.filter(s=>s.camera_id===cam);const order=v.runs.map(r=>r.key);
- const pts=(mode,key)=>sums.filter(s=>s.processing_mode===mode).map(s=>({x:order.indexOf(s.source_host+'|'+s.run_id),y:s[key]}));
+let camPicked=false;function renderCharts(v){if(!camPicked){const has=c=>v.summaries.some(s=>s.camera_id===c);if(!has(el('lc-cam').value)&&has('logitech'))el('lc-cam').value='logitech';}
+ const perMode=m=>v.summaries.filter(s=>s.processing_mode===m&&s.camera_id===el('lc-cam').value).length;
+ if(Math.max(perMode('local'),perMode('cloud'))<2){for(const t of ['lc-ch-lat','lc-ch-fps','lc-ch-fail'])el(t).innerHTML='<div class="lc-muted" style="padding:30px 8px;text-align:center">Trend needs at least two independently identified runs of one mode. With one run per mode, use the table above.</div>';return}
+ if(!camPicked){const has=c=>v.summaries.some(s=>s.camera_id===c);if(!has(el('lc-cam').value)&&has('logitech'))el('lc-cam').value='logitech';}const cam=el('lc-cam').value;const sums=v.summaries.filter(s=>s.camera_id===cam);const order=v.runs.map(r=>r.key);
+ const pts=(mode,key)=>sums.filter(s=>s.processing_mode===mode).map(s=>({x:order.indexOf(s.source_host+'|'+s.run_id),y:s[key],run:s.run_id,n:s.latency_n}));
  chart('lc-ch-lat',[{name:'Local p50',mode:'local',points:pts('local','latency_p50_ms')},{name:'Local p95',mode:'local',dash:1,points:pts('local','latency_p95_ms')},{name:'Cloud p50',mode:'cloud',points:pts('cloud','latency_p50_ms')},{name:'Cloud p95',mode:'cloud',dash:1,points:pts('cloud','latency_p95_ms')}],'ms');
  chart('lc-ch-fps',[{name:'Local',mode:'local',points:pts('local','fps')},{name:'Cloud',mode:'cloud',points:pts('cloud','fps')}],'frames/s');
  chart('lc-ch-fail',[{name:'Local failure %',mode:'local',points:pts('local','failure_pct')},{name:'Local superseded %',mode:'local',dash:1,points:pts('local','superseded_pct')},{name:'Cloud failure %',mode:'cloud',points:pts('cloud','failure_pct')},{name:'Cloud superseded %',mode:'cloud',dash:1,points:pts('cloud','superseded_pct')}],'%')}

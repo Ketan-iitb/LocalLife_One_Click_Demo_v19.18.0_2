@@ -71,6 +71,7 @@ class FrameRecord:
     client_prev_upload_rtt_ms: float | None = None
     reconnected: bool = False
     persisted: bool = False
+    input_id: str | None = None      # identifies a recorded input set (replay benchmark), else None
 
     def _ms(self, start: float | None, end: float | None) -> float | None:
         return None if start is None or end is None else round((end - start) * 1000.0, 3)
@@ -115,7 +116,8 @@ class TelemetryRecorder:
 
     # ------------------------------------------------------------ recording
     def received(self, frame_id: str | None, camera_id: str, *, run_id: str = "", seq: Any = None,
-                 bytes_in: int = 0, client: dict[str, Any] | None = None) -> tuple[str, str] | None:
+                 bytes_in: int = 0, client: dict[str, Any] | None = None,
+                 input_id: str | None = None) -> tuple[str, str] | None:
         """Register an arriving frame. Returns its key, or None for a duplicate.
 
         A frame without an id (an older edge client) gets a server-side one so
@@ -142,6 +144,7 @@ class TelemetryRecorder:
                 bytes_in=int(bytes_in or 0),
                 client_prev_upload_rtt_ms=float(rtt) if isinstance(rtt, (int, float)) else None,
                 reconnected=bool(client.get("reconnected")),
+                input_id=None if input_id is None else str(input_id)[:80],
             )
             self._records[key] = record
             self._order.append(key)
@@ -183,6 +186,12 @@ class TelemetryRecorder:
     def completed(self, key: tuple[str, str] | None, bytes_out: int | None = None) -> None:
         extra = {} if bytes_out is None else {"bytes_out": int(bytes_out)}
         self._set(key, finished_mono=self.clock(), status="completed", **extra)
+
+    def row_for(self, key: tuple[str, str] | None) -> dict[str, Any] | None:
+        """This frame's own measured timings (for correlating a reply with its frame id)."""
+        with self._lock:
+            record = None if key is None else self._records.get(key)
+            return None if record is None else record.row()
 
     def response_bytes(self, key: tuple[str, str] | None, bytes_out: int) -> None:
         """Size of the HTTP reply for this frame (known before async analysis ends)."""

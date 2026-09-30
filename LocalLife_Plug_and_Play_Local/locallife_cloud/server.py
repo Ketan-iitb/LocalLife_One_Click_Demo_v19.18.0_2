@@ -788,6 +788,7 @@ def create_app(
                 run_id=str(metadata.get("run_id") or ""), seq=metadata.get("seq"),
                 bytes_in=int(request.content_length or 0),
                 client=metadata.get("client") if isinstance(metadata.get("client"), dict) else None,
+                input_id=metadata.get("input_id"),
             )
             attribution = {"frame_id": frame_id, "processing_mode": settings.processing_mode}
             if telemetry_key is None:
@@ -842,6 +843,10 @@ def create_app(
             telemetry.failed(telemetry_key, repr(exc))
             LOGGER.exception("Cloud inference failed")
             return jsonify(error="Cloud inference failed; inspect the server logs"), 500
+        timing = telemetry.row_for(telemetry_key) or {}
+        # This frame's own server-side timings, so a synchronous client can
+        # correlate them with its own send->reply time by frame id.
+        attribution["server_timing"] = {k: timing.get(k) for k in ("server_latency_ms", "queue_ms", "processing_ms")}
         response = jsonify(camera_id=target_id, **{**result.to_dict(), **attribution})
         telemetry.response_bytes(telemetry_key, len(response.get_data()))
         return response

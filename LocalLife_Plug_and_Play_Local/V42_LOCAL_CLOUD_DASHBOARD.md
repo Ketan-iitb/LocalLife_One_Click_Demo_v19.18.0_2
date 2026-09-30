@@ -29,3 +29,25 @@ queue = receipt → inference start (all server monotonic clock); upload = edge 
 edge clock (needs the v41 edge client on the Pi); startup = server start → first result per camera
 (GPU provisioning not included); recovery = last result before an outage (edge reconnect or >10 s
 gap) → next result. Accuracy metrics: "Not evaluated" without labelled ground truth.
+
+## Measurement definitions (telemetry revision)
+
+| Row | What is measured | Clock |
+|---|---|---|
+| Server-side result latency (column keys `latency_p50_ms/p95`) | server receipt → result ready. **Not end-to-end**: excludes upload and reply transport | server monotonic |
+| Batch processing time (`inference_*`) | batch start → result ready: detection + depth + measurement for the camera batch, not model forward time alone | server monotonic |
+| Queue waiting time | server receipt → batch start | server monotonic |
+| Edge upload request RTT (`upload_*`) | edge send → HTTP 202 received; includes server enqueue; not one-way latency. N/A when the Pi runs a pre-v41 edge client (the launcher copies the project to the Pi only when it is missing) | one edge monotonic clock |
+| Camera capture → dashboard-visible result | **N/A**: Pi and browser share no clock and displayed results are not correlated to frame ids | — |
+| Superseded | frames replaced in the latest-frame queue by a newer frame (policy, not failure); % of frames received | — |
+| Failed (8a) / Lost (8b) | server-side errors / edge sequence gaps; zero recorded losses is not proof of zero losses when sequence numbers are absent | — |
+| Host CPU/RAM | % of the machine running the server (laptop vs VM): different machines, not comparable capacity | — |
+
+Old CSV columns keep their names and order; new columns are appended (`boundary`, `matched`, `match_notes`,
+`verdict`, `*_na_reason`, `*_window_s`; summaries: `frames_window_s`, `input_id`, `na_reasons` …).
+
+**Matched comparisons only.** A better/worse verdict is shown only when both runs processed the same recorded
+input (`input_id`, set by `scripts/benchmark_local_cloud.py`), with the same detector and depth model and a
+similar frame count. Live camera runs are always "NOT MATCHED" and show numbers without a verdict. Trend
+charts appear only when one mode has at least two runs. The benchmark writes `run_summary.csv` per run
+(N/A reasons included) and `compare` marks the pair MATCHED / NOT MATCHED.
