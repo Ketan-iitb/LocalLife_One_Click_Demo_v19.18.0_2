@@ -22,6 +22,7 @@ from .config import AppConfig
 from .geometry import fixed_bin_mask, is_phantom_source
 from .inference import MetricDepthEstimator, create_segmenter
 from .ledger import waste_object_type
+from .session_deposits import SessionDeposits
 from .paired_events import PairedComparisonLog
 from .pipeline import VisionPipeline, filter_waste_detections
 from .storage import ResultStore
@@ -193,6 +194,11 @@ class DualCameraCoordinator:
             expected_cameras=expected,
         )
         self.attach_paired_listeners()
+        # v45: one session-wide count of NEW bags, shared by both cameras so a
+        # bag seen by both counts once.
+        self.deposits = SessionDeposits(config.results_dir / "session")
+        self.deposits.height_lookup = lambda camera, start, end: self.pipelines[camera].fill.added_height_m(start, end)
+        self.attach_deposit_listeners()
         # Each station knows the other's geometry only so it can refuse to
         # measure with it (coordinates.frame_consistency).
         self.pipelines["logitech"].peer_intrinsics = self.pipelines["realsense"].latest_intrinsics
@@ -238,6 +244,20 @@ class DualCameraCoordinator:
         """
         for camera_id in self.paired_log.expected_cameras:
             self.pipelines[camera_id].measurement_listener = self._record_paired_measurement
+
+    def attach_deposit_listeners(self) -> None:
+        for pipeline in self.pipelines.values():
+            pipeline.deposit_listener = self.deposits.record
+            pipeline.track_listener = self.deposits.observe_tracks
+
+    def bin_fill(self) -> dict[str, Any]:
+        return {"cameras": {camera: {**pipeline.fill.reading,
+                                     "profile": {k: v for k, v in vars(pipeline.fill.profile).items()
+                                                 if k != "pose_edges"},
+                                     "profile_problems": pipeline.fill.profile.problems(),
+                                     "measurement_zone": pipeline.measurement_zone is not None}
+                            for camera, pipeline in self.pipelines.items()},
+                "deposits": self.deposits.snapshot()}
 
     def paired_comparison(self, limit: int = 20) -> dict[str, Any]:
         return {

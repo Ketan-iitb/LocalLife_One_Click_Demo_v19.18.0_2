@@ -60,14 +60,15 @@ async function update(){try{const response=await fetch('/api/state');const state
 
 
 from .comparison_panel import COMPARISON_PANEL  # noqa: E402
+from .bin_fill_panel import BIN_FILL_PANEL  # noqa: E402
 
 # The Local-vs-Cloud panel sits directly below the two live camera streams on
 # both pages; the templates themselves are left as they are.
 _RESEARCH_STREAMS_END = 'id="logitech-materials"></tbody></table></div></article></section>'
 _OPERATOR_STREAMS_END = 'alt="Logitech dumpster camera"></div></div></div>'
 assert DUAL_DASHBOARD.count(_RESEARCH_STREAMS_END) == 1 and OPERATOR_DASHBOARD.count(_OPERATOR_STREAMS_END) == 1
-RESEARCH_PAGE = DUAL_DASHBOARD.replace(_RESEARCH_STREAMS_END, _RESEARCH_STREAMS_END + COMPARISON_PANEL)
-OPERATOR_PAGE = OPERATOR_DASHBOARD.replace(_OPERATOR_STREAMS_END, _OPERATOR_STREAMS_END + COMPARISON_PANEL)
+RESEARCH_PAGE = DUAL_DASHBOARD.replace(_RESEARCH_STREAMS_END, _RESEARCH_STREAMS_END + BIN_FILL_PANEL + COMPARISON_PANEL)
+OPERATOR_PAGE = OPERATOR_DASHBOARD.replace(_OPERATOR_STREAMS_END, _OPERATOR_STREAMS_END + BIN_FILL_PANEL + COMPARISON_PANEL)
 
 
 def _annotate_frame(frame: np.ndarray, pipeline: VisionPipeline) -> np.ndarray:
@@ -189,6 +190,7 @@ def create_app(
         manager = DualCameraCoordinator(settings, detector=pipeline.detector, depth_estimator=pipeline.depth_estimator)
         manager.pipelines["realsense"] = pipeline
         manager.attach_paired_listeners()
+        manager.attach_deposit_listeners()
     else:
         manager = DualCameraCoordinator(settings)
     vision = manager.camera("realsense")
@@ -707,6 +709,61 @@ def create_app(
         BinProfileStore(station.config.results_dir / "bin_profile").save(profile)
         station.reload_bin_profile()
         return jsonify(ok=profile.status == "measured", profile=profile.to_dict()), 200 if profile.status == "measured" else 422
+
+    @app.get("/api/bin-fill")
+    def bin_fill() -> Any:
+        """Per-camera fill readings and the session's new-bag count and events."""
+        return jsonify(manager.bin_fill())
+
+    @app.get("/api/session-deposits.csv")
+    def session_deposits_csv() -> Any:
+        path = manager.deposits.csv_path
+        body = path.read_text(encoding="utf-8") if path.exists() else ""
+        return Response(body, mimetype="text/csv", headers={
+            "Content-Disposition": "attachment; filename=session_deposits.csv", "Cache-Control": "no-store"})
+
+    @app.post("/api/cameras/<camera_id>/fill-profile")
+    @protected
+    def save_fill_profile(camera_id: str) -> Any:
+        """This camera's own tape measurements (cm) -> its fill profile. Save with the bin EMPTY."""
+        from .bin_fill import FillProfile
+
+        try:
+            station = manager.camera(camera_id)
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 404
+        payload = request.get_json(silent=True) or {}
+
+        def metres(key: str) -> float | None:
+            value = payload.get(key)
+            if value in (None, ""):
+                return None
+            number = float(value) / 100.0
+            if not np.isfinite(number) or number <= 0:
+                raise ValueError(f"{key} must be a positive number of cm")
+            return number
+
+        try:
+            tilt = payload.get("tilt_from_vertical_deg")
+            kind = str(payload.get("distance_kind", "unknown"))
+            if kind not in ("vertical", "optical_axis", "unknown"):
+                raise ValueError("distance_kind must be vertical, optical_axis or unknown")
+            capacity = float(payload.get("capacity_l") or 660.0)
+            if not np.isfinite(capacity) or capacity <= 0:
+                raise ValueError("capacity_l must be positive")
+            profile = FillProfile(
+                camera_id=camera_id, camera_to_empty_floor_m=metres("camera_to_empty_floor_cm"),
+                distance_kind=kind, tilt_from_vertical_deg=None if tilt in (None, "") else float(tilt),
+                usable_height_m=metres("usable_height_cm"), camera_above_rim_m=metres("camera_above_rim_cm"),
+                inner_length_m=metres("inner_length_cm"), inner_width_m=metres("inner_width_cm"),
+                capacity_l=capacity, capacity_verified=bool(payload.get("capacity_verified")),
+            )
+        except (TypeError, ValueError) as exc:
+            return jsonify(error=f"Invalid fill profile: {exc}"), 400
+        frame = station.latest_frame
+        region = None if frame is None else station._measurement_region(frame.shape)
+        problems = station.fill.save_profile(profile, frame, region)
+        return jsonify(ok=not problems, problems=problems, pose_reference_saved=frame is not None)
 
     @app.get("/api/cameras/<camera_id>/stages")
     def camera_stages(camera_id: str) -> Any:

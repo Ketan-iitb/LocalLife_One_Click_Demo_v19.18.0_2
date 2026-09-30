@@ -98,6 +98,7 @@ from .logitech_metric import (CALIBRATION_SET, EVALUATION_SET, RECOMMENDED_SAMPL
                               integrate_volume_l, robust_height_cm, stable_statistics,
                               zone_signature)
 from .measurement_zone import MeasurementZone, MeasurementZoneStore
+from .bin_fill import FillEstimator
 from .readiness import MeasurementReadiness
 from .shape_geometry import (CYLINDER, CYLINDER_REJECTIONS, SPHERE, UNCERTAIN, GeometryLock,
                              ObjectSignature, ShapeGeometry, measure_shape)
@@ -801,6 +802,11 @@ class VisionPipeline:
         # Called with each persisted measurement row (DualCameraCoordinator
         # pairs the two cameras through it).
         self.measurement_listener: Callable[[dict[str, Any]], None] | None = None
+        # v45: session deposit counter (set by the coordinator) and this camera's own fill profile.
+        self.deposit_listener: Callable[[str, Any, dict[str, Any]], None] | None = None
+        self.track_listener: Callable[[str, list[int]], None] | None = None
+        self.fill = FillEstimator(camera_id, config.results_dir / "bin_profile")
+        self._last_motion: float | None = None
         # Logitech metric-depth calibration samples and fit, kept apart from
         # evaluation data (logitech_calibration.py).
         self.logitech_calibration = (
@@ -3019,6 +3025,11 @@ class VisionPipeline:
         )
 
         self._apply_bin_bounds(detections)
+        self._update_fill(frame, depth_m, intrinsics, calibrated_prediction, measure_intrinsics,
+                          bin_region, time.time())    # same wall clock as occupancy events
+        if self.track_listener is not None:
+            self.track_listener(self.camera_id, [item.track_id for item in detections
+                                                 if item.track_id is not None and not _is_phantom_detection(item)])
         if persist:
             self.store.append_jsonl("frames.jsonl", analysis.to_dict())
             self._finalise_settled_measurements(detections, timestamp)
@@ -3339,6 +3350,29 @@ class VisionPipeline:
 
     def reload_bin_profile(self) -> None:
         self._bin_profile = None
+
+    def _update_fill(self, frame, depth_m, intrinsics, calibrated_prediction, measure_intrinsics,
+                     bin_region, timestamp: float) -> None:
+        """Refresh this camera's fill reading from its own metric depth (settled frames only).
+
+        RealSense: aligned hardware depth. Logitech: only a depth map scaled by
+        its OWN measured camera-to-floor distance; a scale borrowed from the
+        RealSense or an unverified model scale gives N/A with the reason.
+        """
+        try:
+            if self.camera_id == "logitech":
+                if self.calibration_mode != "independent-measured-distance":
+                    self.fill.update(frame, None, None, bin_region, self._last_motion, timestamp,
+                                     depth_reason=f"Logitech depth not independently metric-calibrated "
+                                                  f"(mode: {self.calibration_mode})")
+                    return
+                depth, geometry = calibrated_prediction, measure_intrinsics
+            else:
+                depth, geometry = depth_m, intrinsics
+            self.fill.update(frame, depth, geometry, bin_region, self._last_motion, timestamp,
+                             depth_reason="no aligned depth frame")
+        except Exception:  # noqa: BLE001 - the fill panel must never stop the pipeline
+            LOGGER.exception("%s fill update failed", self.camera_id)
 
     def _apply_bin_bounds(self, detections: list[Detection]) -> None:
         """Withhold dimensions that cannot exist inside this bin; never clamp them."""
@@ -4557,6 +4591,7 @@ class VisionPipeline:
         else:
             motion = int(np.count_nonzero(current ^ previous)) / available
         self._previous_change_mask = None if current is None else current.copy()
+        self._last_motion = motion
         self._observe_bin_occupancy(detections, motion)
 
     def _observe_bin_occupancy(self, detections: list[Detection], changed: float) -> None:
@@ -4618,6 +4653,17 @@ class VisionPipeline:
                 self.camera_id, event.event_id, event.occupied_before_l,
                 event.occupied_after_l, event.delta_occupancy_l, event.status,
             )
+            if self.deposit_listener is not None:
+                bag = next((item for item in detections if event.track_id is not None
+                            and item.track_id == event.track_id), None)
+                material = None
+                if bag is not None and bag.material not in (None, "", "unknown") \
+                        and float(bag.material_confidence or 0.0) >= 0.5:
+                    material = bag.material
+                try:
+                    self.deposit_listener(self.camera_id, event, {"material": material})
+                except Exception:  # noqa: BLE001 - the counter must never stop the pipeline
+                    LOGGER.exception("session deposit listener failed")
 
     def _measurement_readiness(self) -> MeasurementReadiness:
         """Each prerequisite for a metric measurement, ready or missing."""

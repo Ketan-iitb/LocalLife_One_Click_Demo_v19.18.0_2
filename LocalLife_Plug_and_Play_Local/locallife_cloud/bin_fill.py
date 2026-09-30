@@ -1,0 +1,254 @@
+"""Bin fill level from one camera's own measured pose.
+
+Each camera has its OWN fill profile (tripods differ): the tape-measured
+distance from its optical centre to the EMPTY bin floor, whether that distance
+is vertical or along the tilted optical axis, the tilt from vertical, and the
+usable floor-to-rim height. Nothing is shared between cameras and nothing is
+derived from the bin's nominal capacity.
+
+From calibrated metric depth, each valid pixel inside the bin region gets a
+height above the empty floor:  h = H + up . P, with P the back-projected
+point, H the vertical optical-centre height and up = (0, -sin b, -cos b) for a
+camera pitched b degrees from vertical (roll assumed zero). Pixels are pooled
+into 5 cm floor cells (the cell's top surface). The reported quantities are
+kept apart and labelled:
+
+* maximum reliable fill height -- 95th percentile of the cell tops;
+* height-based fill %          -- that height / usable height;
+* rough litres                 -- capacity x that fraction, which assumes the
+                                  bin is filled roughly evenly;
+* estimated occupied volume    -- mean cell height x measured inner floor area,
+                                  only when the interior is measured and most of
+                                  it is seen.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import time
+from collections import deque
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+CELL_M = 0.05
+RIM_TOLERANCE_M = 0.15          # above rim + this: rim, tripod or outside the bin
+MIN_COVERAGE = 0.30              # of bin-region pixels with valid depth
+OCCUPIED_MIN_CELL_SHARE = 0.60   # of the measured inner floor area seen
+STABLE_MOTION = 0.02             # scene motion fraction below which a frame is "settled"
+MOVED_EDGE_CORRELATION = 0.45    # thumbnail edge correlation outside the bin below this: camera moved
+HEIGHT_FILL_LABEL = "rough height-based equivalent; assumes roughly uniform filling"
+OCCUPIED_LABEL = "estimated occupied volume over the measured bin floor area (visible surface; voids unseen)"
+
+
+@dataclass
+class FillProfile:
+    camera_id: str
+    camera_to_empty_floor_m: float | None = None
+    distance_kind: str = "unknown"            # "vertical" | "optical_axis" | "unknown"
+    tilt_from_vertical_deg: float | None = None
+    usable_height_m: float | None = None      # empty floor -> rim, measured
+    camera_above_rim_m: float | None = None
+    inner_length_m: float | None = None
+    inner_width_m: float | None = None
+    capacity_l: float = 660.0
+    capacity_verified: bool = False
+    saved_at: float | None = None
+    pose_edges: list[int] | None = None       # 64x48 edge thumbnail outside the bin at save time
+
+    def vertical_height_m(self) -> float | None:
+        if self.camera_to_empty_floor_m is None or self.tilt_from_vertical_deg is None:
+            return None
+        if self.distance_kind == "vertical":
+            return self.camera_to_empty_floor_m
+        if self.distance_kind == "optical_axis":
+            return self.camera_to_empty_floor_m * math.cos(math.radians(self.tilt_from_vertical_deg))
+        return None
+
+    def problems(self) -> list[str]:
+        issues = []
+        if self.camera_to_empty_floor_m is None or self.camera_to_empty_floor_m <= 0:
+            issues.append("camera-to-empty-floor distance not measured")
+        if self.distance_kind not in ("vertical", "optical_axis"):
+            issues.append("say whether the camera-to-floor distance is vertical or along the optical axis")
+        if self.tilt_from_vertical_deg is None or not 0 <= self.tilt_from_vertical_deg < 80:
+            issues.append("camera tilt from vertical not measured (0-80 deg)")
+        if self.usable_height_m is None or self.usable_height_m <= 0:
+            issues.append("usable floor-to-rim height not measured")
+        vertical = self.vertical_height_m()
+        if not issues and vertical is not None and self.usable_height_m >= vertical:
+            issues.append("usable height is not below the camera: re-check both measurements")
+        if (not issues and self.camera_above_rim_m is not None and vertical is not None
+                and abs(vertical - (self.usable_height_m + self.camera_above_rim_m)) > 0.05):
+            issues.append(f"inconsistent: camera height {vertical:.2f} m vs rim {self.usable_height_m:.2f} m + "
+                          f"offset {self.camera_above_rim_m:.2f} m (more than 5 cm apart)")
+        return issues
+
+
+def heights_above_floor(depth_m: np.ndarray, intrinsics: Any, profile: FillProfile,
+                        region: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(height above empty floor, horizontal x, horizontal y) for valid pixels inside `region`."""
+    vertical = profile.vertical_height_m()
+    tilt = math.radians(profile.tilt_from_vertical_deg or 0.0)
+    rows, cols = np.nonzero((depth_m > 0.05) & np.isfinite(depth_m) & (True if region is None else region))
+    z = depth_m[rows, cols].astype(np.float64)
+    x = (cols - intrinsics.ppx) * z / intrinsics.fx
+    y = (rows - intrinsics.ppy) * z / intrinsics.fy
+    up = (0.0, -math.sin(tilt), -math.cos(tilt))
+    forward = (0.0, math.cos(tilt), -math.sin(tilt))
+    height = vertical + up[1] * y + up[2] * z
+    horizontal_y = forward[1] * y + forward[2] * z
+    return height, x, horizontal_y
+
+
+def cell_tops(height: np.ndarray, hx: np.ndarray, hy: np.ndarray) -> dict[tuple[int, int], float]:
+    cells: dict[tuple[int, int], float] = {}
+    for key, value in zip(zip(np.floor(hx / CELL_M).astype(int), np.floor(hy / CELL_M).astype(int)), height):
+        if value > cells.get(key, -1e9):
+            cells[key] = float(value)
+    return cells
+
+
+def fill_reading(cells: dict[tuple[int, int], float], coverage: float, profile: FillProfile) -> dict[str, Any]:
+    """The labelled fill quantities from one settled grid of cell tops (heights in metres)."""
+    usable = float(profile.usable_height_m)
+    tops = np.clip(np.fromiter(cells.values(), dtype=np.float64), 0.0, usable)
+    fill = float(np.percentile(tops, 95))
+    fraction = fill / usable
+    reading = {
+        "status": "ok", "reason": None, "coverage_pct": round(100 * coverage, 1),
+        "max_fill_height_cm": round(fill * 100, 1), "usable_height_cm": round(usable * 100, 1),
+        "height_fill_pct": round(100 * fraction, 1),
+        "remaining_height_cm": round((usable - fill) * 100, 1),
+        "rough_litres": round(profile.capacity_l * fraction, 1),
+        "rough_remaining_litres": round(profile.capacity_l * (1 - fraction), 1),
+        "rough_litres_label": HEIGHT_FILL_LABEL,
+        "capacity_l": profile.capacity_l,
+        "capacity_note": "verified on the bin label" if profile.capacity_verified else "nominal 660 L, unverified",
+        "occupied_l": None, "occupied_pct": None, "occupied_label": OCCUPIED_LABEL,
+    }
+    if profile.inner_length_m and profile.inner_width_m:
+        area = profile.inner_length_m * profile.inner_width_m
+        seen = len(cells) * CELL_M * CELL_M / area
+        if seen >= OCCUPIED_MIN_CELL_SHARE:
+            mean = float(tops.mean())
+            reading["occupied_l"] = round(mean * area * 1000.0, 1)
+            reading["occupied_pct"] = round(100 * mean / usable, 1)
+        else:
+            reading["occupied_reason"] = f"only {seen:.0%} of the measured bin floor area is visible"
+    else:
+        reading["occupied_reason"] = "inner bin length and width not measured"
+    return reading
+
+
+def edge_thumbnail(frame: np.ndarray, region: np.ndarray | None) -> np.ndarray | None:
+    try:
+        import cv2
+    except ImportError:  # pragma: no cover
+        return None
+    grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+    small = cv2.resize(cv2.GaussianBlur(grey, (5, 5), 0), (64, 48), interpolation=cv2.INTER_AREA)
+    edges = cv2.Canny(small, 40, 120).astype(np.float32)
+    if region is not None:
+        outside = cv2.resize(region.astype(np.uint8), (64, 48), interpolation=cv2.INTER_NEAREST) == 0
+        edges[~outside] = 0.0        # waste inside the bin changes; walls and rim do not
+    return edges
+
+
+def _correlation(a: np.ndarray, b: np.ndarray) -> float:
+    a, b = a - a.mean(), b - b.mean()
+    denominator = float(np.sqrt((a * a).sum() * (b * b).sum()))
+    return float((a * b).sum() / denominator) if denominator > 0 else 0.0
+
+
+class FillEstimator:
+    """Per-camera fill reading, refreshed only from settled frames."""
+
+    def __init__(self, camera_id: str, directory: Path) -> None:
+        self.camera_id = camera_id
+        self.path = Path(directory) / f"fill_{camera_id}.json"
+        self.profile = self._load()
+        self.reading: dict[str, Any] = self._na("no settled frame processed yet")
+        self.history: deque[tuple[float, dict[tuple[int, int], float]]] = deque(maxlen=60)
+
+    def _load(self) -> FillProfile:
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            return FillProfile(**{k: v for k, v in data.items() if k in FillProfile.__dataclass_fields__})
+        except (OSError, ValueError, TypeError):
+            return FillProfile(camera_id=self.camera_id)
+
+    def save_profile(self, profile: FillProfile, frame: np.ndarray | None, region: np.ndarray | None) -> list[str]:
+        problems = profile.problems()
+        if frame is not None:
+            edges = edge_thumbnail(frame, region)
+            profile.pose_edges = None if edges is None else edges.astype(np.uint8).ravel().tolist()
+        profile.saved_at = time.time()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(asdict(profile)), encoding="utf-8")
+        os.replace(temporary, self.path)
+        self.profile = profile
+        self.history.clear()
+        self.reading = self._na("profile saved; waiting for a settled frame")
+        return problems
+
+    def _na(self, reason: str) -> dict[str, Any]:
+        return {"status": "na", "reason": reason, "updated_at": None, "camera_id": self.camera_id,
+                "rough_litres_label": HEIGHT_FILL_LABEL, "occupied_label": OCCUPIED_LABEL,
+                "capacity_l": self.profile.capacity_l,
+                "capacity_note": "verified on the bin label" if self.profile.capacity_verified
+                else "nominal 660 L, unverified"}
+
+    def camera_moved(self, frame: np.ndarray, region: np.ndarray | None) -> bool:
+        if not self.profile.pose_edges:
+            return False
+        now = edge_thumbnail(frame, region)
+        if now is None:
+            return False
+        saved = np.asarray(self.profile.pose_edges, dtype=np.float32).reshape(48, 64)
+        return _correlation(saved, now) < MOVED_EDGE_CORRELATION
+
+    def update(self, frame: np.ndarray, depth_m: np.ndarray | None, intrinsics: Any, region: np.ndarray | None,
+               motion: float | None, timestamp: float, *, depth_reason: str | None = None) -> dict[str, Any]:
+        problems = self.profile.problems()
+        if problems:
+            self.reading = self._na("fill profile incomplete: " + "; ".join(problems))
+            return self.reading
+        if depth_m is None or intrinsics is None:
+            self.reading = self._na(depth_reason or "no calibrated metric depth for this camera")
+            return self.reading
+        if self.camera_moved(frame, region):
+            self.reading = self._na("camera or bin moved since the fill profile was saved: re-measure and save it")
+            return self.reading
+        if motion is not None and motion > STABLE_MOTION:
+            if self.reading.get("status") == "ok":
+                self.reading["stale"] = True       # keep the last settled reading, marked
+            return self.reading
+        height, hx, hy = heights_above_floor(depth_m, intrinsics, self.profile, region)
+        total = int(np.count_nonzero(region)) if region is not None else depth_m.size
+        keep = (height > -0.10) & (height < self.profile.usable_height_m + RIM_TOLERANCE_M)
+        coverage = float(np.count_nonzero(keep)) / max(1, total)
+        if coverage < MIN_COVERAGE:
+            self.reading = self._na(f"only {coverage:.0%} of the bin region has valid depth")
+            return self.reading
+        cells = cell_tops(height[keep], hx[keep], hy[keep])
+        self.history.append((timestamp, cells))
+        self.reading = {**fill_reading(cells, coverage, self.profile), "camera_id": self.camera_id,
+                        "updated_at": timestamp, "stale": False}
+        return self.reading
+
+    def added_height_m(self, started_at: float, finalized_at: float) -> tuple[float | None, str | None]:
+        """New bag height: AFTER top minus the BEFORE surface, over the cells that rose (its footprint)."""
+        before = next((cells for ts, cells in reversed(self.history) if ts < started_at), None)
+        after = next((cells for ts, cells in reversed(self.history) if ts >= finalized_at - 1.0), None)
+        if before is None or after is None:
+            return None, "no settled before/after surface pair around the deposit"
+        rises = [after[key] - before[key] for key in after.keys() & before.keys() if after[key] - before[key] > 0.02]
+        if len(rises) < 4:
+            return None, "no measurable rise of the surface under the new bag"
+        return float(np.percentile(rises, 90)), None
