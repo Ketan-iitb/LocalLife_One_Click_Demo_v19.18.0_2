@@ -299,15 +299,16 @@ class LaunchController:
     def _note(self, message: str) -> None:
         self.state.messages.append(message)
 
-    def _attempt(self, mode: str, timeout: float) -> tuple[bool, str | None]:
+    def _attempt(self, mode: str, timeout: float | None) -> tuple[bool, str | None]:
         self.state.phase = "starting-cloud" if mode == "cloud" else "starting-local"
         self._note(f"Starting {mode} pipeline…")
+        timeout = timeout if timeout and timeout > 0 else None   # 0 = wait until it opens
         try:
             completed = self._runner(self._command(mode), timeout)
         except FileNotFoundError as exc:
             return False, str(exc)
         except subprocess.TimeoutExpired:
-            return False, f"{mode} startup exceeded {timeout:.0f}s"
+            return False, f"{mode} startup exceeded {timeout:.0f}s (configured limit)"
         except OSError as exc:
             return False, f"{mode} startup could not run: {exc}"
         if completed.returncode != 0:

@@ -286,11 +286,15 @@ class AppConfig:
     local_api_port: int = 8765
     default_run_mode: str = "ask"
     allow_local_fallback: bool = True
-    cloud_startup_timeout_seconds: int = 90
+    # 0 = no limit in the control service. The launcher script bounds each of
+    # its own waits (gpu.py, SSH, app health, Pi), so the white page just keeps
+    # showing progress until it opens; a fixed 90 s killed every real cloud
+    # start there ("cloud startup exceeded 90s") and left Windows 2/3 unopened.
+    cloud_startup_timeout_seconds: int = 0
     # Local start includes loading the detection/depth models and waiting for
     # the Pi's first frames; the old shared 90 s limit killed the launcher
     # mid-start on a slower laptop, so the system never finished opening.
-    local_startup_timeout_seconds: int = 900
+    local_startup_timeout_seconds: int = 0
     # Per-stage budgets. Defaults come from measured startup, not from guesses:
     # a real run brought the VM up in 79 s with capacity in the usual zone, so
     # 300 s covers that with room for a slow boot while still failing long

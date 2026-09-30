@@ -269,16 +269,32 @@ class BackgroundStartTests(unittest.TestCase):
             control._worker.join(10)
             status = client.get("/api/launcher/status").get_json()["launch"]
             self.assertEqual(status["phase"], "running")
-            self.assertEqual(seen["timeout"], 900.0)   # local budget, not the old shared 90 s
+            self.assertIsNone(seen["timeout"])   # no timer: the launcher's own stages bound it
 
     def test_worker_failure_is_reported_on_the_page(self) -> None:
         def broken(command, timeout):
             raise subprocess.TimeoutExpired(command, timeout)
 
         with TemporaryDirectory() as directory:
-            control = LaunchController(AppConfig(results_dir=Path(directory)), runner=broken)
+            config = AppConfig(results_dir=Path(directory), local_startup_timeout_seconds=600)
+            control = LaunchController(config, runner=broken)
             control.resolve_launcher_script = lambda: Path("Start-LocalLife-Demo.ps1")
             control.start_in_background("local")
             control._worker.join(10)
             self.assertEqual(control.state.phase, "failed")
-            self.assertIn("900", control.state.error)
+            self.assertIn("600", control.state.error)   # only an explicitly configured limit applies
+
+    def test_cloud_start_has_no_timer_by_default(self) -> None:
+        seen = {}
+
+        def runner(command, timeout):
+            seen["timeout"] = timeout
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with TemporaryDirectory() as directory:
+            control = LaunchController(AppConfig(results_dir=Path(directory)), runner=runner)
+            control.resolve_launcher_script = lambda: Path("Start-LocalLife-Demo.ps1")
+            control.readiness = lambda: {"cloud_available": True, "internet": True, "gcloud_installed": True}
+            launch = control.start("cloud")
+            self.assertEqual(launch["phase"], "running")
+            self.assertIsNone(seen["timeout"])
