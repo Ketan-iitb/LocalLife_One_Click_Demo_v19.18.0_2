@@ -24,7 +24,9 @@ from .operator_dashboard import OPERATOR_DASHBOARD
 from .pipeline import VisionPipeline
 from .storage import BucketSync
 from .streaming import LatestFrameProcessor
-from .telemetry import TELEMETRY_COLUMNS, TelemetryRecorder, export_json
+from .telemetry import TELEMETRY_COLUMNS, TelemetryRecorder, export_json, gpu_resources, host_resources
+from .telemetry import code_commit as _code_commit
+from . import comparison_store as cmp_store
 from .types import CameraIntrinsics
 
 
@@ -55,6 +57,17 @@ function tableRow(target,values){const tr=document.createElement('tr');for(const
 async function update(){try{const response=await fetch('/api/state');const state=await response.json();const result=state.latest||{};const hardware=state.realsense_depth||{};const mono=state.monocular_depth||{};const readiness=state.volume_status||{};const plant=state.plant||{};node('bags-seen').textContent=plant.observed_bags||0;node('boxes-seen').textContent=plant.observed_boxes||0;node('bags-deposited').textContent=plant.deposited_bags||0;node('boxes-deposited').textContent=plant.deposited_boxes||0;node('cumulative').textContent=fmt(plant.cumulative_volume_l||0);node('hardware').textContent=fmt(result.realsense_volume_l);node('occupancy').textContent=fmt(result.bin_total_volume_l);node('coverage').textContent=hardware.available?hardware.valid_percent.toFixed(0)+'%':'none';node('runtime').textContent=state.runtime.gpu_name||state.runtime.device||'GPU initializes on first frame';node('warnings').textContent=(result.warnings||[]).join(' • ');node('volume-status').className=readiness.ready?'ready':'warnings';node('volume-status').textContent=readiness.message||'';node('hardware-depth-status').textContent=signalSummary(hardware);node('monocular-depth-status').textContent=signalSummary(mono)+(mono.available?(state.monocular_calibrated?' | calibrated':' | not calibrated'):'');node('status').textContent='Frames: '+state.frames_processed+' | Baseline frames: '+(state.baseline_frame_count||0)+' | Auto-deposit: '+(state.auto_deposit?'on':'off')+' | Intrinsics: '+(state.camera_intrinsics_ready?'ready':'missing');node('models').textContent=state.detector_model+' | '+(state.depth_model||'depth disabled');for(const id of ['rows','color-rows','stream-rows','history-rows'])node(id).replaceChildren();for(const item of result.detections||[]){const depth=item.depth_distance_m!=null?item.depth_distance_m.toFixed(2)+' m':'—';const height=item.height_above_baseline_cm!=null?item.height_above_baseline_cm.toFixed(1)+' cm':'—';const volume=item.volume_uncertainty_l!=null?fmt(item.realsense_volume_l)+' ± '+item.volume_uncertainty_l.toFixed(3)+' L':fmt(item.realsense_volume_l);tableRow('rows',[item.track_id??'—',item.label,item.color,depth,height,volume]);}if(!(result.detections||[]).length)tableRow('rows',['Waiting for the next bag or box','','','','','']);for(const item of plant.colors||[])tableRow('color-rows',[item.color,item.waste_stream||'not configured',item.observed_count,item.deposited_count,fmt(item.volume_l)]);for(const item of plant.waste_streams||[])tableRow('stream-rows',[item.waste_stream,item.deposited_count,fmt(item.volume_l)]);if(!(plant.waste_streams||[]).length)tableRow('stream-rows',['No color mappings configured','','']);for(const item of plant.history||[])tableRow('history-rows',[new Date(item.observed_at*1000).toLocaleTimeString(),item.track_id,item.object_type,item.label,item.color,item.waste_stream||'not configured',fmt(item.volume_l),item.status]);}catch(error){node('warnings').textContent='Dashboard cannot reach the cloud service.';}}setInterval(update,550);update();
 </script></main></body></html>
 """
+
+
+from .comparison_panel import COMPARISON_PANEL  # noqa: E402
+
+# The Local-vs-Cloud panel sits directly below the two live camera streams on
+# both pages; the templates themselves are left as they are.
+_RESEARCH_STREAMS_END = 'id="logitech-materials"></tbody></table></div></article></section>'
+_OPERATOR_STREAMS_END = 'alt="Logitech dumpster camera"></div></div></div>'
+assert DUAL_DASHBOARD.count(_RESEARCH_STREAMS_END) == 1 and OPERATOR_DASHBOARD.count(_OPERATOR_STREAMS_END) == 1
+RESEARCH_PAGE = DUAL_DASHBOARD.replace(_RESEARCH_STREAMS_END, _RESEARCH_STREAMS_END + COMPARISON_PANEL)
+OPERATOR_PAGE = OPERATOR_DASHBOARD.replace(_OPERATOR_STREAMS_END, _OPERATOR_STREAMS_END + COMPARISON_PANEL)
 
 
 def _annotate_frame(frame: np.ndarray, pipeline: VisionPipeline) -> np.ndarray:
@@ -212,6 +225,19 @@ def create_app(
         csv_path=settings.results_dir / "telemetry" / f"telemetry_{settings.processing_mode}_{server_run_id}.csv",
     )
     app.extensions["locallife_telemetry"] = telemetry
+    # Durable Local-vs-Cloud history: every finished frame and a resource
+    # sample every few seconds, appended; earlier runs are reloaded on start.
+    lc_store = cmp_store.ComparisonStore(
+        settings.results_dir / "local_cloud_comparison", processing_mode=settings.processing_mode,
+        run_meta={"detector": settings.detector_model,
+                  "depth_model": settings.depth_model if settings.enable_monocular_depth else None,
+                  "code_commit": _code_commit()},
+    )
+    telemetry.sink = lc_store.record_frame
+    sampler = cmp_store.ResourceSampler(lc_store, host_resources, gpu_resources).start()
+    app.extensions["locallife_comparison_store"] = lc_store
+    atexit.register(sampler.stop)
+    atexit.register(lc_store.persist_summaries)
     frame_processor = LatestFrameProcessor(manager, telemetry=telemetry)
     app.extensions["locallife_frame_processor"] = frame_processor
     atexit.register(frame_processor.stop)
@@ -235,7 +261,7 @@ def create_app(
     @app.get("/")
     def index() -> str:
         """Operator page (Accuracy Deployment v3.0) -- the default landing page."""
-        return render_template_string(OPERATOR_DASHBOARD, api_token=settings.api_token)
+        return render_template_string(OPERATOR_PAGE, api_token=settings.api_token)
 
     @app.get("/research")
     def research_dashboard() -> str:
@@ -245,7 +271,7 @@ def create_app(
         # localhost, e.g. the normal 0.0.0.0 launcher run) those calls need the
         # token too, so it is embedded into the page here and attached by the
         # JS fetch calls.
-        return render_template_string(DUAL_DASHBOARD, api_token=settings.api_token)
+        return render_template_string(RESEARCH_PAGE, api_token=settings.api_token)
 
     @app.get("/api/color-map")
     def get_color_map() -> Any:
@@ -299,6 +325,54 @@ def create_app(
         return Response(output.getvalue(), mimetype="text/csv", headers={
             "Content-Disposition":
                 f"attachment; filename=telemetry_{settings.processing_mode}_{server_run_id}.csv"})
+
+    def _csv_response(text: str, rows: int, name: str) -> Response:
+        return Response(text, mimetype="text/csv", headers={
+            "Content-Disposition": f"attachment; filename={name}", "X-Row-Count": str(rows)})
+
+    @app.get("/api/local-cloud/view")
+    def local_cloud_view() -> Any:
+        """The comparison both dashboards render: runs, selected pair, rows, summaries."""
+        return jsonify(lc_store.comparison(request.args.get("local_run") or None,
+                                             request.args.get("cloud_run") or None))
+
+    @app.get("/api/local-cloud/summaries")
+    def local_cloud_summaries() -> Any:
+        return jsonify(processing_mode=settings.processing_mode, summaries=lc_store.own_summaries())
+
+    @app.get("/api/local-cloud/raw.csv")
+    def local_cloud_raw_csv() -> Any:
+        since = request.args.get("since")
+        rows = lc_store.raw_rows(request.args.get("run_id") or None,
+                                   float(since) if since and since.replace(".", "", 1).isdigit() else None)
+        return _csv_response(cmp_store.to_csv(rows, cmp_store.RAW_COLUMNS), len(rows),
+                             "local_cloud_raw_observations.csv")
+
+    @app.get("/api/local-cloud/summaries.csv")
+    def local_cloud_summaries_csv() -> Any:
+        run = request.args.get("run_id")
+        rows = [s for s in lc_store.all_summaries() if not run or s.get("run_id") == run]
+        return _csv_response(cmp_store.to_csv(rows, cmp_store.SUMMARY_COLUMNS), len(rows),
+                             "local_cloud_run_summaries.csv")
+
+    @app.get("/api/local-cloud/comparison.csv")
+    def local_cloud_comparison_csv() -> Any:
+        view = lc_store.comparison(request.args.get("local_run") or None, request.args.get("cloud_run") or None)
+        return _csv_response(cmp_store.to_csv(view["rows"], cmp_store.COMPARISON_COLUMNS), len(view["rows"]),
+                             "local_cloud_comparison.csv")
+
+    @app.post("/api/local-cloud/import")
+    @protected
+    def local_cloud_import() -> Any:
+        """The other processing mode's run summaries (JSON list or the run summary CSV)."""
+        if request.mimetype == "text/csv":
+            items = cmp_store.parse_summary_csv(request.get_data(as_text=True))
+        else:
+            payload = request.get_json(silent=True) or {}
+            items = payload.get("summaries") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            return jsonify(error="Provide summaries as a JSON list or the run summary CSV"), 400
+        return jsonify(ok=True, **lc_store.import_summaries(items[:2000]))
 
     @app.get("/api/telemetry.json")
     def telemetry_json() -> Any:

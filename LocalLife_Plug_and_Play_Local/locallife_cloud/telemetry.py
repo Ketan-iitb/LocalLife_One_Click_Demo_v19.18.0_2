@@ -70,6 +70,7 @@ class FrameRecord:
     error: str | None = None
     client_prev_upload_rtt_ms: float | None = None
     reconnected: bool = False
+    persisted: bool = False
 
     def _ms(self, start: float | None, end: float | None) -> float | None:
         return None if start is None or end is None else round((end - start) * 1000.0, 3)
@@ -108,6 +109,7 @@ class TelemetryRecorder:
         self._order: deque[tuple[str, str]] = deque()
         self._max = max_records
         self.duplicates = 0
+        self.sink: Callable[[FrameRecord], None] | None = None   # durable store hook
         self.client_counters: dict[str, dict[str, Any]] = {}
         self.edge_resources: dict[str, dict[str, Any]] = {}
 
@@ -162,9 +164,18 @@ class TelemetryRecorder:
                 return
             for name, value in values.items():
                 setattr(record, name, value)
-            final = record.status in {"completed", "superseded", "failed"}
+            # A frame is written once, when it first reaches a final status;
+            # a later reply-size update must not add a second row.
+            final = record.status in {"completed", "superseded", "failed"} and not record.persisted
+            if final:
+                record.persisted = True
         if final:
             self._append_csv(record)
+            if self.sink is not None:
+                try:
+                    self.sink(record)
+                except Exception:  # noqa: BLE001 - storage must never stop processing
+                    pass
 
     def started(self, key: tuple[str, str] | None) -> None:
         self._set(key, started_mono=self.clock(), status="processing")
