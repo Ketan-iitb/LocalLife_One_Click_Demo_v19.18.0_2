@@ -5,7 +5,6 @@ Synthetic scenes only: they check the logic, not real-world accuracy.
 
 from __future__ import annotations
 
-import csv
 import math
 import sys
 import unittest
@@ -17,11 +16,9 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from locallife_cloud import bin_fill as bf  # noqa: E402
-from locallife_cloud.bin_occupancy import OccupancyEvent  # noqa: E402
 from locallife_cloud.comparison import DualCameraCoordinator  # noqa: E402
 from locallife_cloud.config import AppConfig  # noqa: E402
 from locallife_cloud.server import create_app  # noqa: E402
-from locallife_cloud.session_deposits import SessionDeposits  # noqa: E402
 from locallife_cloud.types import CameraIntrinsics  # noqa: E402
 
 K = CameraIntrinsics(fx=300.0, fy=300.0, ppx=80.0, ppy=60.0, width=160, height=120)
@@ -131,69 +128,6 @@ class EstimatorTests(unittest.TestCase):
             self.assertIsNone(est.added_height_m(12.0, 19.5)[0])            # hidden: no rise, N/A
 
 
-def _event(n, camera="realsense", track=None, delta=15.0, start=100.0, envelope=(400.0, 300.0, 250.0), status="finalized"):
-    return OccupancyEvent(event_id=f"{camera}-occ-{n}", camera=camera, started_at=start, finalized_at=start + 3,
-                          occupied_before_l=100.0, occupied_after_l=None if delta is None else 100 + delta,
-                          delta_occupancy_l=delta, absolute=True, status=status,
-                          reason=None if delta is not None else "surface hidden", label="plastic bag",
-                          color="black", track_id=track, envelope_mm=envelope)
-
-
-class CounterTests(unittest.TestCase):
-    def test_scenario_sequence(self) -> None:
-        with TemporaryDirectory() as d:
-            now = [0.0]
-            s = SessionDeposits(Path(d), clock=lambda: now[0])
-            s.height_lookup = lambda camera, a, b: (0.24, None) if camera == "realsense" else (None, "no profile")
-            s.observe_tracks("realsense", [1, 2, 3], now=1.0)                  # bags already in the bin
-            s.observe_tracks("logitech", [7, 8], now=1.0)
-            self.assertEqual(s.count, 0)
-            s.observe_tracks("realsense", [9], now=50.0)                     # after warm-up: not baseline
-            self.assertNotIn(9, s.baseline["realsense"])
-
-            self.assertEqual(s.record("realsense", _event(1, track=10, start=60))["count_after"], 1)
-            self.assertEqual(s.count, 1)
-            self.assertIsNone(s.record("realsense", _event(1, track=10, start=60)))          # same event again
-            s.record("realsense", _event(2, track=11, start=120))
-            self.assertEqual(s.count, 2)
-            self.assertIsNone(s.record("realsense", _event(3, track=2, start=200)))          # old bag moves
-            self.assertIsNone(s.record("realsense", _event(4, track=None, delta=0.4, start=260)))  # occlusion
-            self.assertIsNone(s.record("realsense", _event(5, track=11, start=300)))         # re-tracked/dup
-            self.assertEqual(s.count, 2)
-
-            merged = s.record("logitech", _event(6, camera="logitech", track=40, start=361))
-            first = s.record("realsense", _event(7, track=12, start=360))                    # both cams, one bag
-            self.assertEqual(s.count, 3)
-            self.assertIs(merged, first)
-            self.assertEqual(sorted(first["cameras"]), ["logitech", "realsense"])
-            self.assertEqual(first["height_source"], "after top - before surface under the bag")  # RealSense evidence
-            self.assertEqual(first["envelope_l"], round(40 * 30 * 24 / 1000, 1))
-
-            hidden = s.record("realsense", _event(8, track=13, delta=None, envelope=None, start=500,
-                                                  status="relative_unavailable"))
-            self.assertEqual(s.count, 4)
-            self.assertEqual((hidden["envelope_l"], hidden["measurement_status"]), (None, "na"))
-            self.assertTrue(hidden["reason"])
-            self.assertEqual(hidden["material"], "UNKNOWN")
-
-            snap = s.snapshot()
-            self.assertEqual(snap["new_bags_this_session"], 4)
-            self.assertEqual(snap["rejected_candidates"], 3)
-            times = [e["deposit_time"] for e in snap["events"]]
-            self.assertEqual(times, sorted(times))
-
-            with s.csv_path.open(encoding="utf-8") as handle:
-                rows = list(csv.DictReader(handle))
-            self.assertEqual(sum(r["counted"] == "True" for r in rows if "merged" not in (r["reason"] or "")), 4)
-            self.assertTrue(any("baseline bag" in r["reason"] for r in rows))
-
-    def test_warmup_event_is_not_a_new_bag(self) -> None:
-        with TemporaryDirectory() as d:
-            s = SessionDeposits(Path(d), clock=lambda: 0.0)
-            self.assertIsNone(s.record("realsense", _event(1, track=5, start=2.0)))
-            self.assertEqual(s.count, 0)
-
-
 class ServerTests(unittest.TestCase):
     def test_endpoints_panel_and_pipeline_hooks(self) -> None:
         with TemporaryDirectory() as d:
@@ -214,7 +148,7 @@ class ServerTests(unittest.TestCase):
                 "camera_to_empty_floor_cm": 110, "distance_kind": "vertical", "tilt_from_vertical_deg": 0,
                 "usable_height_cm": 80}).get_json()
             self.assertTrue(saved["ok"], saved)
-            self.assertIsNone(manager.camera("logitech").fill.profile.usable_height_m)   # other camera untouched
+            self.assertIsNone(manager.camera("logitech").fill.profile.camera_to_empty_floor_m)  # not invented
 
             station = manager.camera("realsense")
             depth = _render(_profile(camera_to_empty_floor_m=1.10, usable_height_m=0.80), lambda x, y: 0.24 + 0 * x)
@@ -223,15 +157,51 @@ class ServerTests(unittest.TestCase):
             logi = manager.camera("logitech")
             logi._update_fill(np.zeros((K.height, K.width, 3), np.uint8), None, None, depth, K, None, 5.0)
             self.assertEqual(logi.fill.reading["status"], "na")
-            self.assertIn("profile incomplete", logi.fill.reading["reason"])
+            self.assertIn("distance not measured", logi.fill.reading["reason"])
 
-            manager.deposits.session_started_at -= 100
-            station.deposit_listener("realsense", _event(1, track=3, start=manager.deposits.session_started_at + 50),
-                                     {"material": None})
-            self.assertEqual(client.get("/api/bin-fill").get_json()["deposits"]["new_bags_this_session"], 1)
-            csv_text = client.get("/api/session-deposits.csv").get_data(as_text=True)
-            self.assertIn("event_id", csv_text.splitlines()[0])
-            self.assertEqual(len(csv_text.strip().splitlines()), 2)
+            # Every processed frame reaches the counter, with no fill profile or zone needed.
+            frame = np.full((K.height, K.width, 3), 90, np.uint8)
+            region = np.ones((K.height, K.width), bool)
+            logi._emit_deposit_evidence(frame, [], None, None, region)
+            snap = client.get("/api/bin-fill").get_json()["deposits"]
+            self.assertEqual(snap["cameras"]["logitech"]["state"], "initialising")
+            self.assertIsNotNone(snap["updated_at"])
+            session = snap["session_id"]
+            self.assertEqual(client.get("/api/bin-fill").get_json()["deposits"]["session_id"], session)  # refresh
+            fresh = client.post("/api/bin-fill/session/new").get_json()["session"]
+            self.assertNotEqual(fresh["session_id"], session)
+            self.assertEqual(client.get("/api/session-deposits.csv").status_code, 200)
+
+    def test_defaults_are_provisional_and_never_overwrite_a_saved_profile(self) -> None:
+        with TemporaryDirectory() as d:
+            config = AppConfig(detector_model="local-opencv-background", enable_monocular_depth=False,
+                               enable_bucket_sync=False, results_dir=Path(d))
+            default = bf.default_profile("realsense", config)
+            self.assertEqual((default.camera_to_empty_floor_m, default.usable_height_m), (1.10, 1.00))
+            self.assertEqual(default.status, "approximate")
+            self.assertTrue(any("tilt not measured" in a for a in default.assumptions()))
+            self.assertTrue(any("assigned to the RealSense by default" in n for n in default.notes))
+            self.assertIsNone(bf.default_profile("logitech", config).camera_to_empty_floor_m)
+            config.logitech_reference_distance_m = 1.12       # the Logitech's own measured distance
+            self.assertEqual(bf.default_profile("logitech", config).camera_to_empty_floor_m, 1.12)
+            self.assertIsNone(bf.default_profile("realsense", config).camera_to_empty_floor_m)
+            config.logitech_reference_distance_m = 0.0
+
+            store = Path(d) / "realsense" / "bin_profile"          # where the RealSense station keeps it
+            est = bf.FillEstimator("realsense", store, default)
+            self.assertEqual(est.profile.source, "default-provisional")
+            self.assertFalse(est.path.exists())                       # defaults are never written
+            est.save_profile(_profile(camera_to_empty_floor_m=1.30, usable_height_m=1.05, tilt_from_vertical_deg=10),
+                             None, None)
+            again = bf.FillEstimator("realsense", store, default)
+            self.assertEqual((again.profile.source, again.profile.camera_to_empty_floor_m), ("saved", 1.30))
+            self.assertEqual(again.profile.status, "measured")
+
+            client = create_app(config, DualCameraCoordinator(config)).test_client()
+            got = client.post("/api/cameras/realsense/fill-profile", json={"usable_height_cm": 98}).get_json()
+            self.assertEqual(got["status"], "measured")
+            profile = client.get("/api/bin-fill").get_json()["cameras"]["realsense"]["profile"]
+            self.assertEqual((profile["camera_to_empty_floor_m"], profile["usable_height_m"]), (1.30, 0.98))
 
 
 if __name__ == "__main__":

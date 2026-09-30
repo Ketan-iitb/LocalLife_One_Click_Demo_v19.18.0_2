@@ -282,7 +282,9 @@ def create_app(
     @protected
     def new_operator_session() -> Any:
         try:
-            return jsonify(ok=True, session=manager.start_new_operator_session())
+            session = manager.start_new_operator_session()
+            manager.deposits.new_session()          # the operator's new session also restarts the bag count
+            return jsonify(ok=True, session=session)
         except (OSError, ValueError) as exc:
             return jsonify(error=str(exc)), 400
 
@@ -725,8 +727,8 @@ def create_app(
     @app.post("/api/cameras/<camera_id>/fill-profile")
     @protected
     def save_fill_profile(camera_id: str) -> Any:
-        """This camera's own tape measurements (cm) -> its fill profile. Save with the bin EMPTY."""
-        from .bin_fill import FillProfile
+        """Corrections (cm) to THIS camera's fill profile; unspecified fields keep their current value."""
+        from dataclasses import replace as _replace
 
         try:
             station = manager.camera(camera_id)
@@ -743,27 +745,48 @@ def create_app(
                 raise ValueError(f"{key} must be a positive number of cm")
             return number
 
+        current = station.fill.profile
         try:
-            tilt = payload.get("tilt_from_vertical_deg")
-            kind = str(payload.get("distance_kind", "unknown"))
-            if kind not in ("vertical", "optical_axis", "unknown"):
-                raise ValueError("distance_kind must be vertical, optical_axis or unknown")
-            capacity = float(payload.get("capacity_l") or 660.0)
-            if not np.isfinite(capacity) or capacity <= 0:
-                raise ValueError("capacity_l must be positive")
-            profile = FillProfile(
-                camera_id=camera_id, camera_to_empty_floor_m=metres("camera_to_empty_floor_cm"),
-                distance_kind=kind, tilt_from_vertical_deg=None if tilt in (None, "") else float(tilt),
-                usable_height_m=metres("usable_height_cm"), camera_above_rim_m=metres("camera_above_rim_cm"),
-                inner_length_m=metres("inner_length_cm"), inner_width_m=metres("inner_width_cm"),
-                capacity_l=capacity, capacity_verified=bool(payload.get("capacity_verified")),
-            )
+            changes: dict[str, Any] = {}
+            for key, field_name in (("camera_to_empty_floor_cm", "camera_to_empty_floor_m"),
+                                    ("usable_height_cm", "usable_height_m"),
+                                    ("camera_above_rim_cm", "camera_above_rim_m"),
+                                    ("inner_length_cm", "inner_length_m"), ("inner_width_cm", "inner_width_m")):
+                if key in payload:
+                    changes[field_name] = metres(key)
+            if "tilt_from_vertical_deg" in payload:
+                tilt = payload["tilt_from_vertical_deg"]
+                changes["tilt_from_vertical_deg"] = None if tilt in (None, "") else float(tilt)
+            if "distance_kind" in payload:
+                kind = str(payload["distance_kind"])
+                if kind not in ("vertical", "optical_axis", "unknown"):
+                    raise ValueError("distance_kind must be vertical, optical_axis or unknown")
+                changes["distance_kind"] = kind
+            if payload.get("capacity_l") not in (None, ""):
+                capacity = float(payload["capacity_l"])
+                if not np.isfinite(capacity) or capacity <= 0:
+                    raise ValueError("capacity_l must be positive")
+                changes["capacity_l"] = capacity
+            if "capacity_verified" in payload:
+                changes["capacity_verified"] = bool(payload["capacity_verified"])
         except (TypeError, ValueError) as exc:
             return jsonify(error=f"Invalid fill profile: {exc}"), 400
+        # Default notes stay only for values the operator did not replace.
+        notes = [n for n in (current.notes or [])
+                 if not (n.startswith("floor distance") and "camera_to_empty_floor_m" in changes)
+                 and not (n.startswith("usable height") and "usable_height_m" in changes)]
+        profile = _replace(current, camera_id=camera_id, notes=notes, **changes)
         frame = station.latest_frame
         region = None if frame is None else station._measurement_region(frame.shape)
         problems = station.fill.save_profile(profile, frame, region)
-        return jsonify(ok=not problems, problems=problems, pose_reference_saved=frame is not None)
+        return jsonify(ok=not profile.blocking(), status=profile.status, problems=problems,
+                       blocking=profile.blocking(), pose_reference_saved=frame is not None)
+
+    @app.post("/api/bin-fill/session/new")
+    @protected
+    def new_deposit_session() -> Any:
+        """Explicit new deposit session: count back to 0, baseline re-taken. A page refresh never does this."""
+        return jsonify(ok=True, session=manager.deposits.new_session())
 
     @app.get("/api/cameras/<camera_id>/stages")
     def camera_stages(camera_id: str) -> Any:

@@ -197,7 +197,6 @@ class DualCameraCoordinator:
         # v45: one session-wide count of NEW bags, shared by both cameras so a
         # bag seen by both counts once.
         self.deposits = SessionDeposits(config.results_dir / "session")
-        self.deposits.height_lookup = lambda camera, start, end: self.pipelines[camera].fill.added_height_m(start, end)
         self.attach_deposit_listeners()
         # Each station knows the other's geometry only so it can refuse to
         # measure with it (coordinates.frame_consistency).
@@ -247,15 +246,18 @@ class DualCameraCoordinator:
 
     def attach_deposit_listeners(self) -> None:
         for pipeline in self.pipelines.values():
-            pipeline.deposit_listener = self.deposits.record
-            pipeline.track_listener = self.deposits.observe_tracks
+            pipeline.deposit_listener = self.deposits.attach_occupancy
+            pipeline.frame_listener = self.deposits.observe
 
     def bin_fill(self) -> dict[str, Any]:
         return {"cameras": {camera: {**pipeline.fill.reading,
                                      "profile": {k: v for k, v in vars(pipeline.fill.profile).items()
                                                  if k != "pose_edges"},
-                                     "profile_problems": pipeline.fill.profile.problems(),
-                                     "measurement_zone": pipeline.measurement_zone is not None}
+                                     "profile_blocking": pipeline.fill.profile.blocking(),
+                                     "measurement_zone": pipeline.measurement_zone is not None,
+                                     # Deposit counting uses the event region: the drawn zone when
+                                     # there is one, otherwise the configured ROI / bin polygon.
+                                     "event_region": pipeline.zone_source}
                             for camera, pipeline in self.pipelines.items()},
                 "deposits": self.deposits.snapshot()}
 

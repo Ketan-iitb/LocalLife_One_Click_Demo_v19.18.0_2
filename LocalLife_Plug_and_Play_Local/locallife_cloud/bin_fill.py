@@ -43,6 +43,13 @@ STABLE_MOTION = 0.02             # scene motion fraction below which a frame is 
 MOVED_EDGE_CORRELATION = 0.45    # thumbnail edge correlation outside the bin below this: camera moved
 HEIGHT_FILL_LABEL = "rough height-based equivalent; assumes roughly uniform filling"
 OCCUPIED_LABEL = "estimated occupied volume over the measured bin floor area (visible surface; voids unseen)"
+# Installation defaults. The operator measured ~110 cm from ONE camera to the
+# empty floor and estimated the camera sits ~10 cm above the rim (so ~100 cm
+# usable). Neither pose nor tilt was measured: a profile built from these is
+# "approximate", never "validated".
+DEFAULT_FLOOR_DISTANCE_M = 1.10
+DEFAULT_USABLE_HEIGHT_M = 1.00
+DEFAULT_ABOVE_RIM_M = 0.10
 
 
 @dataclass
@@ -59,15 +66,47 @@ class FillProfile:
     capacity_verified: bool = False
     saved_at: float | None = None
     pose_edges: list[int] | None = None       # 64x48 edge thumbnail outside the bin at save time
+    source: str = "none"                      # "saved" | "default-provisional" | "none"
+    notes: list[str] | None = None            # where each default came from
+
+    def assumptions(self) -> list[str]:
+        """What the reading assumes because it was not measured (approximate profile)."""
+        items = list(self.notes or [])
+        if self.tilt_from_vertical_deg is None:
+            items.append("tilt not measured: camera assumed to look straight down")
+        if self.distance_kind not in ("vertical", "optical_axis"):
+            items.append("floor distance assumed vertical (not stated whether vertical or along the line of sight)")
+        if not self.capacity_verified:
+            items.append("capacity: nominal 660 L, not checked on the bin label")
+        return items
+
+    @property
+    def status(self) -> str:
+        if self.blocking():
+            return "unavailable"
+        exact = self.tilt_from_vertical_deg is not None and self.distance_kind in ("vertical", "optical_axis")
+        return "measured" if exact and self.source == "saved" and not self.notes else "approximate"
+
+    def blocking(self) -> list[str]:
+        """Missing values without which no height can be computed at all."""
+        issues = []
+        if self.camera_to_empty_floor_m is None or self.camera_to_empty_floor_m <= 0:
+            issues.append("camera-to-empty-floor distance not measured for this camera")
+        if self.usable_height_m is None or self.usable_height_m <= 0:
+            issues.append("usable floor-to-rim height not set")
+        if self.tilt_from_vertical_deg is not None and not 0 <= self.tilt_from_vertical_deg < 80:
+            issues.append("tilt must be 0-80 deg from vertical")
+        if not issues and self.usable_height_m >= self.vertical_height_m():
+            issues.append("usable height is not below the camera: re-check both measurements")
+        return issues
 
     def vertical_height_m(self) -> float | None:
-        if self.camera_to_empty_floor_m is None or self.tilt_from_vertical_deg is None:
+        """Vertical optical-centre height; unknown tilt/kind -> the approximate straight-down reading."""
+        if self.camera_to_empty_floor_m is None:
             return None
-        if self.distance_kind == "vertical":
-            return self.camera_to_empty_floor_m
-        if self.distance_kind == "optical_axis":
+        if self.distance_kind == "optical_axis" and self.tilt_from_vertical_deg is not None:
             return self.camera_to_empty_floor_m * math.cos(math.radians(self.tilt_from_vertical_deg))
-        return None
+        return self.camera_to_empty_floor_m
 
     def problems(self) -> list[str]:
         issues = []
@@ -168,9 +207,12 @@ def _correlation(a: np.ndarray, b: np.ndarray) -> float:
 class FillEstimator:
     """Per-camera fill reading, refreshed only from settled frames."""
 
-    def __init__(self, camera_id: str, directory: Path) -> None:
+    def __init__(self, camera_id: str, directory: Path, default: FillProfile | None = None) -> None:
         self.camera_id = camera_id
         self.path = Path(directory) / f"fill_{camera_id}.json"
+        self.last_processed_at: float | None = None
+        self.last_valid_at: float | None = None
+        self.default = default or FillProfile(camera_id=camera_id)
         self.profile = self._load()
         self.reading: dict[str, Any] = self._na("no settled frame processed yet")
         self.history: deque[tuple[float, dict[tuple[int, int], float]]] = deque(maxlen=60)
@@ -178,9 +220,11 @@ class FillEstimator:
     def _load(self) -> FillProfile:
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
-            return FillProfile(**{k: v for k, v in data.items() if k in FillProfile.__dataclass_fields__})
+            saved = FillProfile(**{k: v for k, v in data.items() if k in FillProfile.__dataclass_fields__})
+            saved.source = "saved"            # a saved profile always wins over the defaults
+            return saved
         except (OSError, ValueError, TypeError):
-            return FillProfile(camera_id=self.camera_id)
+            return self.default                # never written to disk: defaults cannot overwrite a saved profile
 
     def save_profile(self, profile: FillProfile, frame: np.ndarray | None, region: np.ndarray | None) -> list[str]:
         problems = profile.problems()
@@ -188,6 +232,7 @@ class FillEstimator:
             edges = edge_thumbnail(frame, region)
             profile.pose_edges = None if edges is None else edges.astype(np.uint8).ravel().tolist()
         profile.saved_at = time.time()
+        profile.source = "saved"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(".json.tmp")
         temporary.write_text(json.dumps(asdict(profile)), encoding="utf-8")
@@ -197,12 +242,18 @@ class FillEstimator:
         self.reading = self._na("profile saved; waiting for a settled frame")
         return problems
 
+    def _decorate(self, reading: dict[str, Any]) -> dict[str, Any]:
+        reading.update(profile_status=self.profile.status, profile_source=self.profile.source,
+                       assumptions=self.profile.assumptions(), last_processed_at=self.last_processed_at,
+                       last_valid_at=self.last_valid_at)
+        return reading
+
     def _na(self, reason: str) -> dict[str, Any]:
-        return {"status": "na", "reason": reason, "updated_at": None, "camera_id": self.camera_id,
+        return self._decorate({"status": "na", "reason": reason, "updated_at": None, "camera_id": self.camera_id,
                 "rough_litres_label": HEIGHT_FILL_LABEL, "occupied_label": OCCUPIED_LABEL,
                 "capacity_l": self.profile.capacity_l,
                 "capacity_note": "verified on the bin label" if self.profile.capacity_verified
-                else "nominal 660 L, unverified"}
+                else "nominal 660 L, unverified"})
 
     def camera_moved(self, frame: np.ndarray, region: np.ndarray | None) -> bool:
         if not self.profile.pose_edges:
@@ -215,7 +266,8 @@ class FillEstimator:
 
     def update(self, frame: np.ndarray, depth_m: np.ndarray | None, intrinsics: Any, region: np.ndarray | None,
                motion: float | None, timestamp: float, *, depth_reason: str | None = None) -> dict[str, Any]:
-        problems = self.profile.problems()
+        self.last_processed_at = timestamp
+        problems = self.profile.blocking()
         if problems:
             self.reading = self._na("fill profile incomplete: " + "; ".join(problems))
             return self.reading
@@ -238,8 +290,17 @@ class FillEstimator:
             return self.reading
         cells = cell_tops(height[keep], hx[keep], hy[keep])
         self.history.append((timestamp, cells))
+        self.last_valid_at = timestamp
+        warnings = []
+        # Plausibility of the assumed floor distance, from this camera's own depth:
+        # the empty floor cannot be seen much farther away than the measured distance.
+        far = float(np.percentile(height[(height > -1.0)], 1)) if height.size else 0.0
+        if far < -0.15:
+            warnings.append(f"depth reaches {-far * 100:.0f} cm below the assumed floor: the floor distance "
+                            "may belong to the other camera or be too short")
         self.reading = {**fill_reading(cells, coverage, self.profile), "camera_id": self.camera_id,
-                        "updated_at": timestamp, "stale": False}
+                        "updated_at": timestamp, "stale": False, "warnings": warnings}
+        self._decorate(self.reading)
         return self.reading
 
     def added_height_m(self, started_at: float, finalized_at: float) -> tuple[float | None, str | None]:
@@ -252,3 +313,46 @@ class FillEstimator:
         if len(rises) < 4:
             return None, "no measurable rise of the surface under the new bag"
         return float(np.percentile(rises, 90)), None
+
+
+def default_profile(camera_id: str, config: Any) -> FillProfile:
+    """Provisional installation defaults for one camera (never written to disk).
+
+    The ~110 cm floor distance was measured from ONE camera. Which one comes
+    from configuration, in this order: LOCALLIFE_FLOOR_DISTANCE_CAMERA; else a
+    Logitech operator-measured reference distance (that value, not 110 cm); else
+    the RealSense, the only camera with hardware metric depth -- stated as an
+    assumption on the dashboard. The other camera gets no invented distance.
+    """
+    named = os.environ.get("LOCALLIFE_FLOOR_DISTANCE_CAMERA", "").strip().lower()
+    logitech_m = float(getattr(config, "logitech_reference_distance_m", 0.0) or 0.0)
+    try:
+        distance_m = float(os.environ.get("LOCALLIFE_FLOOR_DISTANCE_CM", "110")) / 100.0
+    except ValueError:
+        distance_m = DEFAULT_FLOOR_DISTANCE_M
+    notes = [f"usable height {DEFAULT_USABLE_HEIGHT_M * 100:.0f} cm is approximate "
+             f"({distance_m * 100:.0f} cm to floor minus an estimated {DEFAULT_ABOVE_RIM_M * 100:.0f} cm above the rim)"]
+    if named in ("realsense", "logitech"):
+        owner, why = named, "camera named by LOCALLIFE_FLOOR_DISTANCE_CAMERA"
+    elif logitech_m > 0:
+        owner, distance_m, why = "logitech", logitech_m, "Logitech operator-measured reference distance"
+    else:
+        owner, why = "realsense", ("assigned to the RealSense by default (no camera named in configuration); "
+                                   "if it was measured from the Logitech, correct it in Installation settings")
+    profile = FillProfile(camera_id=camera_id, usable_height_m=DEFAULT_USABLE_HEIGHT_M, source="default-provisional")
+    if camera_id == owner:
+        profile.camera_to_empty_floor_m = distance_m
+        profile.camera_above_rim_m = DEFAULT_ABOVE_RIM_M
+        profile.notes = [f"floor distance {distance_m * 100:.0f} cm: {why}"] + notes
+    else:
+        profile.notes = notes
+    return profile
+
+
+def height_map(depth_m: np.ndarray, intrinsics: Any, profile: FillProfile) -> np.ndarray:
+    """2-D height above the empty floor (NaN where depth is invalid)."""
+    out = np.full(depth_m.shape, np.nan, dtype=np.float32)
+    valid = (depth_m > 0.05) & np.isfinite(depth_m)
+    height, _, _ = heights_above_floor(depth_m, intrinsics, profile, valid)
+    out[valid] = height
+    return out

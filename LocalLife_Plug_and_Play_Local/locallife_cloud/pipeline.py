@@ -98,7 +98,9 @@ from .logitech_metric import (CALIBRATION_SET, EVALUATION_SET, RECOMMENDED_SAMPL
                               integrate_volume_l, robust_height_cm, stable_statistics,
                               zone_signature)
 from .measurement_zone import MeasurementZone, MeasurementZoneStore
-from .bin_fill import FillEstimator
+from .bin_fill import FillEstimator, default_profile, height_map
+from .mask_leak import trim_mask_leak
+from .session_deposits import FrameEvidence, TrackInfo
 from .readiness import MeasurementReadiness
 from .shape_geometry import (CYLINDER, CYLINDER_REJECTIONS, SPHERE, UNCERTAIN, GeometryLock,
                              ObjectSignature, ShapeGeometry, measure_shape)
@@ -803,9 +805,11 @@ class VisionPipeline:
         # pairs the two cameras through it).
         self.measurement_listener: Callable[[dict[str, Any]], None] | None = None
         # v45: session deposit counter (set by the coordinator) and this camera's own fill profile.
+        # deposit_listener receives whole-bin occupancy events as evidence only;
+        # frame_listener receives every processed frame's deposit evidence.
         self.deposit_listener: Callable[[str, Any, dict[str, Any]], None] | None = None
-        self.track_listener: Callable[[str, list[int]], None] | None = None
-        self.fill = FillEstimator(camera_id, config.results_dir / "bin_profile")
+        self.frame_listener: Callable[[FrameEvidence], Any] | None = None
+        self.fill = FillEstimator(camera_id, config.results_dir / "bin_profile", default_profile(camera_id, config))
         self._last_motion: float | None = None
         # Logitech metric-depth calibration samples and fit, kept apart from
         # evaluation data (logitech_calibration.py).
@@ -1944,6 +1948,13 @@ class VisionPipeline:
                         for other in detections
                         if other is not detection and not _is_phantom_detection(other)],
             )
+            # A few pixels leaked onto the rim, a wall or a neighbour stretch the
+            # minimum-area footprint rectangle (40 cm -> 90 cm): trim islands and
+            # thin spill first (mask_leak.py), flagged on the detection.
+            instance_mask, leak_trimmed = trim_mask_leak(instance_mask)
+            if leak_trimmed:
+                detection.dimension_flags = tuple(dict.fromkeys(
+                    tuple(detection.dimension_flags or ()) + ("leaked_mask_pixels_trimmed",)))
             # The box-cuboid estimator erodes its own mask against leaks; it
             # keeps the unfiltered one, or its edge would be cut twice.
             cuboid_mask = instance_mask
@@ -3025,11 +3036,9 @@ class VisionPipeline:
         )
 
         self._apply_bin_bounds(detections)
+        self._emit_deposit_evidence(frame, detections, depth_m, intrinsics, bin_region)
         self._update_fill(frame, depth_m, intrinsics, calibrated_prediction, measure_intrinsics,
                           bin_region, time.time())    # same wall clock as occupancy events
-        if self.track_listener is not None:
-            self.track_listener(self.camera_id, [item.track_id for item in detections
-                                                 if item.track_id is not None and not _is_phantom_detection(item)])
         if persist:
             self.store.append_jsonl("frames.jsonl", analysis.to_dict())
             self._finalise_settled_measurements(detections, timestamp)
@@ -3351,6 +3360,54 @@ class VisionPipeline:
     def reload_bin_profile(self) -> None:
         self._bin_profile = None
 
+    def _emit_deposit_evidence(self, frame, detections, depth_m, intrinsics, bin_region) -> None:
+        """Hand this frame to the session deposit counter (every processed frame, no calibration needed)."""
+        try:
+            import cv2
+
+            height, width = frame.shape[:2]
+            sw, sh = 160, 120
+            sx, sy = sw / width, sh / height
+            # Colour, not grey: a red bag on a dark pile can have the same grey level.
+            grey = cv2.resize(frame, (sw, sh), interpolation=cv2.INTER_AREA)
+            region = cv2.resize(bin_region.astype(np.uint8), (sw, sh), interpolation=cv2.INTER_NEAREST).astype(bool)
+            # Frame-to-frame motion in the event region: what "settled" means for the fill reading.
+            previous = self.__dict__.get("_previous_small_grey")
+            if previous is not None and previous.shape == grey.shape and region.any():
+                moving = np.abs(grey.astype(np.int16) - previous.astype(np.int16))
+                moving = (moving.max(axis=-1) if moving.ndim == 3 else moving) > 28
+                self._frame_motion = float(np.count_nonzero(moving & region)) / int(np.count_nonzero(region))
+            self._previous_small_grey = grey
+            if self.frame_listener is None:
+                return
+            tracks = []
+            for item in detections:
+                if item.track_id is None or _is_phantom_detection(item):
+                    continue
+                x1, y1, x2, y2 = item.box
+                label = item.label if not item.accepted_class else f"{item.label} [{item.accepted_class}]"
+                tracks.append(TrackInfo(
+                    track_id=int(item.track_id), box=(x1 * sx, y1 * sy, x2 * sx, y2 * sy), label=label,
+                    colour=item.color or "unknown", material=item.material,
+                    material_confidence=float(item.material_confidence or 0.0),
+                    length_mm=item.footprint_length_mm, width_mm=item.footprint_width_mm,
+                    height_mm=item.physical_height_mm, rejection=item.volume_rejection_reason))
+            depth = heights = None
+            status = None
+            # RealSense only: aligned hardware depth. The Logitech's monocular depth is
+            # rescaled per frame, so its frame-to-frame "rise" is not evidence.
+            if self.camera_id != "logitech" and depth_m is not None and depth_m.shape[:2] == (height, width):
+                depth = cv2.resize(depth_m.astype(np.float32), (sw, sh), interpolation=cv2.INTER_NEAREST)
+                if intrinsics is not None and not self.fill.profile.blocking():
+                    small = CameraIntrinsics(fx=intrinsics.fx * sx, fy=intrinsics.fy * sy, ppx=intrinsics.ppx * sx,
+                                             ppy=intrinsics.ppy * sy, width=sw, height=sh)
+                    heights, status = height_map(depth, small, self.fill.profile), self.fill.profile.status
+            self.frame_listener(FrameEvidence(camera=self.camera_id, timestamp=time.time(), grey=grey,
+                                              region=region, tracks=tracks, depth=depth, heights=heights,
+                                              height_status=status))
+        except Exception:  # noqa: BLE001 - the counter must never stop the pipeline
+            LOGGER.exception("%s deposit evidence failed", self.camera_id)
+
     def _update_fill(self, frame, depth_m, intrinsics, calibrated_prediction, measure_intrinsics,
                      bin_region, timestamp: float) -> None:
         """Refresh this camera's fill reading from its own metric depth (settled frames only).
@@ -3369,7 +3426,8 @@ class VisionPipeline:
                 depth, geometry = calibrated_prediction, measure_intrinsics
             else:
                 depth, geometry = depth_m, intrinsics
-            self.fill.update(frame, depth, geometry, bin_region, self._last_motion, timestamp,
+            motion = self.__dict__.get("_frame_motion", self._last_motion)
+            self.fill.update(frame, depth, geometry, bin_region, motion, timestamp,
                              depth_reason="no aligned depth frame")
         except Exception:  # noqa: BLE001 - the fill panel must never stop the pipeline
             LOGGER.exception("%s fill update failed", self.camera_id)
