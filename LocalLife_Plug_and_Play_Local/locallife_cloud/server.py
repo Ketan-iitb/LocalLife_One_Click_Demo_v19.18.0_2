@@ -77,6 +77,7 @@ def _annotate_frame(frame: np.ndarray, pipeline: VisionPipeline) -> np.ndarray:
     latest = pipeline.latest_analysis
     if latest is None:
         return output
+    placed: list[tuple[int, int, int, int]] = []
     for detection in latest.detections:
         track = pipeline.tracker.tracks.get(detection.track_id) if detection.track_id is not None else None
         if detection.source != "tracked-prediction" and track is not None and not track.counted:
@@ -120,35 +121,22 @@ def _annotate_frame(frame: np.ndarray, pipeline: VisionPipeline) -> np.ndarray:
             else detection.accepted_class.replace("_", " ")
             if detection.accepted_class is not None else shown_label
         )
-        caption = f"#{detection.track_id or '?'} {display_type}{continuity}{visible_color}{distance}{height}{volume}"
-        cv2.putText(output, caption, (x1, max(19, y1 - 7)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
-        if (
-            detection.footprint_length_mm is not None
-            and detection.footprint_width_mm is not None
-            and detection.physical_height_mm is not None
-        ):
-            shape = detection.shape_geometry
-            if shape is not None and shape.geometry_method == "cylinder" and shape.cylinder_orientation == "lying":
-                dimensions = (
-                    f"cylinder D{shape.cylinder_diameter_mm:.0f} x axis {shape.cylinder_height_mm:.0f} mm"
-                    " = pi r2 L"
-                )
-            elif shape is not None and shape.geometry_method == "cylinder":
-                # The same fitted numbers the API and CSV carry.
-                dimensions = (
-                    f"cylinder D{shape.cylinder_diameter_mm:.0f}xD{shape.cylinder_diameter_mm:.0f}"
-                    f"xH{detection.physical_height_mm:.0f} mm = pi r2 h"
-                )
-            else:
-                dimensions = (
-                    f"LxWxH {detection.footprint_length_mm:.0f}x"
-                    f"{detection.footprint_width_mm:.0f}x{detection.physical_height_mm:.0f} mm"
-                )
-            dimension_y = min(output.shape[0] - 8, max(20, y1 + 20))
-            cv2.putText(
-                output, dimensions, (x1, dimension_y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2,
-            )
+        # A crowded bin put 10-20 long captions and L x W x H lines on top of each
+        # other. The image carries only a short, readable tag; distance, height,
+        # dimensions and litres are in the camera's table and CSV (unchanged).
+        del distance, height, volume, visible_color
+        short = shown_label if detection.accepted_class == "measurement_object" else display_type
+        tag = f"#{detection.track_id or '?'} {short[:18]}{'*' if continuity else ''}"
+        (text_w, text_h), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        tx, ty = x1, max(text_h + 4, y1 - 5)
+        for _ in range(8):                      # step down past tags already placed
+            box = (tx, ty - text_h - 3, tx + text_w + 4, ty + 3)
+            if not any(box[0] < o[2] and o[0] < box[2] and box[1] < o[3] and o[1] < box[3] for o in placed):
+                break
+            ty = min(output.shape[0] - 4, ty + text_h + 6)
+        placed.append((tx, ty - text_h - 3, tx + text_w + 4, ty + 3))
+        cv2.rectangle(output, (tx, ty - text_h - 3), (tx + text_w + 4, ty + 3), (20, 24, 26), -1)
+        cv2.putText(output, tag, (tx + 2, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
     return output
 
 
@@ -667,6 +655,58 @@ def create_app(
         if not ok:
             return jsonify(error="Could not encode the mask overlay"), 500
         return Response(encoded.tobytes(), mimetype="image/jpeg", headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/cameras/<camera_id>/bin-profile")
+    def get_bin_profile(camera_id: str) -> Any:
+        """This camera's bin profile, its physical bounds and a moved-camera check."""
+        from .bin_profile import pose_check
+
+        try:
+            station = manager.camera(camera_id)
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 404
+        profile = station.bin_profile
+        plane = station.reference_plane
+        distance = None
+        if plane is not None and plane.coefficients is not None:
+            a_, b_, c_ = plane.coefficients
+            distance = abs(float(c_)) / float(np.sqrt(a_ * a_ + b_ * b_ + 1.0))
+        latest = station.latest_analysis
+        empty = latest is not None and not latest.detections
+        return jsonify(profile=profile.to_dict(), pose=pose_check(
+            profile, None if plane is None else float(plane.tilt_degrees), distance, empty_bin=empty))
+
+    @app.post("/api/cameras/<camera_id>/bin-profile")
+    @protected
+    def save_bin_profile(camera_id: str) -> Any:
+        """Tape measurements + reference-object check -> validated (or rejected) profile."""
+        from .bin_profile import BinProfile, BinProfileStore, ReferencePlacement, validate
+
+        try:
+            station = manager.camera(camera_id)
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 404
+        payload = request.get_json(silent=True) or {}
+        try:
+            references = [ReferencePlacement(
+                object_name=str(item["object_name"])[:60], position=str(item.get("position", ""))[:40],
+                true_mm=tuple(float(v) for v in item["true_mm"]),
+                measured_mm=None if item.get("measured_mm") is None else tuple(float(v) for v in item["measured_mm"]),
+            ) for item in payload.get("references", [])]
+            profile = BinProfile(
+                camera_id=camera_id,
+                measurements={str(k): float(v) for k, v in (payload.get("measurements") or {}).items()},
+                uncertainty_mm={str(k): float(v) for k, v in (payload.get("uncertainty_mm") or {}).items()},
+                method=str(payload.get("method", ""))[:300], measured_by=str(payload.get("measured_by", ""))[:80],
+                measured_at=time.time(), references=references,
+                capacity_label=str(payload.get("capacity_label") or "bin capacity unverified")[:120],
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            return jsonify(error=f"Invalid bin profile: {exc}"), 400
+        validate(profile)
+        BinProfileStore(station.config.results_dir / "bin_profile").save(profile)
+        station.reload_bin_profile()
+        return jsonify(ok=profile.status == "measured", profile=profile.to_dict()), 200 if profile.status == "measured" else 422
 
     @app.get("/api/cameras/<camera_id>/stages")
     def camera_stages(camera_id: str) -> Any:

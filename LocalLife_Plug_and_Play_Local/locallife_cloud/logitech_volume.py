@@ -386,6 +386,11 @@ SUPPORT_CONTACT_TOLERANCE_M = 0.05
 SUPPORT_MIN_CLEARANCE_M = 0.03
 
 
+# Share of an object's above-plane pixels allowed above the physical height cap
+# before its height is withheld rather than clipped (single spikes stay tolerated).
+OVER_HEIGHT_REJECT_FRACTION = 0.20
+
+
 def local_support_height(
     height_map: np.ndarray, object_mask: np.ndarray, depth: np.ndarray,
     *, measurement_mask: np.ndarray | None = None,
@@ -533,6 +538,11 @@ def metric_object_volume(
             if corrected is not None:
                 height_map = corrected
                 diagnostics["height_source"] = "fitted_support_plane_local_floor"
+        if diagnostics.get("height_reference") == "support_surface_uneven_height_above_bin_floor":
+            # The bag rests on waste of mixed heights: the only height left is
+            # pile + bag above the bin floor, which in a 660 L bin read as
+            # ~0.8 m for every bag. Unreliable, so it is not published.
+            return HeightMapResult(None, diagnostics, "support_unknown_on_uneven_pile")
     if reference_depth_m is not None and reference_depth_m.shape == depth.shape:
         # The empty-scene prediction is the other, independent reference: used
         # when the fitted plane leaves this object with no measurable height
@@ -552,8 +562,17 @@ def metric_object_volume(
         smoothed = height_map.astype(np.float32)
     heights = np.where(np.isfinite(smoothed), smoothed, 0.0).astype(np.float64)
     heights = np.clip(heights, 0.0, None)  # below the plane is not negative volume
-    valid = candidate & np.isfinite(depth) & (depth > 0.05) & (heights >= min_height_m) \
-        & (heights <= max_height_m)
+    above = candidate & np.isfinite(depth) & (depth > 0.05) & (heights >= min_height_m)
+    over = above & (heights > max_height_m)
+    diagnostics["over_max_height_fraction"] = (
+        round(float(np.count_nonzero(over)) / max(1, int(np.count_nonzero(above))), 4))
+    if np.count_nonzero(above) >= min_pixels and diagnostics["over_max_height_fraction"] >= OVER_HEIGHT_REJECT_FRACTION:
+        # Dropping the too-tall pixels and measuring the rest reported every
+        # bag in a deep (660 L) bin as ~0.79 m -- the cap, not a measurement.
+        # A mask this far above the physical bound means the floor reference or
+        # the metric scale is wrong for this object: say so instead.
+        return HeightMapResult(None, diagnostics, "height_exceeds_physical_bound")
+    valid = above & (heights <= max_height_m)
     diagnostics["above_plane_pixels"] = int(np.count_nonzero(valid))
     if diagnostics["above_plane_pixels"] < min_pixels:
         return HeightMapResult(None, diagnostics, "no_measurable_height_above_plane")

@@ -3018,6 +3018,7 @@ class VisionPipeline:
             peer_bag_present=peer_bag_present,
         )
 
+        self._apply_bin_bounds(detections)
         if persist:
             self.store.append_jsonl("frames.jsonl", analysis.to_dict())
             self._finalise_settled_measurements(detections, timestamp)
@@ -3326,6 +3327,37 @@ class VisionPipeline:
             self.reset_live_tracking()
             return {"camera_id": self.camera_id, "removed_observations": previous["observed_count"],
                     "backup_created": backup is not None}
+
+    @property
+    def bin_profile(self):
+        """This camera's own bin profile (measured, or nominal 660 L bounds marked unverified)."""
+        if getattr(self, "_bin_profile", None) is None:
+            from .bin_profile import BinProfileStore
+
+            self._bin_profile = BinProfileStore(self.config.results_dir / "bin_profile").load(self.camera_id)
+        return self._bin_profile
+
+    def reload_bin_profile(self) -> None:
+        self._bin_profile = None
+
+    def _apply_bin_bounds(self, detections: list[Detection]) -> None:
+        """Withhold dimensions that cannot exist inside this bin; never clamp them."""
+        from .bin_profile import physical_check
+
+        bounds = self.bin_profile.bounds()
+        for detection in detections:
+            if self._detection_volume(detection) is None and detection.physical_height_mm is None:
+                continue
+            reason = physical_check(bounds, detection.footprint_length_mm, detection.footprint_width_mm,
+                                    detection.physical_height_mm)
+            if reason is None:
+                continue
+            detection.volume_rejection_reason = reason
+            detection.measurement_quality = reason
+            detection.realsense_volume_l = None
+            detection.monocular_volume_l = None
+            detection.stable_volume_l = None
+            self.stage_counters[f"bin_bounds_{reason}"] += 1
 
     def _detection_volume(self, detection: Detection) -> float | None:
         return detection.monocular_volume_l if self.camera_id == "logitech" else detection.realsense_volume_l
