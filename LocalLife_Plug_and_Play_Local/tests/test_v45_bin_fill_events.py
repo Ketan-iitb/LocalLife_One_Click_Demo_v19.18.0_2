@@ -312,5 +312,36 @@ class V47ExportTests(unittest.TestCase):
             self.assertEqual(book.sheetnames, ["Summary", "Deposits"])
 
 
+
+class V47VolumeTests(unittest.TestCase):
+    def test_bag_on_a_pile_is_measured_from_the_pile_not_the_floor(self) -> None:
+        with TemporaryDirectory() as d:
+            prof = _profile(camera_to_empty_floor_m=1.10, usable_height_m=1.00)
+            est = bf.FillEstimator("realsense", Path(d), prof)
+            est.recalibrate(_render(prof, lambda x, y: 0 * x), K, None)          # empty-bin floor first
+            pile_and_bag = lambda x, y: np.where((np.abs(x) < 0.10) & (np.abs(y) < 0.075), 0.55,  # 20x15, 25 cm
+                                                 0.30)                                           # on a 30 cm pile
+            depth = _render(prof, pile_and_bag)
+            est.update(np.zeros((K.height, K.width, 3), np.uint8), depth, K, None, 0.0, 1.0)
+            u = lambda x, z: K.ppx + K.fx * x / z
+            v = lambda y, z: K.ppy + K.fy * y / z
+            z = 1.10 - 0.55
+            box = (u(-0.10, z), v(-0.075, z), u(0.10, z), v(0.075, z))
+            litres, tall = est.object_volume(box, None, 1.5)
+            self.assertAlmostEqual(tall, 0.25, delta=0.03)                     # not 0.55 (pile + bag)
+            top = depth < 0.6                                                  # the rendered bag top
+            truth = float(np.sum((depth[top] / K.fx) * (depth[top] / K.fy))) * 0.25 * 1000
+            self.assertLess(abs(litres - truth) / truth, 0.15, (litres, truth))
+
+    def test_pile_top_never_replaces_a_known_deeper_floor(self) -> None:
+        with TemporaryDirectory() as d:
+            prof = _profile(camera_to_empty_floor_m=1.10)
+            est = bf.FillEstimator("logitech", Path(d), prof)
+            self.assertTrue(est.recalibrate(_render(prof, lambda x, y: 0 * x), K, None)["ok"])
+            pile = _render(prof, lambda x, y: 0.40 + 0 * x)
+            self.assertFalse(est.recalibrate(pile, K, None, automatic=True)["ok"])
+            self.assertAlmostEqual(est.profile.floor_raw_distance, 1.10, delta=0.02)
+
+
 if __name__ == "__main__":
     unittest.main()

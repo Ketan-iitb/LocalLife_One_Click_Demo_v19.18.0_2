@@ -3060,6 +3060,19 @@ class VisionPipeline:
             fill_objects |= mask
         self._update_fill(frame, depth_m, intrinsics, fill_monocular, measure_intrinsics,
                           bin_region, time.time(), fill_plane, fill_objects)    # same wall clock as occupancy events
+        # A detection whose own measurement is still pending gets this camera's surface-map estimate
+        # (above the local support around it) as a PROVISIONAL, display-only value; the ledger is untouched.
+        for item in detections:
+            own = item.monocular_volume_l if self.camera_id == "logitech" else item.realsense_volume_l
+            if own is None and item.provisional_volume_l is None and not _is_phantom_detection(item):
+                try:
+                    estimate = self.fill.object_volume(item.box, item.mask, time.time())
+                except Exception:  # noqa: BLE001 - display-only estimate
+                    estimate = None
+                if estimate is not None:
+                    item.provisional_volume_l = estimate[0]
+                    if item.height_above_baseline_cm is None:
+                        item.height_above_baseline_cm = round(estimate[1] * 100, 1)
         if persist:
             self.store.append_jsonl("frames.jsonl", analysis.to_dict())
             self._finalise_settled_measurements(detections, timestamp)
@@ -3419,15 +3432,21 @@ class VisionPipeline:
             # RealSense: aligned hardware depth (also used for the rise check). Logitech: its own
             # model depth, scaled by its own floor fit -- for sizes and the removal check only.
             source, geometry = None, None
-            if self.camera_id != "logitech" and depth_m is not None and depth_m.shape[:2] == (height, width):
+            # The depth map may arrive at another resolution than the colour frame (same aligned field
+            # of view): resample it instead of dropping all depth evidence, and scale the intrinsics
+            # from the resolution they were given for.
+            if self.camera_id != "logitech" and depth_m is not None and depth_m.ndim == 2:
                 source, geometry = depth_m, intrinsics
                 depth = cv2.resize(depth_m.astype(np.float32), (sw, sh), interpolation=cv2.INTER_NEAREST)
-            elif self.camera_id == "logitech" and monocular is not None and monocular.shape[:2] == (height, width):
+            elif self.camera_id == "logitech" and monocular is not None and monocular.ndim == 2:
                 source, geometry = monocular, monocular_intrinsics or self._field_of_view_intrinsics(frame.shape)
             if source is not None and geometry is not None:
                 small_depth = cv2.resize(source.astype(np.float32), (sw, sh), interpolation=cv2.INTER_NEAREST)
-                small = CameraIntrinsics(fx=geometry.fx * sx, fy=geometry.fy * sy, ppx=geometry.ppx * sx,
-                                         ppy=geometry.ppy * sy, width=sw, height=sh)
+                gw = float(getattr(geometry, "width", 0) or source.shape[1])
+                gh = float(getattr(geometry, "height", 0) or source.shape[0])
+                kx, ky = sw / gw, sh / gh
+                small = CameraIntrinsics(fx=geometry.fx * kx, fy=geometry.fy * ky, ppx=geometry.ppx * kx,
+                                         ppy=geometry.ppy * ky, width=sw, height=sh)
                 maps = self.fill.height_map_small(small_depth, small)
                 if maps is not None:
                     heights, area, xs, ys = maps

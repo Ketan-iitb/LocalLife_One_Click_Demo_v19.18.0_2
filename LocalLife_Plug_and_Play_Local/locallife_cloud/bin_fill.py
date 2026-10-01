@@ -74,6 +74,7 @@ class FillProfile:
     floor_plane: list[float] | None = None    # (a, b, c): z = a x + b y + c, this camera's own empty floor
     floor_scale: float = 1.0                  # Logitech: model depth -> metres from the 110 cm reference
     floor_fitted_at: float | None = None
+    floor_raw_distance: float | None = None   # in this camera's own depth units (the floor is the DEEPEST plane)
     source: str = "none"                      # "saved" | "default-provisional" | "none"
     notes: list[str] | None = None            # where each default came from
 
@@ -366,6 +367,9 @@ class FillEstimator:
             # surface clearly stands as a pile (>= 15 cm); everything else is empty bin floor.
             tops = np.where(objects[keep] | (tops >= PILE_M), tops, 0.0)
         cells = cell_tops(tops, hx, hy)
+        z_all = depth_m * scale
+        self.last_surface = {"at": timestamp, "step": step, "height": height, "ok": valid & flat,
+                             "area": (z_all / intrinsics.fx) * (z_all / intrinsics.fy)}
         if len(cells) < 8:
             return self._hold("waiting for a clear view of the bin surface", warnings=warnings)
         reading = fill_reading(cells, coverage, self.profile)
@@ -404,6 +408,10 @@ class FillEstimator:
             return {"ok": False, "reason": "bin floor not visible (cover <15% of the view) -- empty the bin and retry"}
         plane, distance, share = fit
         reference = float(self.profile.camera_to_empty_floor_m or DEFAULT_FLOOR_DISTANCE_M)
+        known = self.profile.floor_raw_distance
+        if automatic and known and distance < 0.97 * known:
+            # Waste is always closer than the floor: a shallower "floor" is the top of the pile.
+            return {"ok": False, "reason": "a deeper floor is already known (pile top is not the floor)"}
         if self.camera_id == "logitech":
             if automatic and share < 0.35:
                 return {"ok": False, "reason": "floor not clearly visible yet (automatic fit needs an open floor)"}
@@ -420,6 +428,7 @@ class FillEstimator:
         self.profile.floor_plane = [float(v) for v in plane]
         self.profile.floor_scale = float(scale)
         self.profile.floor_fitted_at = time.time()
+        self.profile.floor_raw_distance = float(distance)
         a, b, _ = plane
         self.profile.tilt_from_vertical_deg = round(math.degrees(math.atan(math.hypot(a, b))), 1)
         try:
@@ -443,6 +452,49 @@ class FillEstimator:
         area = (z / intrinsics.fx) * (z / intrinsics.fy)
         return (np.where(valid, height, np.nan).astype(np.float32), area.astype(np.float32),
                 x.astype(np.float32), y.astype(np.float32))
+
+    def object_volume(self, box, mask: np.ndarray | None, now: float) -> tuple[float, float] | None:
+        """(litres, height m) of one detection above the surface AROUND it, from this camera's own map.
+
+        Volume = sum over the object's pixels of (height - local support) x pixel floor area. The local
+        support is the 25th-percentile height in a ring around the box, so a bag lying on the pile is
+        measured from the pile, not from the bin floor. None when the map is stale or support unclear.
+        """
+        surface = getattr(self, "last_surface", None)
+        if not surface or now - surface["at"] > 2.0:
+            return None
+        step, height, ok, area = surface["step"], surface["height"], surface["ok"], surface["area"]
+        h, w = height.shape
+        x1, y1, x2, y2 = (int(round(v / step)) for v in box)
+        x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+        if x2 - x1 < 3 or y2 - y1 < 3:
+            return None
+        inside = np.zeros_like(ok)
+        if mask is not None and mask.ndim == 2:
+            small = mask[::step, ::step][:h, :w]
+            inside[:small.shape[0], :small.shape[1]] = small
+            inside[:, :x1] = inside[:, x2:] = False
+            inside[:y1] = inside[y2:] = False
+        if not inside.any():
+            inside[y1:y2, x1:x2] = True
+        pad_x, pad_y = max(2, (x2 - x1) // 4), max(2, (y2 - y1) // 4)
+        ring = np.zeros_like(ok)
+        ring[max(0, y1 - pad_y):min(h, y2 + pad_y), max(0, x1 - pad_x):min(w, x2 + pad_x)] = True
+        ring &= ~inside
+        support_px = height[ring & ok]
+        top = inside & ok
+        if support_px.size < 10 or np.count_nonzero(top) < 10:
+            return None
+        support = float(np.percentile(support_px, 25))
+        rise = height[top] - support
+        keep = rise > 0.02
+        if np.count_nonzero(keep) < 10:
+            return None
+        litres = float(np.sum(rise[keep] * area[top][keep])) * 1000.0
+        tall = float(np.percentile(rise[keep], 90))
+        if litres > 250.0 or tall > self.profile.usable_height_m + RIM_TOLERANCE_M:
+            return None                                  # implausible: unavailable, never clamped
+        return round(litres, 2), tall
 
     def _hold(self, reason: str, *, warnings: list[str] | None = None, stale_only: bool = False) -> dict[str, Any]:
         """Keep the last valid reading (marked stale, with its age) instead of inventing a fresh one."""
