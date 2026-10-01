@@ -3047,8 +3047,13 @@ class VisionPipeline:
         if (fill_monocular is None and self.camera_id == "logitech" and predicted_depth is not None
                 and depth_output_kind(self.config.depth_model) == "metric"):
             fill_monocular = predicted_depth
+        fill_objects = np.zeros(frame.shape[:2], dtype=bool)
+        for item in detections:
+            if not _is_phantom_detection(item):
+                x1, y1, x2, y2 = (int(round(v)) for v in item.box)
+                fill_objects[max(0, y1):max(0, y2), max(0, x1):max(0, x2)] = True
         self._update_fill(frame, depth_m, intrinsics, fill_monocular, measure_intrinsics,
-                          bin_region, time.time(), fill_plane)    # same wall clock as occupancy events
+                          bin_region, time.time(), fill_plane, fill_objects)    # same wall clock as occupancy events
         if persist:
             self.store.append_jsonl("frames.jsonl", analysis.to_dict())
             self._finalise_settled_measurements(detections, timestamp)
@@ -3428,7 +3433,7 @@ class VisionPipeline:
             LOGGER.exception("%s deposit evidence failed", self.camera_id)
 
     def _update_fill(self, frame, depth_m, intrinsics, calibrated_prediction, measure_intrinsics,
-                     bin_region, timestamp: float, floor_plane=None) -> None:
+                     bin_region, timestamp: float, floor_plane=None, objects=None) -> None:
         """Refresh this camera's fill reading from its OWN depth (settled frames only).
 
         RealSense: aligned hardware depth. Logitech: its own monocular depth in
@@ -3449,11 +3454,11 @@ class VisionPipeline:
                     return
                 geometry = measure_intrinsics or self._field_of_view_intrinsics(frame.shape)
                 self.fill.update(frame, calibrated_prediction, geometry, bin_region, motion, timestamp,
-                                 floor_plane=floor_plane,
+                                 floor_plane=floor_plane, objects=objects,
                                  depth_label=f"monocular model depth, approximate scale ({mode})")
                 return
             self.fill.update(frame, depth_m, intrinsics, bin_region, motion, timestamp,
-                             depth_reason="no aligned depth frame", floor_plane=floor_plane,
+                             depth_reason="no aligned depth frame", floor_plane=floor_plane, objects=objects,
                              depth_label="RealSense aligned hardware depth")
         except Exception:  # noqa: BLE001 - the fill panel must never stop the pipeline
             LOGGER.exception("%s fill update failed", self.camera_id)

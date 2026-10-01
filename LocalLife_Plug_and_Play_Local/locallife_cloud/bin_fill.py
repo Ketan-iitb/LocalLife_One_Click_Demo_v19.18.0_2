@@ -43,6 +43,7 @@ BELOW_FLOOR_M = 0.10            # a pixel this far below the floor reference is 
 BELOW_FLOOR_SHARE = 0.05         # more than this share of such pixels -> visible quality warning
 INCONSISTENT_M = 0.15            # a single frame this far from the recent median is not trusted
 SMOOTH_FRAMES = 5
+PILE_M = 0.15                    # undetected flat surface this high is still waste (crowded pile)
 STABLE_MOTION = 0.02             # scene motion fraction below which a frame is "settled"
 MOVED_EDGE_CORRELATION = 0.45    # thumbnail edge correlation outside the bin below this: camera moved
 HEIGHT_FILL_LABEL = "rough height-based equivalent; assumes roughly uniform filling"
@@ -252,6 +253,7 @@ class FillEstimator:
         self.history: deque[tuple[float, dict[tuple[int, int], float]]] = deque(maxlen=60)
         self.fill_history: deque[tuple[float, float]] = deque(maxlen=SMOOTH_FRAMES)
         self._last_fit_try = -1e9
+        self._last_refit = -1e9
         self.last_maps: tuple[Any, float] = (None, 1.0)
         self.inconsistent = 0
 
@@ -314,7 +316,8 @@ class FillEstimator:
 
     def update(self, frame: np.ndarray, depth_m: np.ndarray | None, intrinsics: Any, region: np.ndarray | None,
                motion: float | None, timestamp: float, *, depth_reason: str | None = None,
-               floor_plane=None, depth_label: str = "hardware depth") -> dict[str, Any]:
+               floor_plane=None, depth_label: str = "hardware depth",
+               objects: np.ndarray | None = None) -> dict[str, Any]:
         self.last_processed_at = timestamp
         problems = self.profile.blocking()
         if problems:
@@ -325,7 +328,13 @@ class FillEstimator:
             return self._hold("camera or bin moved since the fill profile was saved: re-save it")
         if motion is not None and motion > STABLE_MOTION:
             return self._hold("scene moving", stale_only=True)
+        step = max(1, int(depth_m.shape[1] // 160))
+        objects = None if objects is None else objects[::step, ::step]
         depth_m, intrinsics, region = _subsample(depth_m, intrinsics, region)
+        if objects is not None and not objects.any() and timestamp - self._last_refit >= 30.0:
+            # Nothing detected in the bin: the deepest flat surface is the floor -- refresh it (plug and play).
+            self._last_refit = timestamp
+            self.recalibrate(depth_m, intrinsics, region, automatic=True)
         plane, scale = floor_plane, 1.0
         if plane is not None:
             geometry = "saved empty-bin floor plane"
@@ -351,7 +360,12 @@ class FillEstimator:
         z = depth_m[rows, cols] * scale
         hx = (cols - intrinsics.ppx) * z / intrinsics.fx
         hy = (rows - intrinsics.ppy) * z / intrinsics.fy
-        cells = cell_tops(height[keep].astype(np.float64), hx, hy)
+        tops = height[keep].astype(np.float64)
+        if objects is not None and objects.shape == height.shape:
+            # Surroundings analysis: waste height counts where a bag is detected, or where a flat
+            # surface clearly stands as a pile (>= 15 cm); everything else is empty bin floor.
+            tops = np.where(objects[keep] | (tops >= PILE_M), tops, 0.0)
+        cells = cell_tops(tops, hx, hy)
         if len(cells) < 8:
             return self._hold("waiting for a clear view of the bin surface", warnings=warnings)
         reading = fill_reading(cells, coverage, self.profile)

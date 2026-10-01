@@ -2225,6 +2225,18 @@ function Start-PiRole {
         $checkCommand = 'if [ -d ~/' + $ProjectDirectory + '/locallife_cloud ]; then echo LOCALLIFE_PROJECT_PRESENT; else echo LOCALLIFE_PROJECT_MISSING; fi'
         $checkOutput = & ssh '-o' 'StrictHostKeyChecking=accept-new' $PiHost $checkCommand
         if ($LASTEXITCODE -ne 0) {
+            # A changed host key is not a network fault: say exactly what to do, never bypass the check.
+            $previousPreference = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'      # PS 5.1 turns native stderr into terminating errors
+            try { $probe = (& ssh '-o' 'BatchMode=yes' '-o' 'ConnectTimeout=5' $PiHost 'exit' 2>&1 | Out-String) }
+            catch { $probe = $_.Exception.Message }
+            finally { $ErrorActionPreference = $previousPreference }
+            if ($probe -match 'REMOTE HOST IDENTIFICATION HAS CHANGED') {
+                $keyHost = ($PiHost -split '@')[-1]
+                throw ('The Raspberry Pi answering as ''' + $keyHost + ''' has a different SSH key than the one this PC saved for that name. ' +
+                    'If the Pi was re-installed or replaced, run this once in PowerShell and start again:  ssh-keygen -R ' + $keyHost + '   ' +
+                    'If you did not change the Pi, do not continue: another device may be using its name.')
+            }
             throw 'Could not check the Raspberry Pi over SSH (see its output above). Confirm it is powered on and reachable.'
         }
         if (($checkOutput -join "`n") -notmatch 'LOCALLIFE_PROJECT_PRESENT') {

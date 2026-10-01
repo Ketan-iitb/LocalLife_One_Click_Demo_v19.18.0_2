@@ -268,5 +268,21 @@ class FloorTests(unittest.TestCase):
             self.assertAlmostEqual(got["floor_cm"], 110.0, delta=1.0)
 
 
+
+class SurroundingsTests(unittest.TestCase):
+    def test_nothing_detected_reads_empty_and_a_detected_bag_counts(self) -> None:
+        with TemporaryDirectory() as d:
+            est = bf.FillEstimator("realsense", Path(d), _profile(camera_to_empty_floor_m=1.10, usable_height_m=1.00))
+            bag = lambda x, y: np.where((np.abs(x) < 0.12) & (np.abs(y) < 0.12), 0.12, 0.0)   # low bag, < 15 cm
+            depth = _render(_profile(camera_to_empty_floor_m=1.10), bag)
+            frame = np.zeros((K.height, K.width, 3), np.uint8)
+            none = np.zeros(depth.shape, bool)
+            self.assertEqual(est.update(frame, depth, K, None, 0.0, 1.0, objects=none)["height_fill_pct"], 0.0)
+            est.fill_history.clear()
+            boxed = np.zeros(depth.shape, bool)
+            boxed[40:80, 50:110] = True                                                        # detector box
+            self.assertGreater(est.update(frame, depth, K, None, 0.0, 2.0, objects=boxed)["height_fill_pct"], 0.5)
+
+
 if __name__ == "__main__":
     unittest.main()
