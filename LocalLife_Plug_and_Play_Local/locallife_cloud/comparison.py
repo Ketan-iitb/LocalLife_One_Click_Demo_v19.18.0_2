@@ -197,6 +197,7 @@ class DualCameraCoordinator:
         # v45: one session-wide count of NEW bags, shared by both cameras so a
         # bag seen by both counts once.
         self.deposits = SessionDeposits(config.results_dir / "session")
+        self.deposits.fill_lookup = lambda camera: dict(self.pipelines[camera].fill.reading)
         self.attach_deposit_listeners()
         # Each station knows the other's geometry only so it can refuse to
         # measure with it (coordinates.frame_consistency).

@@ -47,8 +47,8 @@ LOGGER = logging.getLogger(__name__)
 SMALL = (160, 120)             # evaluation resolution (w, h)
 WARMUP_S = 4.0                 # minimum time before the baseline is taken
 BASELINE_MAX_S = 20.0          # take the baseline even if the scene never stills
-SETTLE_S = 1.0                 # stillness needed to evaluate a candidate
-CANDIDATE_TIMEOUT_S = 30.0     # candidate that never settles -> rejected
+SETTLE_S = float(os.environ.get("LOCALLIFE_DEPOSIT_SETTLE_S", "1.0"))   # stillness in the event region
+CANDIDATE_TIMEOUT_S = float(os.environ.get("LOCALLIFE_DEPOSIT_TIMEOUT_S", "30"))  # never settles -> rejected
 FINALISE_S = 12.0              # late measurements update an event this long; then its CSV row is written
 PIXEL_DIFF = 28                # grey-level change counted as changed
 MOTION_ENTER = 0.02            # changed fraction between frames that opens a candidate
@@ -66,10 +66,11 @@ ENVELOPE_LABEL = "new-bag outer envelope (visible L x W x added height box)"
 DELTA_LABEL = "net before/after change in bin occupancy (whole-bin surface, separate method)"
 
 CSV_FIELDS = (
-    "session_id", "camera", "event_id", "counted", "count_after", "deposit_time", "cameras", "association",
-    "confidence", "evidence",
+    "session_id", "camera", "event_id", "counted", "count_after", "deposit_time", "entered_at", "confirmed_at",
+    "cameras", "association", "confidence", "evidence",
     "track_id", "colour", "object_type", "detector_label", "material", "length_cm", "width_cm", "height_cm",
     "height_source", "envelope_l", "delta_occupancy_l", "measurement_status", "reason",
+    "volume_method", "units", "bin_fill_pct_after", "bin_fill_litres_after",
 )
 
 
@@ -151,12 +152,14 @@ class CameraWatcher:
         self.known_ids: set[int] = set()
         self.baseline_ids: set[int] = set()
         self.candidate_since: float | None = None
+        self.last_candidate_since: float | None = None
         self.candidate_trigger: str | None = None
         self.motion = 0.0
         self.last_frame_at: float | None = None
         self.resync = False
         self.votes: dict[int, dict[str, Counter]] = {}
         self.noise = 0.0                    # typical frame-to-frame change of a still scene (sensor/JPEG)
+        self.views: list[np.ndarray] = []   # last few small views, for colour voted over several frames
         self.pending: list[tuple[dict[str, Any], int, float]] = []   # (event, track id, until) for late sizes
 
     # ----------------------------------------------------------- helpers
@@ -201,6 +204,7 @@ class CameraWatcher:
             diff = _changed(ev.grey, self.prev_grey)
             self.motion = float(np.count_nonzero(diff & region)) / max(1, int(np.count_nonzero(region)))
         self.prev_grey = ev.grey
+        self.views = (self.views + [ev.grey])[-4:]
         # Thresholds follow this camera's own noise floor, so a noisy dark view still settles.
         if self.motion < max(MOTION_ENTER, 4 * self.noise):
             self.noise = 0.9 * self.noise + 0.1 * self.motion
@@ -261,6 +265,7 @@ class CameraWatcher:
         return outcome
 
     def _end(self, reason: str | None) -> None:
+        self.last_candidate_since = self.candidate_since
         self.state, self.reason = "watching", reason
         self.candidate_since = None
         if reason:
@@ -392,6 +397,7 @@ class SessionDeposits:
         self.state_path = self.directory / "session_state.json"
         self._lock = threading.RLock()
         self.watchers: dict[str, CameraWatcher] = {}
+        self.fill_lookup: Callable[[str], dict[str, Any]] | None = None   # camera -> its current fill reading
         self._pending_csv: list[dict[str, Any]] = []
         self._last_frame_at = 0.0
         if not self._resume():
@@ -492,7 +498,28 @@ class SessionDeposits:
     def _confirm(self, ev: FrameEvidence, watcher: CameraWatcher, details: dict[str, Any]) -> dict[str, Any]:
         """Each camera counts its own deposits: nothing is merged with, or copied from, the other camera."""
         track: TrackInfo | None = details.get("track")
+        mask = details.get("mask")
+        if track is None and mask is not None and mask.any():
+            # The change was confirmed without a NEW track id (re-used id, merged mask): link it to the
+            # detection that covers it, so colour/material/size come from the deposited bag itself.
+            best, best_share = None, 0.0
+            for t in ev.tracks:
+                share = float(np.count_nonzero(mask & _box_mask(t.box, mask.shape))) / np.count_nonzero(mask)
+                if bag_like(t.label) and share > best_share:
+                    best, best_share = t, share
+            if best is not None and best_share >= 0.4:
+                track = details["track"] = best
+                details["evidence"] += f" (linked to track {best.track_id})"
         record = self._measure(ev, watcher, details, track)
+        record["entered_at"] = watcher.last_candidate_since
+        record["confirmed_at"] = record["deposit_time"]
+        if record["colour"] in (None, "unknown") and mask is not None and mask.any():
+            record["colour"] = _voted_colour(watcher.views, mask)
+        if self.fill_lookup is not None:
+            reading = self.fill_lookup(ev.camera) or {}
+            if reading.get("status") == "ok":
+                record["bin_fill_pct_after"] = reading.get("height_fill_pct")
+                record["bin_fill_litres_after"] = reading.get("rough_litres")
         number = self.count_for(ev.camera) + 1
         record["event_id"] = f"{'RS' if ev.camera == 'realsense' else 'LG'}-{self.session_id[-6:]}-{number:03d}"
         record["count_after"] = number
@@ -610,6 +637,10 @@ class SessionDeposits:
             "envelope_l": envelope, "envelope_label": ENVELOPE_LABEL,
             "delta_occupancy_l": None, "delta_label": DELTA_LABEL,
             "measurement_status": status, "reason": "; ".join(reasons) or None,
+            "bin_fill_pct_after": None, "bin_fill_litres_after": None,
+            "volume_method": ("surface rise integrated over the bag (after - before)" if volume is not None
+                              else "L x W x H box" if envelope is not None else None),
+            "units": "cm, L",
             "evidence": {ev.camera: {"evidence": details["evidence"], "trigger": details.get("trigger"),
                                      "changed_fraction": details.get("changed_fraction")}},
         }
@@ -617,8 +648,8 @@ class SessionDeposits:
     def attach_occupancy(self, camera: str, event: Any, extra: dict[str, Any] | None = None) -> None:
         """A whole-bin before/after occupancy event is EVIDENCE only; it never counts on its own."""
         with self._lock:
-            near = [e for e in self.events if abs(e["deposit_time"] - event.finalized_at) <= FINALISE_S
-                    and e["camera"] == camera and e["delta_occupancy_l"] is None]
+            near = [e for e in self.events if e["camera"] == camera and e["delta_occupancy_l"] is None
+                    and event.started_at - FINALISE_S <= e["deposit_time"] <= event.finalized_at + FINALISE_S]
             if near and event.delta_occupancy_l is not None:
                 near[-1]["delta_occupancy_l"] = event.delta_occupancy_l
                 self._save()
@@ -641,6 +672,12 @@ class SessionDeposits:
             return
         try:
             self.directory.mkdir(parents=True, exist_ok=True)
+            if self.csv_path.exists():
+                with self.csv_path.open(encoding="utf-8") as handle:
+                    header = handle.readline().strip().split(",")
+                if header != list(CSV_FIELDS):        # older schema: keep it under a dated name
+                    self.csv_path.rename(self.csv_path.with_name(
+                        f"session_deposits_{time.strftime('%Y%m%d-%H%M%S')}_old_schema.csv"))
             new = not self.csv_path.exists()
             with self.csv_path.open("a", newline="", encoding="utf-8") as handle:
                 writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS, extrasaction="ignore")
@@ -686,6 +723,20 @@ class SessionDeposits:
                                       for r in self.rejected[-5:]],
                 "envelope_label": ENVELOPE_LABEL, "delta_label": DELTA_LABEL,
             }
+
+
+def _voted_colour(views: list[np.ndarray], mask: np.ndarray) -> str:
+    """Colour of the deposit's own pixels, agreed over the last few frames; UNKNOWN when they disagree."""
+    try:
+        from .geometry import classify_color
+    except ImportError:  # pragma: no cover
+        return "unknown"
+    names = [classify_color(v, mask)[0] for v in views if v.ndim == 3 and v.shape[:2] == mask.shape]
+    names = [n for n in names if n != "unknown"]
+    if not names:
+        return "unknown"
+    top = Counter(names).most_common(1)[0]
+    return top[0] if top[1] >= max(2, 0.6 * len(names)) else "unknown"
 
 
 def _r(value: float | None) -> float | None:

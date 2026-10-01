@@ -90,6 +90,7 @@ SETTLE_TOLERANCE = 0.06
 SETTLE_FLOOR_L = 0.25
 # A change smaller than this is the room breathing rather than a deposit.
 ENTER_CHANGED_FRACTION = 0.02
+EVENT_TIMEOUT_S = 30.0
 
 
 @dataclass(frozen=True)
@@ -312,6 +313,17 @@ class BinOccupancyTracker:
             self._obstructed_during_event = True
 
         finalised: OccupancyEvent | None = None
+        if (self.state in (DEPOSIT_IN_PROGRESS, SETTLING, STABLE_POST) and self._started_at is not None
+                and timestamp - self._started_at > EVENT_TIMEOUT_S):
+            # Bounded: an event that cannot settle is closed with what is known, marked partial.
+            if reading.usable:
+                self._post_samples = [float(reading.litres)]
+            event = self._finalize(timestamp)
+            if event.status == "finalized":
+                event.status, event.reason = "partial", f"did not settle within {EVENT_TIMEOUT_S:.0f} s"
+            self.pending_reason = event.reason
+            self.state = STABLE_PRE
+            return event
         if self.state == STABLE_PRE:
             if reading.usable and not arriving:
                 # Refreshed only while nothing is arriving. The frame that

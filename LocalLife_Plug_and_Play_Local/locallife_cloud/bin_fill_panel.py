@@ -20,10 +20,11 @@ BIN_FILL_PANEL = r"""{% raw %}
 @media(max-width:900px){#bf-panel .bf-grid{grid-template-columns:1fr}}
 </style>
 <h2>Bin fill &amp; new deposits — each camera independently</h2>
+<div style="margin:6px 0"><button type="button" id="bf-reset">Reset counts &amp; readings</button> <a class="bf-btn" href="/api/session-deposits.xlsx">Download Excel</a> <a class="bf-btn" href="/api/session-deposits.csv">Download CSV</a></div>
 <div id="bf-session" class="bf-muted">Loading…</div>
 <div class="bf-grid"><div class="bf-card" id="bf-cam-realsense"></div><div class="bf-card" id="bf-cam-logitech"></div></div>
 <div class="bf-muted" style="margin-top:6px">Fill = average waste height ÷ 100 cm bin height; litres = 660 L × fill (approximate).</div>
-<div style="margin-top:8px"><a class="bf-btn" href="/api/session-deposits.csv">Download deposits CSV (both cameras)</a> <button type="button" id="bf-new">New session</button></div>
+<div style="margin-top:8px"></div>
 
 <script>
 (function(){
@@ -54,7 +55,7 @@ async function load(){try{const d=await (await fetch('/api/bin-fill',{cache:'no-
  $('bf-session').textContent='Session started '+new Date(s.session_started_at*1000).toLocaleString()+(s.resumed?' (resumed)':'')+' · bags present at start count toward fill, not as new';
 }catch(err){$('bf-session').textContent='Bin fill data unavailable: '+err.message;}}
 
-$('bf-new').addEventListener('click',async()=>{if(!confirm('Start a new session? Both NEW-bag counts return to 0.'))return;await fetch('/api/bin-fill/session/new',{method:'POST'});load();});
+$('bf-reset').addEventListener('click',async()=>{if(!confirm('Reset? Both bag counts return to 0 and recording starts fresh (earlier rows stay in the CSV).'))return;await fetch('/api/bin-fill/session/new',{method:'POST'});load();});
 load();setInterval(load,1000);
 })();
 </script>

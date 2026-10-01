@@ -728,6 +728,52 @@ def create_app(
         return Response(body, mimetype="text/csv", headers={
             "Content-Disposition": "attachment; filename=session_deposits.csv", "Cache-Control": "no-store"})
 
+    @app.get("/api/session-deposits.xlsx")
+    def session_deposits_xlsx() -> Any:
+        """This session's drops, both cameras: summary (bags dropped, fill now) + one row per drop."""
+        try:
+            from openpyxl import Workbook
+        except ImportError:
+            return jsonify(error="openpyxl is not installed (pip install -r requirements-local.txt)"), 501
+        state = manager.bin_fill()
+        snap = state["deposits"]
+
+        def stamp(value: Any) -> str:
+            return "" if not value else time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(value)))
+
+        book = Workbook()
+        summary = book.active
+        summary.title = "Summary"
+        summary.append(["Session", snap["session_id"], "started", stamp(snap["session_started_at"])])
+        summary.append([])
+        summary.append(["Camera", "Bags dropped", "Bin fill now (%)", "Bin filled now (L, approx.)",
+                        "Remaining (L, approx.)", "Last drop", "Fill reading at"])
+        for camera, reading in state["cameras"].items():
+            block = snap["cameras"].get(camera, {})
+            ok = reading.get("status") == "ok"
+            summary.append([camera, block.get("new_bags", 0), reading.get("height_fill_pct") if ok else None,
+                            reading.get("rough_litres") if ok else None,
+                            reading.get("rough_remaining_litres") if ok else None,
+                            stamp(block.get("last_confirmed_at")), stamp(reading.get("last_valid_at"))])
+        summary.append([])
+        summary.append(["Fill = average waste height / 100 cm bin height; litres = 660 L x fill (approximate)."])
+        rows = book.create_sheet("Deposits")
+        columns = ["camera", "event_id", "count_after", "entered_at", "confirmed_at", "colour", "object_type",
+                   "material", "length_cm", "width_cm", "height_cm", "envelope_l", "volume_method",
+                   "bin_fill_pct_after", "bin_fill_litres_after", "measurement_status", "confidence", "reason"]
+        rows.append(["Camera", "Event", "Bags dropped so far", "Entered", "Dropped (confirmed)", "Colour", "Type",
+                     "Material", "Length cm", "Width cm", "Height cm", "Bag volume L", "Volume method",
+                     "Bin fill after (%)", "Bin filled after (L)", "Status", "Confidence", "Reason"])
+        for event in sorted(snap["events"], key=lambda e: e["deposit_time"]):
+            rows.append([stamp(event.get(c)) if c in ("entered_at", "confirmed_at") else event.get(c)
+                         for c in columns])
+        buffer = io.BytesIO()
+        book.save(buffer)
+        return Response(buffer.getvalue(), headers={
+            "Content-Disposition": f"attachment; filename=bin_deposits_{snap['session_id']}.xlsx",
+            "Cache-Control": "no-store"},
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
     @app.post("/api/cameras/<camera_id>/fill-profile")
     @protected
     def save_fill_profile(camera_id: str) -> Any:

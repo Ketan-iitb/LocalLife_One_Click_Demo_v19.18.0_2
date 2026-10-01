@@ -284,5 +284,33 @@ class SurroundingsTests(unittest.TestCase):
             self.assertGreater(est.update(frame, depth, K, None, 0.0, 2.0, objects=boxed)["height_fill_pct"], 0.5)
 
 
+
+class V47ExportTests(unittest.TestCase):
+    def test_excel_export_and_occupancy_timeout(self) -> None:
+        from locallife_cloud.bin_occupancy import BinOccupancyTracker, DepositObservation, OccupancyReading
+        tracker = BinOccupancyTracker("realsense")
+        reading = OccupancyReading(litres=100.0, valid_fraction=0.9)
+        tracker.observe(DepositObservation(reading=reading, timestamp=0.0))
+        tracker.observe(DepositObservation(reading=reading, tracked_objects=1, timestamp=1.0))   # arriving
+        event = None
+        for t in range(2, 40):                     # never settles (always moving)
+            event = event or tracker.observe(DepositObservation(reading=reading, changed_fraction=0.5,
+                                                                timestamp=float(t)))
+        self.assertIsNotNone(event)                # bounded, not "waste has not settled" for ever
+        try:
+            import openpyxl  # noqa: F401
+        except ImportError:
+            self.skipTest("openpyxl not installed here")
+        with TemporaryDirectory() as d:
+            config = AppConfig(detector_model="local-opencv-background", enable_monocular_depth=False,
+                               enable_bucket_sync=False, results_dir=Path(d))
+            client = create_app(config, DualCameraCoordinator(config)).test_client()
+            got = client.get("/api/session-deposits.xlsx")
+            self.assertEqual(got.status_code, 200)
+            import io
+            book = openpyxl.load_workbook(io.BytesIO(got.data))
+            self.assertEqual(book.sheetnames, ["Summary", "Deposits"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -290,5 +290,34 @@ class DimensionTests(unittest.TestCase):
         self.assertFalse(trim_mask_leak(thin)[1])
 
 
+
+class V47RecordTests(unittest.TestCase):
+    def test_entry_and_confirmation_times_fill_at_drop_and_linked_metadata(self) -> None:
+        with TemporaryDirectory() as d:
+            counter = sd.SessionDeposits(Path(d), clock=lambda: 0.0)
+            counter.fill_lookup = lambda camera: {"status": "ok", "height_fill_pct": 12.5, "rough_litres": 82.5}
+            scene = Scene()
+            scene.add(1, (10, 10, 40, 40))
+            run(counter, scene, 0.0, 7.0)
+            run(counter, scene, 7.0, 8.0, hand=True)
+            scene.add(1, (60, 60, 100, 100), height=0.25)   # same id re-used by the detector for the new bag
+            scene.bags[1]["box"] = (60, 60, 100, 100)
+            scene.untracked.append(dict(box=(10, 10, 40, 40), height=0.30, shade=200, label="waste bag"))
+            got, _ = run(counter, scene, 8.0, 12.0)
+            e = got[0]
+            self.assertLess(e["entered_at"], e["confirmed_at"])
+            self.assertEqual((e["bin_fill_pct_after"], e["bin_fill_litres_after"]), (12.5, 82.5))
+            self.assertEqual(e["colour"], "black")                      # linked to the covering detection
+
+    def test_old_csv_schema_is_kept_aside_not_misaligned(self) -> None:
+        with TemporaryDirectory() as d:
+            (Path(d) / "session_deposits.csv").write_text("session_id,event_id\nold,1\n")
+            counter = sd.SessionDeposits(Path(d), clock=lambda: 0.0)
+            counter._write_csv({"event_id": "x", "cameras": ["realsense"], "deposit_time": 1.0, "evidence": {}})
+            self.assertTrue(any("old_schema" in p.name for p in Path(d).iterdir()))
+            header = (Path(d) / "session_deposits.csv").read_text().splitlines()[0].split(",")
+            self.assertEqual(header, list(sd.CSV_FIELDS))
+
+
 if __name__ == "__main__":
     unittest.main()

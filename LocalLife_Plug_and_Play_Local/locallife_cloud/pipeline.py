@@ -3052,6 +3052,12 @@ class VisionPipeline:
             if not _is_phantom_detection(item):
                 x1, y1, x2, y2 = (int(round(v)) for v in item.box)
                 fill_objects[max(0, y1):max(0, y2), max(0, x1):max(0, x2)] = True
+        # Boxes flicker between frames; hold each for 3 s so the fill definition stays steady.
+        held = [(t, m) for t, m in self.__dict__.get("_recent_fill_objects", [])
+                if time.time() - t <= 3.0 and m.shape == fill_objects.shape]
+        self._recent_fill_objects = held + [(time.time(), fill_objects)]
+        for _, mask in held:
+            fill_objects |= mask
         self._update_fill(frame, depth_m, intrinsics, fill_monocular, measure_intrinsics,
                           bin_region, time.time(), fill_plane, fill_objects)    # same wall clock as occupancy events
         if persist:
@@ -4683,6 +4689,21 @@ class VisionPipeline:
         self._last_motion = motion
         self._observe_bin_occupancy(detections, motion)
 
+    def _recently_appeared(self, detections: list[Detection], window_s: float = 3.0) -> int:
+        now, frame = time.time(), self.frames_processed
+        seen = self.__dict__.setdefault("_track_first_seen", {})
+        frames = max(3, int(self.config.settle_frames))      # a slow machine still sees the arrival
+        count = 0
+        for item in detections:
+            if item.track_id is None or _is_phantom_detection(item) or item.source == "yoloe-unchanged":
+                continue
+            first_t, first_f = seen.setdefault(item.track_id, (now, frame))
+            count += int(now - first_t <= window_s or frame - first_f <= frames)
+        if len(seen) > 500:
+            for key in sorted(seen, key=lambda k: seen[k][0])[:250]:
+                seen.pop(key, None)
+        return count
+
     def _observe_bin_occupancy(self, detections: list[Detection], changed: float) -> None:
         """Feed this frame's bin surface to the before/after event tracker.
 
@@ -4718,12 +4739,9 @@ class VisionPipeline:
             # stays in view in a bin, and counting it kept the tracker in
             # "deposit in progress" for ever -- no before/after event could
             # ever finalise once the first bag was in.
-            tracked_objects=sum(
-                1 for item in detections
-                if item.track_id is not None and not _is_phantom_detection(item)
-                and item.source != "yoloe-unchanged"
-                and not self.ledger.is_deposited(item.track_id)
-            ),
+            # Only tracks that APPEARED in the last few seconds are "arriving". Counting every
+            # not-yet-ledgered bag kept a full bin "in progress" for ever: no event ever finalised.
+            tracked_objects=self._recently_appeared(detections),
             # A hand reaching in covers the bin without being a deposit: the
             # surface it hides is not the waste surface, and an event measured
             # across it is not a before/after pair.
