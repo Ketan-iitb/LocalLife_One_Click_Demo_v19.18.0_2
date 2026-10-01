@@ -220,6 +220,20 @@ class SequenceTests(unittest.TestCase):
             snap = counter.snapshot()
             self.assertEqual(snap["cameras"]["logitech"]["new_bags"], 1)
 
+    def test_removing_the_top_bag_does_not_count_the_one_below(self) -> None:
+        for depth in (True, False):
+            with self.subTest(depth=depth), TemporaryDirectory() as d:
+                counter = sd.SessionDeposits(Path(d), clock=lambda: 0.0)
+                scene = Scene(depth=depth)
+                scene.add(1, (40, 40, 100, 90), height=0.20, shade=120)            # lower bag
+                scene.add(2, (45, 45, 95, 85), height=0.45, shade=220)             # bag on top of it
+                run(counter, scene, 0.0, 7.0)
+                run(counter, scene, 7.0, 8.0, hand=True)
+                del scene.bags[2]                                                   # top bag lifted out
+                scene.bags[7] = scene.bags.pop(1)                                   # lower bag re-detected, new id
+                run(counter, scene, 8.0, 12.0)
+                self.assertEqual(counter.count, 0)
+
     def test_a_person_is_not_a_bag(self) -> None:
         self.assertFalse(sd.bag_like("person"))
         self.assertFalse(sd.bag_like("hand"))

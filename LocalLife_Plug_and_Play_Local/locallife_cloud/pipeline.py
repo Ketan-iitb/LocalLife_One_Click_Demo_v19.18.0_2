@@ -3036,7 +3036,8 @@ class VisionPipeline:
         )
 
         self._apply_bin_bounds(detections)
-        self._emit_deposit_evidence(frame, detections, depth_m, intrinsics, bin_region)
+        self._emit_deposit_evidence(frame, detections, depth_m, intrinsics, bin_region,
+                                    calibrated_prediction, measure_intrinsics)
         # The saved EMPTY-bin floor plane is the measured pose; a plane fitted through
         # today's waste is not a floor and is never used for the fill.
         fill_plane = (occupancy_plane.coefficients if self.last_occupancy_absolute and occupancy_plane is not None
@@ -3369,7 +3370,8 @@ class VisionPipeline:
     def reload_bin_profile(self) -> None:
         self._bin_profile = None
 
-    def _emit_deposit_evidence(self, frame, detections, depth_m, intrinsics, bin_region) -> None:
+    def _emit_deposit_evidence(self, frame, detections, depth_m, intrinsics, bin_region,
+                               monocular=None, monocular_intrinsics=None) -> None:
         """Hand this frame to the session deposit counter (every processed frame, no calibration needed)."""
         try:
             import cv2
@@ -3401,19 +3403,27 @@ class VisionPipeline:
                     material_confidence=float(item.material_confidence or 0.0),
                     length_mm=item.footprint_length_mm, width_mm=item.footprint_width_mm,
                     height_mm=item.physical_height_mm, rejection=item.volume_rejection_reason))
-            depth = heights = None
+            depth = heights = area = xs = ys = None
             status = None
-            # RealSense only: aligned hardware depth. The Logitech's monocular depth is
-            # rescaled per frame, so its frame-to-frame "rise" is not evidence.
+            # RealSense: aligned hardware depth (also used for the rise check). Logitech: its own
+            # model depth, scaled by its own floor fit -- for sizes and the removal check only.
+            source, geometry = None, None
             if self.camera_id != "logitech" and depth_m is not None and depth_m.shape[:2] == (height, width):
+                source, geometry = depth_m, intrinsics
                 depth = cv2.resize(depth_m.astype(np.float32), (sw, sh), interpolation=cv2.INTER_NEAREST)
-                if intrinsics is not None and not self.fill.profile.blocking():
-                    small = CameraIntrinsics(fx=intrinsics.fx * sx, fy=intrinsics.fy * sy, ppx=intrinsics.ppx * sx,
-                                             ppy=intrinsics.ppy * sy, width=sw, height=sh)
-                    heights, status = height_map(depth, small, self.fill.profile), self.fill.profile.status
+            elif self.camera_id == "logitech" and monocular is not None and monocular.shape[:2] == (height, width):
+                source, geometry = monocular, monocular_intrinsics or self._field_of_view_intrinsics(frame.shape)
+            if source is not None and geometry is not None:
+                small_depth = cv2.resize(source.astype(np.float32), (sw, sh), interpolation=cv2.INTER_NEAREST)
+                small = CameraIntrinsics(fx=geometry.fx * sx, fy=geometry.fy * sy, ppx=geometry.ppx * sx,
+                                         ppy=geometry.ppy * sy, width=sw, height=sh)
+                maps = self.fill.height_map_small(small_depth, small)
+                if maps is not None:
+                    heights, area, xs, ys = maps
+                    status = self.fill.profile.status
             self.frame_listener(FrameEvidence(camera=self.camera_id, timestamp=time.time(), grey=grey,
                                               region=region, tracks=tracks, depth=depth, heights=heights,
-                                              height_status=status))
+                                              height_status=status, area=area, xs=xs, ys=ys))
         except Exception:  # noqa: BLE001 - the counter must never stop the pipeline
             LOGGER.exception("%s deposit evidence failed", self.camera_id)
 

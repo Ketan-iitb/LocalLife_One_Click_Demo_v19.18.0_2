@@ -161,10 +161,12 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(logi.fill.reading["status"], "na")
             self.assertIn("no Logitech depth-model output", logi.fill.reading["reason"])
             # Its own model depth + the shared 110 cm / 100 cm defaults: an independent, approximate reading.
-            logi_depth = _render(_profile(camera_to_empty_floor_m=1.10), lambda x, y: 0.50 + 0 * x)
-            logi._update_fill(np.zeros((K.height, K.width, 3), np.uint8), None, None, logi_depth, K, None, 6.0)
-            self.assertEqual(logi.fill.reading["height_fill_pct"], 50.0)
-            self.assertEqual(logi.fill.reading["rough_litres"], 330.0)
+            # Model depth reads the floor at 1.6 m (wrong scale): the auto floor fit rescales it to 110 cm.
+            logi_depth = _render(_profile(camera_to_empty_floor_m=1.10), lambda x, y: np.where(x < 0, 0.5, 0.0))
+            logi._update_fill(np.zeros((K.height, K.width, 3), np.uint8), None, None, logi_depth * (1.6 / 1.1),
+                              K, None, 6.0)
+            self.assertTrue(8.0 < logi.fill.reading["height_fill_pct"] < 30.0)   # part floor, part 50 cm (by floor area)
+            self.assertEqual(logi.fill.reading["geometry"], "auto-detected bin floor")
             self.assertIn("monocular model depth, approximate", logi.fill.reading["depth_source"])
             self.assertEqual(station.fill.reading["height_fill_pct"], 30.0)        # RealSense unaffected
 
@@ -231,13 +233,39 @@ class FillQualityTests(unittest.TestCase):
             deep = good.copy()
             deep[:, :60] = 1.60                                  # 20 cm-plus below the assumed floor
             warned = est.update(frame, deep, K, None, 0.0, 5.0)
-            self.assertTrue(any("below the assumed floor" in w for w in warned["warnings"]))
+            self.assertTrue(any("below the floor reference" in w for w in warned["warnings"]))
             self.assertEqual(warned["height_fill_pct"], 40.0)    # excluded, not clamped into the reading
             spike = _render(_profile(), lambda x, y: 0.90 + 0 * x)
             held = est.update(frame, spike, K, None, 0.0, 6.0)
             self.assertTrue(held["stale"])
             self.assertIn("inconsistent depth frame ignored", held["stale_reason"])
             self.assertEqual(held["height_fill_pct"], 40.0)
+
+
+class FloorTests(unittest.TestCase):
+    def test_nearly_empty_bin_reads_low_not_the_tallest_bag(self) -> None:
+        # Live: one bag in an empty bin showed 44 %. The floor is found and fill is the mean surface.
+        with TemporaryDirectory() as d:
+            prof = _profile(camera_to_empty_floor_m=1.10, usable_height_m=1.00, tilt_from_vertical_deg=None,
+                            distance_kind="unknown")
+            est = bf.FillEstimator("realsense", Path(d), prof)
+            tilt = _profile(camera_to_empty_floor_m=1.10, tilt_from_vertical_deg=20.0)   # real tilt, unknown to it
+            bag = lambda x, y: np.where((np.abs(x) < 0.12) & (np.abs(y) < 0.12), 0.30, 0.0)
+            depth = _render(tilt, bag)
+            r = est.update(np.zeros((K.height, K.width, 3), np.uint8), depth, K, None, 0.0, 1.0)
+            self.assertEqual(r["geometry"], "auto-detected bin floor")
+            self.assertLess(r["height_fill_pct"], 15.0)
+            self.assertAlmostEqual(est.profile.tilt_from_vertical_deg, 20.0, delta=2.0)
+
+    def test_reset_refits_the_floor_and_rejects_a_hidden_floor(self) -> None:
+        with TemporaryDirectory() as d:
+            est = bf.FillEstimator("realsense", Path(d), _profile(camera_to_empty_floor_m=1.10))
+            full = _render(_profile(camera_to_empty_floor_m=1.10), lambda x, y: 0.60 + 0 * x)
+            self.assertFalse(est.recalibrate(full, K, None)["ok"])           # 50 cm away: waste, not floor
+            empty = _render(_profile(camera_to_empty_floor_m=1.10), lambda x, y: 0.0 * x)
+            got = est.recalibrate(empty, K, None)
+            self.assertTrue(got["ok"])
+            self.assertAlmostEqual(got["floor_cm"], 110.0, delta=1.0)
 
 
 if __name__ == "__main__":

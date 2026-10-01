@@ -22,8 +22,8 @@ BIN_FILL_PANEL = r"""{% raw %}
 <h2>Bin fill &amp; new deposits — each camera independently</h2>
 <div id="bf-session" class="bf-muted">Loading…</div>
 <div class="bf-grid"><div class="bf-card" id="bf-cam-realsense"></div><div class="bf-card" id="bf-cam-logitech"></div></div>
-<div class="bf-muted" style="margin-top:6px">Fill % = reliable waste-surface height ÷ 100 cm usable height. Litres = 660 L × that fraction: a <b>height-based approximation</b> (assumes roughly uniform filling; hidden voids unseen) — not a measured occupied volume. Bag volume = visible outer envelope, approximate; occupancy Δ is a separate whole-bin method.</div>
-<div style="margin-top:8px"><a class="bf-btn" href="/api/session-deposits.csv">Download deposits CSV (both cameras)</a> <button type="button" id="bf-new">New session</button></div>
+<div class="bf-muted" style="margin-top:6px">Fill = average waste height ÷ 100 cm bin height; litres = 660 L × fill (approximate).</div>
+<div style="margin-top:8px"><a class="bf-btn" href="/api/session-deposits.csv">Download deposits CSV (both cameras)</a> <button type="button" id="bf-new">Reset &amp; recalibrate</button></div>
 <details id="bf-settings" style="margin-top:8px"><summary>Installation settings (optional)</summary><div class="bf-set" id="bf-forms"></div>
 <div class="bf-muted">Only changed fields are saved; saved values persist and always win over defaults.</div></details>
 <script>
@@ -39,9 +39,8 @@ function card(id,r,w){w=w||{};let h='<b>'+name(id)+'</b> <span class="bf-muted">
  h+='<div><div class="bf-muted">≈ filled / remaining</div><div class="bf-big" style="font-size:18px">'+(ok?r.rough_litres+' L / '+r.rough_remaining_litres+' L':'—')+'</div></div>';
  h+='<div><div class="bf-muted">NEW bags this session</div><div class="bf-big">'+(w.new_bags||0)+'</div></div></div>';
  h+='<div class="'+(w.state==='watching'?'bf-ok':'bf-warn')+'">'+esc(STATE[w.state]||(w.state?w.state:'no frames yet'))+'</div>';
- if(ok)h+='<div>Reliable surface '+r.max_fill_height_cm+' cm of '+r.usable_height_cm+' cm'+(r.stale?' <span class="bf-warn">(last valid, '+age(r.last_valid_at)+': '+esc(r.stale_reason)+')</span>':'')+'</div>';
- else h+='<div class="bf-na">Fill unavailable: '+esc(r.reason)+'</div>';
- for(const x of r.warnings||[])h+='<div class="bf-warn">⚠ '+esc(x)+'</div>';
+ if(ok)h+='<div>Average waste height '+r.max_fill_height_cm+' cm · tallest '+r.tallest_cm+' cm · bin height '+r.usable_height_cm+' cm'+(r.stale?' <span class="bf-muted">(updated '+age(r.last_valid_at)+')</span>':'')+'</div>';
+ else h+='<div class="bf-muted">'+esc(r.reason)+'</div>';
  h+='<div class="bf-muted">Last frame '+t(r.last_processed_at)+' · last valid '+t(r.last_valid_at)+' · last deposit '+t(w.last_confirmed_at)+'</div>';
  h+='<div class="bf-muted">'+esc(r.depth_source||'')+(r.geometry?' · '+esc(r.geometry):'')+'</div>';
  if(w.latest_rejection)h+='<div class="bf-muted">'+w.rejected+' rejected — latest: '+esc(w.latest_rejection)+'</div>';
@@ -60,7 +59,7 @@ document.addEventListener('submit',async ev=>{const f=ev.target;if(!f.dataset||!
  for(const el of f.elements){if(el.name&&el.value!==el.dataset.orig)body[el.name]=el.value;}
  if(!Object.keys(body).length)return;const r=await fetch('/api/cameras/'+f.dataset.cam+'/fill-profile',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
  const j=await r.json();alert(r.ok?'Saved ('+j.status+')':'Not saved: '+(j.error||r.status));$('bf-settings').open=false;load();});
-$('bf-new').addEventListener('click',async()=>{if(!confirm('Start a new session? Both cameras\' NEW-bag counts return to 0.'))return;await fetch('/api/bin-fill/session/new',{method:'POST'});load();});
+$('bf-new').addEventListener('click',async()=>{if(!confirm('Reset: both NEW-bag counts return to 0 and each camera re-finds the empty bin floor (best with the bin floor visible).'))return;const r=await (await fetch('/api/bin-fill/recalibrate',{method:'POST'})).json();const c=r.cameras||{};alert(Object.entries(c).map(([k,x])=>name(k)+': '+(x.ok?'floor found at '+x.floor_cm+' cm, tilt '+x.tilt_deg+'°':x.reason)).join('\n'));load();});
 load();setInterval(load,1000);
 })();
 </script>

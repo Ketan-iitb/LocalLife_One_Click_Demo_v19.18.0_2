@@ -786,6 +786,22 @@ def create_app(
         return jsonify(ok=not profile.blocking(), status=profile.status, problems=problems,
                        blocking=profile.blocking(), pose_reference_saved=frame is not None)
 
+    @app.post("/api/bin-fill/recalibrate")
+    @protected
+    def recalibrate_bin_fill() -> Any:
+        """Reset: re-find each camera's empty bin floor in its own depth, and restart both counts at 0."""
+        result = {}
+        for camera_id, station in manager.pipelines.items():
+            if camera_id == "logitech":
+                depth = station.latest_monocular_depth
+                geometry = station.latest_intrinsics or (
+                    None if depth is None else station._field_of_view_intrinsics(depth.shape + (3,)))
+            else:
+                depth, geometry = station.latest_depth, station.latest_intrinsics
+            region = None if depth is None else station._measurement_region(depth.shape + (3,))
+            result[camera_id] = station.fill.recalibrate(depth, geometry, region)
+        return jsonify(ok=True, cameras=result, session=manager.deposits.new_session())
+
     @app.post("/api/bin-fill/session/new")
     @protected
     def new_deposit_session() -> Any:

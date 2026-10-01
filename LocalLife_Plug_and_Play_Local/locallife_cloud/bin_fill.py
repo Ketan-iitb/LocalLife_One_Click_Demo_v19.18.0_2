@@ -70,6 +70,9 @@ class FillProfile:
     capacity_verified: bool = False
     saved_at: float | None = None
     pose_edges: list[int] | None = None       # 64x48 edge thumbnail outside the bin at save time
+    floor_plane: list[float] | None = None    # (a, b, c): z = a x + b y + c, this camera's own empty floor
+    floor_scale: float = 1.0                  # Logitech: model depth -> metres from the 110 cm reference
+    floor_fitted_at: float | None = None
     source: str = "none"                      # "saved" | "default-provisional" | "none"
     notes: list[str] | None = None            # where each default came from
 
@@ -184,11 +187,14 @@ def fill_reading(cells: dict[tuple[int, int], float], coverage: float, profile: 
     usable = float(profile.usable_height_m)
     # Cells above the rim are waste heaped over it: the height fill saturates at 100 %.
     tops = np.clip(np.fromiter(cells.values(), dtype=np.float64), 0.0, usable)
-    fill = float(np.percentile(tops, 95)) if fill_m is None else float(min(max(fill_m, 0.0), usable))
+    # Fill = mean waste-surface height over the visible bin floor: a few bags in an empty bin
+    # give a few per cent, not the height of the tallest bag.
+    fill = float(tops.mean()) if fill_m is None else float(min(max(fill_m, 0.0), usable))
     fraction = fill / usable
     reading = {
         "status": "ok", "reason": None, "coverage_pct": round(100 * coverage, 1),
         "max_fill_height_cm": round(fill * 100, 1), "usable_height_cm": round(usable * 100, 1),
+        "tallest_cm": round(float(np.percentile(tops, 95)) * 100, 1),
         "height_fill_pct": round(100 * fraction, 1),
         "remaining_height_cm": round((usable - fill) * 100, 1),
         "rough_litres": round(profile.capacity_l * fraction, 1),
@@ -245,6 +251,8 @@ class FillEstimator:
         self.reading: dict[str, Any] = self._na("no settled frame processed yet")
         self.history: deque[tuple[float, dict[tuple[int, int], float]]] = deque(maxlen=60)
         self.fill_history: deque[tuple[float, float]] = deque(maxlen=SMOOTH_FRAMES)
+        self._last_fit_try = -1e9
+        self.last_maps: tuple[Any, float] = (None, 1.0)
         self.inconsistent = 0
 
     def _load(self) -> FillProfile:
@@ -318,33 +326,36 @@ class FillEstimator:
         if motion is not None and motion > STABLE_MOTION:
             return self._hold("scene moving", stale_only=True)
         depth_m, intrinsics, region = _subsample(depth_m, intrinsics, region)
-        if floor_plane is not None:
-            height, hx, hy = heights_above_plane(depth_m, intrinsics, floor_plane, region)
-            geometry = "saved empty-bin floor plane (measured pose)"
+        plane, scale = floor_plane, 1.0
+        if plane is not None:
+            geometry = "saved empty-bin floor plane"
         else:
-            height, hx, hy = heights_above_floor(depth_m, intrinsics, self.profile, region)
-            geometry = ("camera assumed looking straight down (tilt not measured)"
-                        if self.profile.tilt_from_vertical_deg is None else "measured tilt")
-        total = int(np.count_nonzero(region)) if region is not None else depth_m.size
+            if self.profile.floor_plane is None and timestamp - self._last_fit_try >= 5.0:
+                self._last_fit_try = timestamp
+                self.recalibrate(depth_m, intrinsics, region, automatic=True)
+            plane, scale = self.profile.floor_plane, float(self.profile.floor_scale or 1.0)
+            geometry = "auto-detected bin floor" if plane is not None else "camera assumed looking straight down"
+        height, flat, valid = surface_maps(depth_m, intrinsics, self.profile, plane, scale)
+        if region is not None:
+            valid &= region
         usable = self.profile.usable_height_m
-        below = height < -BELOW_FLOOR_M
-        keep = ~below & (height < usable + RIM_TOLERANCE_M)
-        coverage = float(np.count_nonzero(keep)) / max(1, total)
-        warnings = []
-        below_share = float(np.count_nonzero(below)) / max(1, height.size)
+        keep = valid & flat & (height > -BELOW_FLOOR_M) & (height < usable + RIM_TOLERANCE_M)
+        coverage = float(np.count_nonzero(keep)) / max(1, int(np.count_nonzero(valid)))
+        warnings: list[str] = []
+        below_share = float(np.count_nonzero(valid & (height < -BELOW_FLOOR_M))) / max(1, int(np.count_nonzero(valid)))
         if below_share > BELOW_FLOOR_SHARE:
-            deep = float(-np.percentile(height[below], 50)) * 100
-            warnings.append(f"depth quality: {below_share:.0%} of pixels lie ~{deep:.0f} cm below the assumed floor "
-                            f"({geometry}; floor reference {self.profile.camera_to_empty_floor_m * 100:.0f} cm). "
-                            "Likely a tilted camera read as straight down, or the floor reference is short -- "
-                            "enter tilt or capture an empty-bin baseline. These pixels are excluded, not clamped.")
-        if coverage < MIN_COVERAGE:
-            return self._hold(f"only {coverage:.0%} of the bin region has valid depth", warnings=warnings)
-        cells = cell_tops(height[keep], hx[keep], hy[keep])
+            warnings.append(f"{below_share:.0%} of depth below the floor reference")   # API only, not shown
+        if coverage < MIN_COVERAGE or np.count_nonzero(keep) < 30:
+            return self._hold("waiting for a clear view of the bin surface", warnings=warnings)
+        rows, cols = np.nonzero(keep)
+        z = depth_m[rows, cols] * scale
+        hx = (cols - intrinsics.ppx) * z / intrinsics.fx
+        hy = (rows - intrinsics.ppy) * z / intrinsics.fy
+        cells = cell_tops(height[keep].astype(np.float64), hx, hy)
         if len(cells) < 8:
-            return self._hold("too few surface cells with valid depth", warnings=warnings)
+            return self._hold("waiting for a clear view of the bin surface", warnings=warnings)
         reading = fill_reading(cells, coverage, self.profile)
-        frame_fill = reading["max_fill_height_cm"] / 100.0
+        frame_fill = reading["max_fill_height_cm"] / 100.0    # mean surface height, metres
         recent = [v for _, v in self.fill_history]
         if len(recent) >= 3 and abs(frame_fill - float(np.median(recent))) > INCONSISTENT_M:
             self.inconsistent += 1
@@ -356,12 +367,68 @@ class FillEstimator:
         self.fill_history.append((timestamp, frame_fill))
         smoothed = float(np.median([v for _, v in self.fill_history]))
         reading = fill_reading(cells, coverage, self.profile, fill_m=smoothed)
+        self.last_maps = (plane, scale)
         self.history.append((timestamp, cells))
         self.last_valid_at = timestamp
         self.reading = {**reading, "camera_id": self.camera_id, "updated_at": timestamp, "stale": False,
                         "warnings": warnings, "geometry": geometry, "depth_source": depth_label,
                         "frames_smoothed": len(self.fill_history)}
         return self._decorate(self.reading)
+
+    def recalibrate(self, depth_m: np.ndarray | None, intrinsics: Any, region: np.ndarray | None,
+                    *, automatic: bool = False) -> dict[str, Any]:
+        """Find this camera's EMPTY bin floor in its own depth and keep it (reset button / first start).
+
+        RealSense depth is metric: the floor must lie 80-140 cm away (110 cm reference).
+        Logitech depth is model depth: its scale is set so the floor sits at the reference.
+        """
+        if depth_m is None or intrinsics is None:
+            return {"ok": False, "reason": "no depth frame yet"}
+        depth_m, intrinsics, region = _subsample(depth_m, intrinsics, region)
+        fit = fit_floor_plane(depth_m, intrinsics, region)
+        if fit is None:
+            return {"ok": False, "reason": "bin floor not visible (cover <15% of the view) -- empty the bin and retry"}
+        plane, distance, share = fit
+        reference = float(self.profile.camera_to_empty_floor_m or DEFAULT_FLOOR_DISTANCE_M)
+        if self.camera_id == "logitech":
+            if automatic and share < 0.35:
+                return {"ok": False, "reason": "floor not clearly visible yet (automatic fit needs an open floor)"}
+            scale = reference / distance
+        else:
+            if automatic and abs(distance - reference) > 0.12:
+                # A waste layer is flat too: unattended, only a surface at the floor reference is the floor.
+                return {"ok": False, "reason": f"deepest flat surface at {distance * 100:.0f} cm, not the "
+                                               f"{reference * 100:.0f} cm floor"}
+            if not 0.80 <= distance <= 1.40:
+                return {"ok": False, "reason": f"deepest flat surface is {distance * 100:.0f} cm away, not near the "
+                                               f"{reference * 100:.0f} cm floor -- floor hidden by waste?"}
+            scale = 1.0
+        self.profile.floor_plane = [float(v) for v in plane]
+        self.profile.floor_scale = float(scale)
+        self.profile.floor_fitted_at = time.time()
+        a, b, _ = plane
+        self.profile.tilt_from_vertical_deg = round(math.degrees(math.atan(math.hypot(a, b))), 1)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(asdict(self.profile)), encoding="utf-8")
+        except OSError:
+            pass
+        self.fill_history.clear()
+        return {"ok": True, "floor_cm": round(distance * scale * 100, 1), "tilt_deg": self.profile.tilt_from_vertical_deg,
+                "floor_share": round(share, 2), "scale": round(scale, 3), "automatic": automatic}
+
+    def height_map_small(self, depth_m: np.ndarray, intrinsics: Any):
+        """(height above floor, pixel area m^2, x, y metres) for the deposit counter's small view, or None."""
+        plane, scale = self.profile.floor_plane, float(self.profile.floor_scale or 1.0)
+        if self.profile.blocking():
+            return None
+        height, _, valid = surface_maps(depth_m, intrinsics, self.profile, plane, scale)
+        z = depth_m * scale
+        v, u = np.indices(depth_m.shape)
+        x, y = (u - intrinsics.ppx) * z / intrinsics.fx, (v - intrinsics.ppy) * z / intrinsics.fy
+        area = (z / intrinsics.fx) * (z / intrinsics.fy)
+        return (np.where(valid, height, np.nan).astype(np.float32), area.astype(np.float32),
+                x.astype(np.float32), y.astype(np.float32))
 
     def _hold(self, reason: str, *, warnings: list[str] | None = None, stale_only: bool = False) -> dict[str, Any]:
         """Keep the last valid reading (marked stale, with its age) instead of inventing a fresh one."""
@@ -412,6 +479,73 @@ def default_profile(camera_id: str, config: Any) -> FillProfile:
     return FillProfile(camera_id=camera_id, camera_to_empty_floor_m=distance_m, usable_height_m=DEFAULT_USABLE_HEIGHT_M,
                        camera_above_rim_m=DEFAULT_ABOVE_RIM_M, source="default-provisional",
                        notes=[f"floor reference {distance_m * 100:.0f} cm: {why}"] + notes)
+
+
+def fit_floor_plane(depth_m: np.ndarray, intrinsics: Any, region: np.ndarray | None = None,
+                    iterations: int = 150) -> tuple[tuple[float, float, float], float, float] | None:
+    """RANSAC plane through the DEEPEST visible points: the empty bin floor, when it is visible.
+
+    Returns ((a, b, c) with z = a x + b y + c, perpendicular distance, floor share of the view).
+    """
+    valid = (depth_m > 0.05) & np.isfinite(depth_m) & (True if region is None else region)
+    rows, cols = np.nonzero(valid)
+    if rows.size < 200:
+        return None
+    z = depth_m[rows, cols].astype(np.float64)
+    x = (cols - intrinsics.ppx) * z / intrinsics.fx
+    y = (rows - intrinsics.ppy) * z / intrinsics.fy
+    deep = z >= np.percentile(z, 70)
+    P = np.c_[x[deep], y[deep], z[deep]]
+    tolerance = 0.02 * float(np.median(z))
+    rng = np.random.default_rng(0)
+    best, best_count = None, 0
+    for _ in range(iterations):
+        sample = P[rng.choice(len(P), 3, replace=False)]
+        A = np.c_[sample[:, :2], np.ones(3)]
+        try:
+            coef = np.linalg.solve(A, sample[:, 2])
+        except np.linalg.LinAlgError:
+            continue
+        if math.hypot(coef[0], coef[1]) > 1.2:              # steeper than ~50 deg: a wall, not a floor
+            continue
+        count = int(np.count_nonzero(np.abs(np.c_[x, y, np.ones_like(x)] @ coef - z) < tolerance))
+        if count > best_count:
+            best, best_count = coef, count
+    if best is None:
+        return None
+    inliers = np.abs(np.c_[x, y, np.ones_like(x)] @ best - z) < tolerance
+    share = float(np.count_nonzero(inliers)) / rows.size
+    if share < 0.15:
+        return None
+    coef, *_ = np.linalg.lstsq(np.c_[x[inliers], y[inliers], np.ones(int(inliers.sum()))], z[inliers], rcond=None)
+    a, b, c = (float(v) for v in coef)
+    return (a, b, c), abs(c) / math.sqrt(a * a + b * b + 1.0), share
+
+
+def surface_maps(depth_m: np.ndarray, intrinsics: Any, profile: FillProfile, plane, scale: float = 1.0):
+    """2-D (height above floor, upward-facing mask, valid mask). Walls (steep surfaces) are not waste tops."""
+    valid = (depth_m > 0.05) & np.isfinite(depth_m)
+    z = np.where(valid, depth_m, np.nan).astype(np.float64)
+    v, u = np.indices(depth_m.shape)
+    x = (u - intrinsics.ppx) * z / intrinsics.fx
+    y = (v - intrinsics.ppy) * z / intrinsics.fy
+    if plane is not None:
+        a, b, c = plane
+        norm = math.sqrt(a * a + b * b + 1.0)
+        height = (a * x + b * y + c - z) / norm * scale
+        up = np.array([a, b, -1.0]) / norm
+    else:
+        tilt = math.radians(profile.tilt_from_vertical_deg or 0.0)
+        up = np.array([0.0, -math.sin(tilt), -math.cos(tilt)])
+        height = profile.vertical_height_m() + up[1] * y + up[2] * z
+    gx = [np.gradient(m, axis=1) for m in (x, y, z)]
+    gy = [np.gradient(m, axis=0) for m in (x, y, z)]
+    normal = np.cross(np.stack(gx, -1), np.stack(gy, -1))
+    length = np.linalg.norm(normal, axis=-1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        facing = np.abs(normal @ up) / length
+    flat = np.nan_to_num(facing) >= math.cos(math.radians(55))
+    return np.nan_to_num(height, nan=-9.0), flat, valid & np.isfinite(height)
 
 
 def _subsample(depth_m: np.ndarray, intrinsics: Any, region: np.ndarray | None, target: int = 160):

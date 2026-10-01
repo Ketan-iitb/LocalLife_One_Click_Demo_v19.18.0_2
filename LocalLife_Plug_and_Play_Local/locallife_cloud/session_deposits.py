@@ -102,6 +102,9 @@ class FrameEvidence:
     depth: np.ndarray | None = None                 # SMALL metres (RealSense aligned depth)
     heights: np.ndarray | None = None               # SMALL height above floor (approximate/measured pose)
     height_status: str | None = None                # profile status behind `heights`
+    area: np.ndarray | None = None                  # SMALL floor area per pixel (m^2)
+    xs: np.ndarray | None = None                    # SMALL camera x, y (m) for footprint L x W
+    ys: np.ndarray | None = None
 
 
 def _changed(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -295,6 +298,20 @@ class CameraWatcher:
         is_here = ev.grey[added].astype(np.float32).reshape(-1, ev.grey.shape[-1] if ev.grey.ndim == 3 else 1)
         return float(np.abs(np.median(was_there, axis=0) - np.median(is_here, axis=0)).max()) < 25.0
 
+    def _removed(self, ev: FrameEvidence, before: FrameEvidence, area_mask: np.ndarray) -> bool:
+        """Was something TAKEN OUT here? Lifting the top bag reveals the one below: not a new deposit."""
+        if ev.heights is not None and before.heights is not None and ev.heights.shape == before.heights.shape:
+            diff = (ev.heights - before.heights)[area_mask]
+            diff = diff[np.isfinite(diff)]
+            if diff.size >= 10:
+                return float(np.median(diff)) < -0.04
+        current = {t.track_id for t in ev.tracks}
+        gone = [t for t in before.tracks if t.track_id not in current]
+        inside = np.zeros_like(area_mask)
+        for t in gone:
+            inside |= _box_mask(t.box, area_mask.shape)
+        return bool(gone) and np.count_nonzero(area_mask & inside) >= 0.6 * max(1, np.count_nonzero(area_mask))
+
     def _evaluate(self, ev: FrameEvidence) -> tuple[str, dict[str, Any]]:
         before = self.committed
         region = ev.region if ev.region.any() else np.ones_like(ev.region)
@@ -317,6 +334,8 @@ class CameraWatcher:
         for t in sorted(new_tracks, key=lambda t: -changed_share(t.box)):
             if changed_share(t.box) >= 0.10:
                 added = _box_mask(t.box, change.shape) & change
+                if self._removed(ev, before, added):
+                    return "rejected", {**details, "reason": "a bag was removed; the one revealed below is not new"}
                 if self._vacated(ev, before, change, added, region):
                     return "rejected", {**details, "reason": "an existing bag moved: its old spot was vacated"}
                 return "confirmed", {**details, "evidence": "new bag-like track over a persistent change",
@@ -354,6 +373,8 @@ class CameraWatcher:
             largest, labels, n, stats = int(np.count_nonzero(rest)), None, 0, None
         if largest < 0.6 * np.count_nonzero(rest) or largest < MIN_CHANGE * total:
             return "rejected", {**details, "reason": "scattered change, not one new object"}
+        if self._removed(ev, before, rest):
+            return "rejected", {**details, "reason": "a bag was removed; the one revealed below is not new"}
         if self._vacated(ev, before, change, rest, region):
             return "rejected", {**details, "reason": "an existing bag moved: its old spot was vacated"}
         second = int(np.sort(stats[1:, cv2.CC_STAT_AREA])[-2]) if n > 2 else 0
@@ -541,13 +562,30 @@ class SessionDeposits:
                 if diff.size >= 6:
                     added = float(np.percentile(diff, 90))
                     source = "local depth rise along the line of sight (pose unknown, approximate)"
+        volume = None
+        if mask is not None and mask.any() and ev.heights is not None and before is not None \
+                and before.heights is not None and ev.area is not None:
+            rise = (ev.heights - before.heights)
+            bag = mask & np.isfinite(rise) & (rise > 0.02)
+            if np.count_nonzero(bag) >= 6:
+                volume = round(float(np.sum(rise[bag] * ev.area[bag])) * 1000.0, 1)   # litres under the bag top
+                if ev.xs is not None and length is None:
+                    try:
+                        import cv2
+                        pts = np.c_[ev.xs[bag], ev.ys[bag]].astype(np.float32)
+                        (_, _), (w1, w2), _ = cv2.minAreaRect(pts)
+                        length, width = max(w1, w2) * 100.0, min(w1, w2) * 100.0
+                        reasons = [r for r in reasons if not r.startswith("no single tracked bag")]
+                    except ImportError:  # pragma: no cover
+                        pass
         if added is not None:
             height = added * 100.0
         elif track is not None and track.height_mm and not track.rejection:
             height, source = track.height_mm / 10.0, "detector height (surface under the bag not measured)"
         else:
             reasons.append("no reliable before/after surface under the bag (hidden, occluded or no depth)")
-        envelope = round(length * width * height / 1000.0, 1) if length and width and height else None
+        envelope = volume if volume is not None else (
+            round(length * width * height / 1000.0, 1) if length and width and height else None)
         if envelope is None:
             status = "partial" if (length or height) else "na"
         elif source and source.startswith("after top") and "measured" in source:
