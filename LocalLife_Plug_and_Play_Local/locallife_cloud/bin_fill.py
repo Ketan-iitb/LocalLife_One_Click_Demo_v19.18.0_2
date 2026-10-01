@@ -75,6 +75,7 @@ class FillProfile:
     floor_scale: float = 1.0                  # Logitech: model depth -> metres from the 110 cm reference
     floor_fitted_at: float | None = None
     floor_raw_distance: float | None = None   # in this camera's own depth units (the floor is the DEEPEST plane)
+    outside_reference: float | None = None    # median raw depth OUTSIDE the bin region at fit time (walls/rim)
     source: str = "none"                      # "saved" | "default-provisional" | "none"
     notes: list[str] | None = None            # where each default came from
 
@@ -336,6 +337,8 @@ class FillEstimator:
             # Nothing detected in the bin: the deepest flat surface is the floor -- refresh it (plug and play).
             self._last_refit = timestamp
             self.recalibrate(depth_m, intrinsics, region, automatic=True)
+        self.last_drift = self.drift(depth_m, region)
+        depth_m = depth_m / self.last_drift
         plane, scale = floor_plane, 1.0
         if plane is not None:
             geometry = "saved empty-bin floor plane"
@@ -356,7 +359,13 @@ class FillEstimator:
         if below_share > BELOW_FLOOR_SHARE:
             warnings.append(f"{below_share:.0%} of depth below the floor reference")   # API only, not shown
         if coverage < MIN_COVERAGE or np.count_nonzero(keep) < 30:
+            # Self-heal: a floor that leaves no valid surface for 20 s is wrong (stale or a drifted fit).
+            self._blind_since = getattr(self, "_blind_since", None) or timestamp
+            if self.profile.floor_plane is not None and timestamp - self._blind_since > 20.0:
+                self.forget_floor()
+                self._blind_since = None
             return self._hold("waiting for a clear view of the bin surface", warnings=warnings)
+        self._blind_since = None
         rows, cols = np.nonzero(keep)
         z = depth_m[rows, cols] * scale
         hx = (cols - intrinsics.ppx) * z / intrinsics.fx
@@ -403,6 +412,8 @@ class FillEstimator:
         if depth_m is None or intrinsics is None:
             return {"ok": False, "reason": "no depth frame yet"}
         depth_m, intrinsics, region = _subsample(depth_m, intrinsics, region)
+        drift = self.drift(depth_m, region)
+        depth_m = depth_m / drift
         fit = fit_floor_plane(depth_m, intrinsics, region)
         if fit is None:
             return {"ok": False, "reason": "bin floor not visible (cover <15% of the view) -- empty the bin and retry"}
@@ -429,6 +440,10 @@ class FillEstimator:
         self.profile.floor_scale = float(scale)
         self.profile.floor_fitted_at = time.time()
         self.profile.floor_raw_distance = float(distance)
+        if region is not None and region.shape == depth_m.shape:
+            outside = (~region) & np.isfinite(depth_m) & (depth_m > 0.05)
+            self.profile.outside_reference = (float(np.median(depth_m[outside])) * drift
+                                              if np.count_nonzero(outside) >= 50 else None)
         a, b, _ = plane
         self.profile.tilt_from_vertical_deg = round(math.degrees(math.atan(math.hypot(a, b))), 1)
         try:
@@ -440,11 +455,37 @@ class FillEstimator:
         return {"ok": True, "floor_cm": round(distance * scale * 100, 1), "tilt_deg": self.profile.tilt_from_vertical_deg,
                 "floor_share": round(share, 2), "scale": round(scale, 3), "automatic": automatic}
 
+    def forget_floor(self) -> None:
+        """Drop the fitted floor (reset / self-heal); it is re-found automatically from the next frames."""
+        self.profile.floor_plane = None
+        self.profile.floor_raw_distance = None
+        self.profile.outside_reference = None
+        self.profile.floor_scale = 1.0
+        self.fill_history.clear()
+        self._last_fit_try = -1e9
+        try:
+            self.path.write_text(json.dumps(asdict(self.profile)), encoding="utf-8")
+        except OSError:
+            pass
+
+    def drift(self, depth_m: np.ndarray, region: np.ndarray | None) -> float:
+        """Monocular depth rescales the whole scene from frame to frame. The walls/rim OUTSIDE the bin
+        do not change, so their median depth now vs. at the floor fit gives this frame's scale drift."""
+        ref = self.profile.outside_reference
+        if self.camera_id != "logitech" or not ref or region is None or region.shape != depth_m.shape:
+            return 1.0
+        outside = (~region) & np.isfinite(depth_m) & (depth_m > 0.05)
+        if np.count_nonzero(outside) < 50:
+            return 1.0
+        ratio = float(np.median(depth_m[outside])) / ref
+        return ratio if 0.5 < ratio < 2.0 else 1.0
+
     def height_map_small(self, depth_m: np.ndarray, intrinsics: Any):
         """(height above floor, pixel area m^2, x, y metres) for the deposit counter's small view, or None."""
         plane, scale = self.profile.floor_plane, float(self.profile.floor_scale or 1.0)
         if self.profile.blocking():
             return None
+        depth_m = depth_m / getattr(self, "last_drift", 1.0)
         height, _, valid = surface_maps(depth_m, intrinsics, self.profile, plane, scale)
         z = depth_m * scale
         v, u = np.indices(depth_m.shape)
@@ -461,7 +502,7 @@ class FillEstimator:
         measured from the pile, not from the bin floor. None when the map is stale or support unclear.
         """
         surface = getattr(self, "last_surface", None)
-        if not surface or now - surface["at"] > 2.0:
+        if not surface or now - surface["at"] > 10.0:      # the pile changes slowly; settled maps stay valid
             return None
         step, height, ok, area = surface["step"], surface["height"], surface["ok"], surface["area"]
         h, w = height.shape

@@ -343,5 +343,29 @@ class V47VolumeTests(unittest.TestCase):
             self.assertAlmostEqual(est.profile.floor_raw_distance, 1.10, delta=0.02)
 
 
+
+class V47LogitechDriftTests(unittest.TestCase):
+    def test_frame_to_frame_scale_drift_is_cancelled_and_a_bad_floor_self_heals(self) -> None:
+        with TemporaryDirectory() as d:
+            prof = _profile(camera_to_empty_floor_m=1.10, usable_height_m=1.00)
+            est = bf.FillEstimator("logitech", Path(d), prof)
+            region = np.zeros((K.height, K.width), bool)
+            region[15:105, 20:140] = True
+            frame = np.zeros((K.height, K.width, 3), np.uint8)
+            self.assertTrue(est.recalibrate(_render(prof, lambda x, y: 0 * x), K, region)["ok"])
+            scene = _render(prof, lambda x, y: np.where(np.abs(x) < 0.12, 0.40, 0.0))
+            first = est.update(frame, scene, K, region, 0.0, 1.0)["height_fill_pct"]
+            est.fill_history.clear()
+            drifted = est.update(frame, scene * 1.3, K, region, 0.0, 2.0)["height_fill_pct"]   # model rescaled
+            self.assertGreater(first, 5.0)
+            self.assertLess(abs(drifted - first), 1.5, (first, drifted))
+            # A wrong stored floor that leaves no valid surface is dropped after 20 s and re-found.
+            est.profile.floor_plane = [0.0, 0.0, 9.0]
+            est.profile.outside_reference = None
+            for t in (10.0, 25.0, 40.0):
+                est.update(frame, scene, K, region, 0.0, t)
+            self.assertNotEqual(est.profile.floor_plane, [0.0, 0.0, 9.0])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -851,7 +851,12 @@ def create_app(
     @app.post("/api/bin-fill/session/new")
     @protected
     def new_deposit_session() -> Any:
-        """Explicit new deposit session: count back to 0, baseline re-taken. A page refresh never does this."""
+        """Explicit new deposit session: count back to 0, baseline re-taken. A page refresh never does this.
+
+        Each camera's fitted floor is also forgotten and re-found automatically from the next frames.
+        """
+        for station in manager.pipelines.values():
+            station.fill.forget_floor()
         return jsonify(ok=True, session=manager.deposits.new_session())
 
     @app.get("/api/cameras/<camera_id>/stages")
