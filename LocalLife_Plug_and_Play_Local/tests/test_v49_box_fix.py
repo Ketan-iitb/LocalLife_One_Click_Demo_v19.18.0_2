@@ -397,3 +397,25 @@ class CostVsAccuracyTests(unittest.TestCase):
                                          {"all": {"throughput_fps": 8}, "quality": {"status": "Not evaluated"}},
                                          None, None, "SEK")
         self.assertTrue(all(r["cloud"] in ("N/A", "-") or str(r["cloud"]).startswith("N/A") for r in missing))
+
+    def test_cloud_rate_comes_only_from_a_sourced_file_and_is_never_built_in(self):
+        import json as _json
+        sys.path.insert(0, str(PROJECT / "scripts"))
+        import benchmark_local_cloud as bench
+        rate, _, note = bench.load_cloud_rate(None, "g2-standard-4+nvidia-l4", False)
+        self.assertIsNone(rate)                                   # no file -> N/A, no invented price
+        example = _json.loads((PROJECT / "scripts" / "cloud_rates.example.json").read_text(encoding="utf-8"))
+        self.assertTrue(all(v["on_demand_per_hour"] is None for v in example["shapes"].values()))
+        with TemporaryDirectory() as d:
+            path = Path(d) / "rates.json"
+            example["shapes"]["n1-standard-8+nvidia-tesla-t4"]["on_demand_per_hour"] = 0.5
+            path.write_text(_json.dumps(example), encoding="utf-8")
+            rate, _, note = bench.load_cloud_rate(str(path), "n1-standard-8+nvidia-tesla-t4", False)
+            self.assertEqual(rate, 0.5)
+            self.assertTrue(note.startswith("UNVERIFIED"))          # no as_of date -> flagged
+            example["as_of"] = "2026-10-02"
+            path.write_text(_json.dumps(example), encoding="utf-8")
+            self.assertFalse(bench.load_cloud_rate(str(path), "n1-standard-8+nvidia-tesla-t4", False)[2]
+                             .startswith("UNVERIFIED"))
+        svg = bench.cost_accuracy_svg([{"metric": "cost per 1000 frames (USD)", "local": "N/A", "cloud": "N/A"}], "USD")
+        self.assertIn("Not plotted", svg)                           # no data -> no fake points

@@ -434,6 +434,64 @@ def cost_vs_accuracy(local: dict[str, Any], cloud: dict[str, Any], local_rate: f
     return rows
 
 
+def load_cloud_rate(path: str | None, shape: str | None, spot: bool) -> tuple[float | None, str, str]:
+    """(rate per hour, currency, provenance) from a filled cloud_rates.json; never a built-in price."""
+    if not path:
+        return None, "USD", "no rates file (--rates); cost N/A"
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    entry = (data.get("shapes") or {}).get(shape or "", {})
+    rate = entry.get("spot_per_hour" if spot else "on_demand_per_hour")
+    if rate is None:
+        return None, data.get("currency", "USD"), f"no {'spot' if spot else 'on-demand'} rate for {shape!r} in {path}"
+    verified = bool(data.get("source")) and bool(data.get("as_of"))
+    note = (f"{shape}, {'spot' if spot else 'on-demand'}, zone {data.get('zone') or '?'}, "
+            f"source {data.get('source') or '-'}, as of {data.get('as_of') or '-'}")
+    return float(rate), data.get("currency", "USD"), ("" if verified else "UNVERIFIED: ") + note
+
+
+def cost_accuracy_svg(rows: list[dict[str, Any]], currency: str) -> str:
+    """Cost per 1000 frames (x) vs median volume error % (y), one point per mode; no point is drawn
+    for a mode without BOTH a measured cost and a ground-truth error (nothing is invented)."""
+    get = {r["metric"]: r for r in rows}
+    cost = get.get(f"cost per 1000 frames ({currency})", {})
+    err = get.get("volume error % (median, lower is better)", {})
+    pts = [(mode, cost.get(mode), err.get(mode)) for mode in ("local", "cloud")]
+    pts = [(m, float(c), float(e)) for m, c, e in pts if isinstance(c, (int, float)) and isinstance(e, (int, float))]
+    w, h, l, r_, t, b = 560, 380, 70, 30, 40, 70
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}" '
+           'font-family="sans-serif" font-size="12">',
+           f'<rect width="{w}" height="{h}" fill="white"/>',
+           f'<text x="{l}" y="22" font-size="14" font-weight="bold">Cost vs accuracy (same replay)</text>',
+           f'<line x1="{l}" y1="{h - b}" x2="{w - r_}" y2="{h - b}" stroke="#333"/>',
+           f'<line x1="{l}" y1="{t}" x2="{l}" y2="{h - b}" stroke="#333"/>',
+           f'<text x="{(l + w - r_) / 2}" y="{h - 16}" text-anchor="middle">cost per 1000 frames ({currency})</text>',
+           f'<text x="18" y="{(t + h - b) / 2}" text-anchor="middle" transform="rotate(-90 18 {(t + h - b) / 2})">'
+           'median volume error % (lower is better)</text>']
+    if not pts:
+        out.append(f'<text x="{(l + w - r_) / 2}" y="{(t + h - b) / 2}" text-anchor="middle" fill="#a33">'
+                   'Not plotted: needs a rate (--rates) and ground truth (--truth) for a mode</text>')
+    else:
+        xmax = max(max(c for _, c, _ in pts) * 1.25, 1e-6)
+        ymax = max(max(e for _, _, e in pts) * 1.25, 1.0)
+        for i in range(5):                                       # gridlines with values
+            yv, xv = ymax * i / 4, xmax * i / 4
+            y = h - b - (h - t - b) * i / 4
+            x = l + (w - l - r_) * i / 4
+            out.append(f'<line x1="{l}" y1="{y:.1f}" x2="{w - r_}" y2="{y:.1f}" stroke="#ddd"/>'
+                       f'<text x="{l - 6}" y="{y + 4:.1f}" text-anchor="end">{yv:.1f}</text>'
+                       f'<text x="{x:.1f}" y="{h - b + 18}" text-anchor="middle">{xv:.3f}</text>')
+        for mode, c, e in pts:
+            x = l + (w - l - r_) * c / xmax
+            y = h - b - (h - t - b) * e / ymax
+            colour = "#1f6feb" if mode == "local" else "#d1242f"
+            right = x > l + 0.55 * (w - l - r_)                   # keep the label inside the plot
+            out.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="6" fill="{colour}"/>'
+                       f'<text x="{x - 9 if right else x + 9:.1f}" y="{y - 10:.1f}" '
+                       f'text-anchor="{"end" if right else "start"}">{mode}: {c:.4f} {currency}, {e:.1f} %</text>')
+    out.append("</svg>")
+    return "\n".join(out)
+
+
 def compare(args: argparse.Namespace) -> int:
     runs = [json.loads((Path(p) / "run_summary.json").read_text(encoding="utf-8")) for p in args.runs]
     by_mode = {r["metadata"]["server_processing_mode"]: r for r in runs}
@@ -485,10 +543,25 @@ def compare(args: argparse.Namespace) -> int:
     lines.append(f"Local run {local['metadata']['run_id']}, cloud run {cloud['metadata']['run_id']}; "
                  f"network: {cloud['metadata'].get('network')}; cloud GPU: {(cloud['metadata'].get('server_gpu') or {}).get('name')}.")
     lines += [f"WARNING: {w}" for w in warnings]
-    cloud_rate = args.cloud_cost_per_hour
+    cloud_rate, currency, provenance = load_cloud_rate(args.rates, args.shape, args.spot)
+    if cloud_rate is None and args.cloud_cost_per_hour is not None:
+        cloud_rate, currency, provenance = args.cloud_cost_per_hour, args.currency, "UNVERIFIED: --cloud-cost-per-hour"
     if cloud_rate is None and os.environ.get("LOCALLIFE_CLOUD_COST_PER_HOUR", "").strip():
-        cloud_rate = float(os.environ["LOCALLIFE_CLOUD_COST_PER_HOUR"])
-    cva = cost_vs_accuracy(local, cloud, args.local_cost_per_hour, cloud_rate, args.currency)
+        cloud_rate, currency = float(os.environ["LOCALLIFE_CLOUD_COST_PER_HOUR"]), args.currency
+        provenance = "UNVERIFIED: LOCALLIFE_CLOUD_COST_PER_HOUR"
+    cva = cost_vs_accuracy(local, cloud, args.local_cost_per_hour, cloud_rate, currency)
+    # Separate section for the professor's cost-vs-accuracy question: its own file and chart.
+    (out / "cost_vs_accuracy.svg").write_text(cost_accuracy_svg(cva, currency), encoding="utf-8")
+    section = ["# Cost vs accuracy: local laptop vs cloud GPU", "",
+               f"Same recorded frames replayed in both modes. Cloud rate: {provenance}.",
+               "Cost = rate per running hour / measured throughput; excludes the stopped-VM disk, images, "
+               "egress and laptop power unless --local-cost-per-hour is given. Accuracy only from --truth.", "",
+               "| Metric | Local | Cloud |", "|---|---|---|"]
+    section += [f"| {r['metric']} | {r['local']} | {r['cloud']} |" for r in cva]
+    section += ["", "![cost vs accuracy](cost_vs_accuracy.svg)"]
+    if warnings:
+        section += ["", "NOT MATCHED runs -- no better/worse conclusion: " + "; ".join(warnings)]
+    (out / "cost_vs_accuracy.md").write_text("\n".join(section) + "\n", encoding="utf-8")
     with (out / "cost_vs_accuracy.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=["metric", "local", "cloud"])
         writer.writeheader()
@@ -524,7 +597,11 @@ def main(argv: list[str] | None = None) -> int:
                    help="VM running rate (default: LOCALLIFE_CLOUD_COST_PER_HOUR); N/A when unset")
     c.add_argument("--local-cost-per-hour", type=float, default=None,
                    help="optional laptop running cost (power); N/A when unset")
-    c.add_argument("--currency", default="SEK")
+    c.add_argument("--currency", default="USD")
+    c.add_argument("--rates", help="filled cloud_rates.json (see scripts/cloud_rates.example.json)")
+    c.add_argument("--shape", default="g2-standard-4+nvidia-l4",
+                   help="key in the rates file for the VM the cloud run used (gpu.py status)")
+    c.add_argument("--spot", action="store_true", help="the cloud run used a Spot VM")
     args = parser.parse_args(argv)
     return run(args) if args.command == "run" else compare(args)
 
