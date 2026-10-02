@@ -43,7 +43,7 @@ BELOW_FLOOR_M = 0.10            # a pixel this far below the floor reference is 
 BELOW_FLOOR_SHARE = 0.05         # more than this share of such pixels -> visible quality warning
 INCONSISTENT_M = 0.15            # a single frame this far from the recent median is not trusted
 SMOOTH_FRAMES = 5
-PILE_M = 0.15                    # undetected flat surface this high is still waste (crowded pile)
+FLOOR_NOISE_M = 0.03             # surface this close to the fitted floor is floor
 STABLE_MOTION = 0.02             # scene motion fraction below which a frame is "settled"
 MOVED_EDGE_CORRELATION = 0.45    # thumbnail edge correlation outside the bin below this: camera moved
 HEIGHT_FILL_LABEL = "rough height-based equivalent; assumes roughly uniform filling"
@@ -295,6 +295,7 @@ class FillEstimator:
         return problems
 
     def _decorate(self, reading: dict[str, Any]) -> dict[str, Any]:
+        reading["diagnostics"] = dict(getattr(self, "last_diag", {}) or {})
         reading.update(profile_status=self.profile.status, profile_source=self.profile.source,
                        assumptions=self.profile.assumptions(), last_processed_at=self.last_processed_at,
                        last_valid_at=self.last_valid_at)
@@ -351,9 +352,24 @@ class FillEstimator:
         height, flat, valid = surface_maps(depth_m, intrinsics, self.profile, plane, scale)
         if region is not None:
             valid &= region
+        a_, b_, c_ = plane if plane is not None else (0.0, 0.0, None)
+        self.last_diag = {
+            "floor_source": geometry, "depth_source": depth_label,
+            "floor_distance_cm": None if c_ is None else round(abs(c_) / math.sqrt(a_ * a_ + b_ * b_ + 1) * scale * 100, 1),
+            "tilt_deg": round(math.degrees(math.atan(math.hypot(a_, b_))), 1) if plane is not None
+            else self.profile.tilt_from_vertical_deg,
+            "depth_scale": round(scale, 3), "scale_drift": round(float(self.last_drift), 3),
+            "valid_depth_pct": round(100.0 * np.count_nonzero(valid) / max(1, valid.size if region is None
+                                                                           else int(np.count_nonzero(region))), 1),
+            "statistic": "mean over 5 cm floor cells of the surface top (p90 per cell); < 3 cm = floor",
+            "usable_height_cm": round(self.profile.usable_height_m * 100, 1), "frame_at": timestamp,
+        }
         usable = self.profile.usable_height_m
         keep = valid & flat & (height > -BELOW_FLOOR_M) & (height < usable + RIM_TOLERANCE_M)
         coverage = float(np.count_nonzero(keep)) / max(1, int(np.count_nonzero(valid)))
+        self.last_diag.update(surface_coverage_pct=round(100 * coverage, 1),
+                              detected_area_pct=None if objects is None or not objects.size
+                              else round(100.0 * np.count_nonzero(objects) / objects.size, 1))
         warnings: list[str] = []
         below_share = float(np.count_nonzero(valid & (height < -BELOW_FLOOR_M))) / max(1, int(np.count_nonzero(valid)))
         if below_share > BELOW_FLOOR_SHARE:
@@ -371,13 +387,12 @@ class FillEstimator:
         hx = (cols - intrinsics.ppx) * z / intrinsics.fx
         hy = (rows - intrinsics.ppy) * z / intrinsics.fy
         tops = height[keep].astype(np.float64)
-        if objects is not None and objects.shape == height.shape:
-            # Surroundings analysis: waste height counts where a bag is detected, or where a flat
-            # surface clearly stands as a pile (>= 15 cm); everything else is empty bin floor.
-            tops = np.where(objects[keep] | (tops >= PILE_M), tops, 0.0)
+        # One physical definition for both cameras, independent of how many objects a detector
+        # happens to box: every visible upward-facing surface counts; floor noise (< 3 cm) is zero.
+        tops = np.where(tops >= FLOOR_NOISE_M, tops, 0.0)
         cells = cell_tops(tops, hx, hy)
         z_all = depth_m * scale
-        self.last_surface = {"at": timestamp, "step": step, "height": height, "ok": valid & flat,
+        self.last_surface = {"at": timestamp, "step": step, "height": height, "ok": valid & flat, "valid": valid,
                              "area": (z_all / intrinsics.fx) * (z_all / intrinsics.fy)}
         if len(cells) < 8:
             return self._hold("waiting for a clear view of the bin surface", warnings=warnings)
@@ -505,6 +520,7 @@ class FillEstimator:
         if not surface or now - surface["at"] > 10.0:      # the pile changes slowly; settled maps stay valid
             return None
         step, height, ok, area = surface["step"], surface["height"], surface["ok"], surface["area"]
+        valid = surface.get("valid", ok)
         h, w = height.shape
         x1, y1, x2, y2 = (int(round(v / step)) for v in box)
         x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
@@ -522,8 +538,8 @@ class FillEstimator:
         ring = np.zeros_like(ok)
         ring[max(0, y1 - pad_y):min(h, y2 + pad_y), max(0, x1 - pad_x):min(w, x2 + pad_x)] = True
         ring &= ~inside
-        support_px = height[ring & ok]
-        top = inside & ok
+        support_px = height[ring & ok]                   # support: upward-facing surface around the bag
+        top = inside & valid                             # the bag's own surface: any valid depth
         if support_px.size < 10 or np.count_nonzero(top) < 10:
             return None
         support = float(np.percentile(support_px, 25))
@@ -532,6 +548,13 @@ class FillEstimator:
         if np.count_nonzero(keep) < 10:
             return None
         litres = float(np.sum(rise[keep] * area[top][keep])) * 1000.0
+        # Depth dropouts on the bag: assume they resemble the valid pixels around them.
+        risen_inside = inside & valid
+        risen_inside[risen_inside] = keep
+        grown = cv2_dilate(risen_inside)
+        missing = int(np.count_nonzero(grown & inside & ~valid))
+        if missing:
+            litres *= 1.0 + missing / max(1, int(np.count_nonzero(keep)))
         tall = float(np.percentile(rise[keep], 90))
         if litres > 250.0 or tall > self.profile.usable_height_m + RIM_TOLERANCE_M:
             return None                                  # implausible: unavailable, never clamped
@@ -645,14 +668,42 @@ def surface_maps(depth_m: np.ndarray, intrinsics: Any, profile: FillProfile, pla
         tilt = math.radians(profile.tilt_from_vertical_deg or 0.0)
         up = np.array([0.0, -math.sin(tilt), -math.cos(tilt)])
         height = profile.vertical_height_m() + up[1] * y + up[2] * z
-    gx = [np.gradient(m, axis=1) for m in (x, y, z)]
-    gy = [np.gradient(m, axis=0) for m in (x, y, z)]
+    # Normals from depth smoothed over 5 x 5 px: per-pixel stereo noise (a few mm at ~3 mm pixel
+    # spacing) otherwise tilts every normal and drops real bag tops as "walls" (volume undercount).
+    zs = _smooth_nan(z, 5)
+    xs = (u - intrinsics.ppx) * zs / intrinsics.fx
+    ys = (v - intrinsics.ppy) * zs / intrinsics.fy
+    gx = [np.gradient(m, axis=1) for m in (xs, ys, zs)]
+    gy = [np.gradient(m, axis=0) for m in (xs, ys, zs)]
     normal = np.cross(np.stack(gx, -1), np.stack(gy, -1))
     length = np.linalg.norm(normal, axis=-1)
     with np.errstate(invalid="ignore", divide="ignore"):
         facing = np.abs(normal @ up) / length
     flat = np.nan_to_num(facing) >= math.cos(math.radians(55))
     return np.nan_to_num(height, nan=-9.0), flat, valid & np.isfinite(height)
+
+
+def cv2_dilate(mask: np.ndarray) -> np.ndarray:
+    try:
+        import cv2
+    except ImportError:  # pragma: no cover
+        return mask
+    return cv2.dilate(mask.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+
+
+def _smooth_nan(values: np.ndarray, size: int) -> np.ndarray:
+    """Box mean ignoring NaN (invalid depth); NaN stays NaN."""
+    try:
+        import cv2
+    except ImportError:  # pragma: no cover
+        return values
+    finite = np.isfinite(values)
+    total = cv2.blur(np.where(finite, values, 0.0).astype(np.float64), (size, size))
+    weight = cv2.blur(finite.astype(np.float64), (size, size))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        out = total / weight
+    out[~finite] = np.nan
+    return out
 
 
 def _subsample(depth_m: np.ndarray, intrinsics: Any, region: np.ndarray | None, target: int = 160):

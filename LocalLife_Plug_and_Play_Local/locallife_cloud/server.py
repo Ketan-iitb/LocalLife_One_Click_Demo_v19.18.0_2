@@ -283,7 +283,7 @@ def create_app(
     def new_operator_session() -> Any:
         try:
             session = manager.start_new_operator_session()
-            manager.deposits.new_session()          # the operator's new session also restarts the bag count
+            manager.reset_counting()                # the operator's new session also restarts the bag count
             return jsonify(ok=True, session=session)
         except (OSError, ValueError) as exc:
             return jsonify(error=str(exc)), 400
@@ -846,18 +846,18 @@ def create_app(
                 depth, geometry = station.latest_depth, station.latest_intrinsics
             region = None if depth is None else station._measurement_region(depth.shape + (3,))
             result[camera_id] = station.fill.recalibrate(depth, geometry, region)
-        return jsonify(ok=True, cameras=result, session=manager.deposits.new_session())
+        return jsonify(ok=True, cameras=result, session=manager.reset_counting())
 
     @app.post("/api/bin-fill/session/new")
     @protected
     def new_deposit_session() -> Any:
         """Explicit new deposit session: count back to 0, baseline re-taken. A page refresh never does this.
 
-        Each camera's fitted floor is also forgotten and re-found automatically from the next frames.
+        A COUNTING reset only: calibration (each camera's fitted empty-bin floor) is kept, because an
+        occupied bin must never be taken as the empty-bin reference. Use /api/bin-fill/recalibrate
+        with the bin empty to re-find the floor.
         """
-        for station in manager.pipelines.values():
-            station.fill.forget_floor()
-        return jsonify(ok=True, session=manager.deposits.new_session())
+        return jsonify(ok=True, session=manager.reset_counting())
 
     @app.get("/api/cameras/<camera_id>/stages")
     def camera_stages(camera_id: str) -> Any:

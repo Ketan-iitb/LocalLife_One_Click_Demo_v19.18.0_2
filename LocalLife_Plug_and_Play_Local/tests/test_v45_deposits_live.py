@@ -319,5 +319,38 @@ class V47RecordTests(unittest.TestCase):
             self.assertEqual(header, list(sd.CSV_FIELDS))
 
 
+
+class V48ResetTests(unittest.TestCase):
+    def test_reset_zeroes_both_cameras_ignores_late_frames_and_survives_restart(self) -> None:
+        with TemporaryDirectory() as d:
+            clock = [0.0]
+            counter = sd.SessionDeposits(Path(d), clock=lambda: clock[0])
+            scenes = {c: Scene(c, depth=(c == "realsense"), seed=i) for i, c in enumerate(("realsense", "logitech"))}
+            for s in scenes.values():
+                s.add(1, (10, 10, 40, 40))
+                run(counter, s, 0.0, 7.0)
+                run(counter, s, 7.0, 8.0, hand=True)
+                s.add(5, (60, 60, 100, 100), height=0.25)
+                run(counter, s, 8.0, 12.0)
+            self.assertEqual((counter.count_for("realsense"), counter.count_for("logitech")), (1, 1))
+            clock[0] = 20.0
+            snap = counter.new_session()
+            first_generation = snap["generation"]
+            self.assertEqual(snap["new_bags_this_session"], 0)
+            late = scenes["logitech"].evidence(19.5)                       # inference began before the reset
+            late.started_at = 19.5
+            self.assertIsNone(counter.observe(late))
+            self.assertEqual(counter.late_frames_ignored, 1)
+            again = sd.SessionDeposits(Path(d), clock=lambda: 30.0)         # restart: no old counts restored
+            self.assertEqual((again.count, again.session_id), (0, counter.session_id))
+            # Bags present at reset are baseline; the camera that reconnects later also starts at 0.
+            run(counter, scenes["realsense"], 20.0, 27.0)
+            self.assertEqual(counter.count_for("realsense"), 0)
+            run(counter, scenes["logitech"], 40.0, 47.0)                   # reconnects late
+            self.assertEqual(counter.count_for("logitech"), 0)
+            self.assertEqual(counter.new_session()["generation"], first_generation + 1)   # repeated reset safe
+            self.assertEqual(counter.new_session()["new_bags_this_session"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

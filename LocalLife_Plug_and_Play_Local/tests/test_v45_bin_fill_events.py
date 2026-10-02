@@ -140,7 +140,7 @@ class ServerTests(unittest.TestCase):
             for page in ("/", "/research"):
                 html = client.get(page).get_data(as_text=True)
                 self.assertIn("Bin fill &amp; new deposits", html)
-                self.assertIn("NEW bags this session", html)
+                self.assertIn("New bags this session", html)
             data = client.get("/api/bin-fill").get_json()
             self.assertEqual(data["deposits"]["new_bags_this_session"], 0)
             self.assertEqual(data["cameras"]["realsense"]["status"], "na")
@@ -270,19 +270,20 @@ class FloorTests(unittest.TestCase):
 
 
 class SurroundingsTests(unittest.TestCase):
-    def test_nothing_detected_reads_empty_and_a_detected_bag_counts(self) -> None:
+    def test_empty_bin_reads_zero_and_fill_does_not_depend_on_detector_boxes(self) -> None:
         with TemporaryDirectory() as d:
-            est = bf.FillEstimator("realsense", Path(d), _profile(camera_to_empty_floor_m=1.10, usable_height_m=1.00))
-            bag = lambda x, y: np.where((np.abs(x) < 0.12) & (np.abs(y) < 0.12), 0.12, 0.0)   # low bag, < 15 cm
-            depth = _render(_profile(camera_to_empty_floor_m=1.10), bag)
+            prof = _profile(camera_to_empty_floor_m=1.10, usable_height_m=1.00)
+            est = bf.FillEstimator("realsense", Path(d), prof)
             frame = np.zeros((K.height, K.width, 3), np.uint8)
-            none = np.zeros(depth.shape, bool)
-            self.assertEqual(est.update(frame, depth, K, None, 0.0, 1.0, objects=none)["height_fill_pct"], 0.0)
-            est.fill_history.clear()
-            boxed = np.zeros(depth.shape, bool)
-            boxed[40:80, 50:110] = True                                                        # detector box
-            self.assertGreater(est.update(frame, depth, K, None, 0.0, 2.0, objects=boxed)["height_fill_pct"], 0.5)
-
+            empty = _render(prof, lambda x, y: 0 * x)
+            self.assertEqual(est.update(frame, empty, K, None, 0.0, 1.0)["height_fill_pct"], 0.0)   # valid 0 %
+            bag = _render(prof, lambda x, y: np.where((np.abs(x) < 0.12) & (np.abs(y) < 0.12), 0.12, 0.0))
+            fills = []
+            for boxes in (np.zeros(bag.shape, bool), np.ones(bag.shape, bool)):
+                est.fill_history.clear()
+                fills.append(est.update(frame, bag, K, None, 0.0, 2.0, objects=boxes)["height_fill_pct"])
+            self.assertGreater(fills[0], 0.5)
+            self.assertEqual(fills[0], fills[1])          # same surface, same fill, whatever was boxed
 
 
 class V47ExportTests(unittest.TestCase):
@@ -365,6 +366,30 @@ class V47LogitechDriftTests(unittest.TestCase):
             for t in (10.0, 25.0, 40.0):
                 est.update(frame, scene, K, region, 0.0, t)
             self.assertNotEqual(est.profile.floor_plane, [0.0, 0.0, 9.0])
+
+
+
+class V48NoiseTests(unittest.TestCase):
+    def test_bag_volume_and_fill_survive_stereo_noise_and_dropouts(self) -> None:
+        # Before V48, raw per-pixel normals under ~4 mm noise rejected most bag-top pixels (-60..70 %).
+        rng = np.random.default_rng(1)
+        prof = _profile(camera_to_empty_floor_m=1.10, usable_height_m=1.00)
+        scene = lambda x, y: np.where((np.abs(x) < 0.10) & (np.abs(y) < 0.075), 0.55, 0.30)
+        depth = _render(prof, scene)
+        top = depth < 0.6
+        truth = float(np.sum((depth[top] / K.fx) * (depth[top] / K.fy))) * 0.25 * 1000
+        z = 0.55
+        box = (K.ppx - K.fx * 0.10 / z, K.ppy - K.fy * 0.075 / z, K.ppx + K.fx * 0.10 / z, K.ppy + K.fy * 0.075 / z)
+        with TemporaryDirectory() as d:
+            est = bf.FillEstimator("realsense", Path(d), prof)
+            est.recalibrate(_render(prof, lambda x, y: 0 * x), K, None)
+            noisy = depth + rng.normal(0, 0.004, depth.shape)
+            noisy[rng.random(depth.shape) < 0.03] = 0
+            reading = est.update(np.zeros((K.height, K.width, 3), np.uint8), noisy, K, None, 0.0, 1.0)
+            litres, _ = est.object_volume(box, None, 1.5)
+        self.assertLess(abs(litres - truth) / truth, 0.10, (litres, truth))
+        self.assertEqual(reading["status"], "ok")
+        self.assertIn("valid_depth_pct", reading["diagnostics"])
 
 
 if __name__ == "__main__":

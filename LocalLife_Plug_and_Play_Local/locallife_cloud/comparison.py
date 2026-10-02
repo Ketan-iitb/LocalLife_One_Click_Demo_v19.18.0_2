@@ -245,6 +245,15 @@ class DualCameraCoordinator:
         for camera_id in self.paired_log.expected_cameras:
             self.pipelines[camera_id].measurement_listener = self._record_paired_measurement
 
+    def reset_counting(self) -> dict[str, Any]:
+        """One counting reset for both cameras: counters, watchers, settling buffers and occupancy
+        events start fresh; calibration and historical CSV rows are kept."""
+        for pipeline in self.pipelines.values():
+            pipeline.bin_occupancy.reset(reason="counting reset")
+            pipeline.__dict__.pop("_track_first_seen", None)
+            pipeline.__dict__.pop("_provisional_history", None)
+        return self.deposits.new_session()
+
     def attach_deposit_listeners(self) -> None:
         for pipeline in self.pipelines.values():
             pipeline.deposit_listener = self.deposits.attach_occupancy

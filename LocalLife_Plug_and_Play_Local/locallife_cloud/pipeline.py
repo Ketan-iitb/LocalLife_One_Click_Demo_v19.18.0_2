@@ -1165,6 +1165,7 @@ class VisionPipeline:
         frames = [item[0] for item in prepared]
         intrinsics = [item[1] for item in prepared]
         started = time.perf_counter()
+        self._processing_started_at = time.time()      # before inference: lets a reset reject in-flight frames
         with self.inference_lock:
             detections_batch = self.detector.detect_batch(frames)
             predictions = (
@@ -1208,6 +1209,7 @@ class VisionPipeline:
         peer_box_present: bool = False,
     ) -> FrameAnalysis:
         """Assemble a result from inference shared across camera stations."""
+        self._processing_started_at = time.time() - inference_ms / 1000.0
         with self.lock:
             return self._assemble(
                 frame,
@@ -3069,6 +3071,18 @@ class VisionPipeline:
                     estimate = self.fill.object_volume(item.box, item.mask, time.time())
                 except Exception:  # noqa: BLE001 - display-only estimate
                     estimate = None
+                if estimate is not None and item.track_id is not None:
+                    # Repeatability: the median of this SAME track's recent estimates, not one frame.
+                    now = time.time()
+                    history = self.__dict__.setdefault("_provisional_history", {})
+                    samples = [v for v in history.get(item.track_id, []) if now - v[0] <= 15.0][-7:]
+                    samples.append((now, estimate[0], estimate[1]))
+                    history[item.track_id] = samples
+                    if len(history) > 300:
+                        for key in list(history)[:150]:
+                            history.pop(key, None)
+                    estimate = (round(float(np.median([v[1] for v in samples])), 2),
+                                float(np.median([v[2] for v in samples])))
                 if estimate is not None:
                     item.provisional_volume_l = estimate[0]
                     if item.height_above_baseline_cm is None:
@@ -3453,7 +3467,8 @@ class VisionPipeline:
                     status = self.fill.profile.status
             self.frame_listener(FrameEvidence(camera=self.camera_id, timestamp=time.time(), grey=grey,
                                               region=region, tracks=tracks, depth=depth, heights=heights,
-                                              height_status=status, area=area, xs=xs, ys=ys))
+                                              height_status=status, area=area, xs=xs, ys=ys,
+                                              started_at=self.__dict__.get("_processing_started_at")))
         except Exception:  # noqa: BLE001 - the counter must never stop the pipeline
             LOGGER.exception("%s deposit evidence failed", self.camera_id)
 

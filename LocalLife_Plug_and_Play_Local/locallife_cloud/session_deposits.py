@@ -106,6 +106,7 @@ class FrameEvidence:
     area: np.ndarray | None = None                  # SMALL floor area per pixel (m^2)
     xs: np.ndarray | None = None                    # SMALL camera x, y (m) for footprint L x W
     ys: np.ndarray | None = None
+    started_at: float | None = None                 # when this frame's processing (inference) began
 
 
 def _changed(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -413,6 +414,9 @@ class SessionDeposits:
         self.last_confirmed_at: float | None = None
         self.resumed = False
         self.ignored_redetections = 0
+        self.late_frames_ignored = 0
+        self.generation = getattr(self, "generation", 0) + 1
+        self._pending_csv = []
         self.watchers.clear()
         self._save()
 
@@ -434,6 +438,8 @@ class SessionDeposits:
             self.written = set(data.get("written", []))
             self.last_confirmed_at = data.get("last_confirmed_at")
             self.ignored_redetections = 0
+            self.late_frames_ignored = 0
+            self.generation = 1
             self._pending_csv = [e for e in self.events if e["event_id"] not in self.written]
             self.resumed = True
             return True
@@ -466,6 +472,10 @@ class SessionDeposits:
     def observe(self, ev: FrameEvidence) -> dict[str, Any] | None:
         """Feed one camera frame; returns the counted/merged event when one is confirmed."""
         with self._lock:
+            if (ev.started_at if ev.started_at is not None else ev.timestamp) < self.session_started_at:
+                # Captured before the last reset (in-flight inference): never part of the new session.
+                self.late_frames_ignored += 1
+                return None
             self._last_frame_at = max(self._last_frame_at, ev.timestamp)
             watcher = self.watchers.get(ev.camera)
             if watcher is None:
@@ -650,6 +660,8 @@ class SessionDeposits:
         with self._lock:
             near = [e for e in self.events if e["camera"] == camera and e["delta_occupancy_l"] is None
                     and event.started_at - FINALISE_S <= e["deposit_time"] <= event.finalized_at + FINALISE_S]
+            if event.started_at < self.session_started_at:
+                return                                   # an occupancy event from before the reset
             if near and event.delta_occupancy_l is not None:
                 near[-1]["delta_occupancy_l"] = event.delta_occupancy_l
                 self._save()
@@ -713,6 +725,7 @@ class SessionDeposits:
                              latest_rejection=next((r["reason"] for r in reversed(self.rejected)
                                                     if r["cameras"][0] == camera), None))
             return {
+                "generation": self.generation, "late_frames_ignored": self.late_frames_ignored,
                 "session_id": self.session_id, "session_started_at": self.session_started_at,
                 "elapsed_s": round(now - self.session_started_at, 1), "resumed": self.resumed,
                 "updated_at": max(frames) if frames else None, "status": status, "cameras": cams,
