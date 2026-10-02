@@ -235,3 +235,26 @@ class ResearchLayoutTests(unittest.TestCase):
             self.assertIn(marker, page)                                 # every block still on the page
         self.assertNotIn("rl-nav", server.OPERATOR_PAGE)               # operator page unchanged
         self.assertTrue(page.startswith(base[:200]))
+
+
+class TrialTests(unittest.TestCase):
+    def test_known_object_trials_give_accuracy_and_csvs(self):
+        from locallife_cloud.comparison import DualCameraCoordinator
+        from locallife_cloud.config import AppConfig
+        from locallife_cloud.server import create_app
+        trials = [ca.make_trial("local", "h", "realsense", "carton", 1.5, 1.4, "box", 1, 1.0),
+                  ca.make_trial("cloud", "h", "realsense", "carton", 1.5, 1.6, "box", 2, 2.0)]
+        acc = ca.trial_accuracy(trials, "realsense")
+        self.assertIsNotNone(acc)
+        with TemporaryDirectory() as d:
+            config = AppConfig(detector_model="local-opencv-background", enable_monocular_depth=False,
+                               enable_bucket_sync=False, results_dir=Path(d))
+            client = create_app(config, DualCameraCoordinator(config)).test_client()
+            r = client.post("/api/cost-accuracy/trials/import", json={"trials": trials})
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(len(client.get("/api/cost-accuracy/trials").get_json()["trials"]), 2)
+            view = client.get("/api/cost-accuracy/view?camera=realsense").get_json()
+            self.assertIn("known-object", view["accuracy_source"])
+            self.assertAlmostEqual(view["trials"]["accuracy"]["modes"]["cloud"]["mae_l"], 0.1, places=6)
+            self.assertIn("carton", client.get("/api/cost-accuracy/trials.csv").get_data(as_text=True))
+            self.assertIn("monthly_sek_at_24h_per_day", client.get("/api/cost-accuracy/operation.csv").get_data(as_text=True))

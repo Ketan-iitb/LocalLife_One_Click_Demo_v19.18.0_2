@@ -346,7 +346,8 @@ def create_app(
         view = ca.build_view(request.args.get("camera") or "realsense", entries, ca.load_config(ca_config_path),
                              request.args.get("local") or None, request.args.get("cloud") or None)
         view["resources"] = ca.configured_resources(Path(__file__).resolve().parents[2] / "gpu.py")
-        return view
+        view["processing_mode"] = settings.processing_mode
+        return ca.attach_trials(view, ca.load_trials(settings.results_dir / "cost_accuracy" / "trials.jsonl"))
 
     @app.get("/api/cost-accuracy/view")
     def cost_accuracy_view() -> Any:
@@ -370,6 +371,67 @@ def create_app(
         if name not in ca.BILLING_PRESETS:
             return jsonify(error="unknown setup"), 400
         return jsonify(ok=True, config=ca.save_config(ca_config_path, ca.preset_config(name, ca.load_config(ca_config_path))))
+
+    ca_trials_path = settings.results_dir / "cost_accuracy" / "trials.jsonl"
+
+    @app.post("/api/cost-accuracy/trial")
+    @protected
+    def cost_accuracy_trial() -> Any:
+        """Record the CURRENT measured volume of the largest tracked object of one camera against the
+        known volume entered by the operator. Nothing is estimated: no object volume, no trial."""
+        payload = request.get_json(silent=True) or {}
+        camera = str(payload.get("camera") or "")
+        try:
+            reference = float(payload["reference_litres"])
+            if camera not in ca.CAMERAS or reference <= 0:
+                raise ValueError("camera and a positive known volume (L) are required")
+            analysis = manager.camera(camera).latest_analysis
+            items = [] if analysis is None else [
+                d for d in analysis.detections if d.track_id is not None and d.source != "tracked-prediction"]
+            measured = []
+            for d in items:
+                value = next((v for v in (d.support_volume_l, getattr(d, "stable_volume_l", None),
+                                          d.realsense_volume_l if camera == "realsense" else d.monocular_volume_l)
+                              if v is not None), None)
+                if value is not None:
+                    measured.append((d.area_pixels, float(value), d.support_method or d.measurement_method or "", d.track_id))
+            if not measured:
+                raise ValueError(f"no measured object volume on the {camera} view right now")
+            _, value, method, track = max(measured)
+        except (KeyError, TypeError, ValueError) as exc:
+            return jsonify(error=str(exc)), 400
+        trial = ca.make_trial(settings.processing_mode, lc_store.host, camera, str(payload.get("object_name") or ""),
+                              reference, value, method, track, time.time())
+        ca.append_trials(ca_trials_path, [trial])
+        return jsonify(ok=True, trial=trial)
+
+    @app.get("/api/cost-accuracy/trials")
+    def cost_accuracy_trials() -> Any:
+        trials = ca.load_trials(ca_trials_path)
+        return jsonify(trials=trials, processing_mode=settings.processing_mode,
+                       accuracy={c: ca.trial_accuracy(trials, c) for c in ca.CAMERAS})
+
+    @app.post("/api/cost-accuracy/trials/import")
+    @protected
+    def cost_accuracy_trials_import() -> Any:
+        """Trials recorded on the OTHER mode's server (local and cloud are separate servers)."""
+        items = (request.get_json(silent=True) or {}).get("trials") or []
+        return jsonify(ok=True, imported=ca.append_trials(ca_trials_path, items[:2000]))
+
+    @app.get("/api/cost-accuracy/trials.csv")
+    def cost_accuracy_trials_csv() -> Any:
+        return Response(ca.trials_csv(ca.load_trials(ca_trials_path)), mimetype="text/csv",
+                        headers={"Content-Disposition": "attachment; filename=known_object_trials.csv"})
+
+    @app.get("/api/cost-accuracy/operation.csv")
+    def cost_accuracy_operation_csv() -> Any:
+        ops = ca.operation_costs(ca.load_config(ca_config_path))
+        lines = ["setup,rate_sek_per_hour," + ",".join(f"monthly_sek_at_{h}h_per_day" for h in ops["hours_per_day"])]
+        lines += [f"\"{s['name']}\",{s['rate_per_hour']:.3f}," + ",".join(str(v) for _, v in s["points"])
+                  for s in ops["series"]]
+        lines.append(f"# basis: {ops['basis']}")
+        return Response("\n".join(lines) + "\n", mimetype="text/csv",
+                        headers={"Content-Disposition": "attachment; filename=continuous_operation_cost.csv"})
 
     @app.get("/api/cost-accuracy.csv")
     def cost_accuracy_csv() -> Any:

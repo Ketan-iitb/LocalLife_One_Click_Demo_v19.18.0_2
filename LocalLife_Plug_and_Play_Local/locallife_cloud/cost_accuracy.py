@@ -502,6 +502,7 @@ def build_view(camera: str, entries: list[dict[str, Any]], config: dict[str, Any
         "config": config,
         "billing": {**BILLING_SUMMARY, "presets": BILLING_PRESETS, "storage": BILLING_STORAGE,
                     "source": BILLING_SOURCE},
+        "operation": operation_costs(config),
     }
 
 
@@ -560,3 +561,134 @@ def view_csv(view: dict[str, Any]) -> str:
                          "accuracy_status": view["accuracy_status"], "truth_file": view.get("truth_file") or "",
                          "assumptions": " | ".join(view["assumptions"])})
     return output.getvalue()
+
+
+# ------------------------------------------------------------------ known-object trials
+# A trial = one measurement of a KNOWN object (volume measured by hand) taken live in one processing
+# mode. Local and cloud trials of the same object are different frames, so they are reported as
+# "same objects, different frames" -- weaker than a replay, but real, and never estimated.
+TRIAL_FIELDS = ["trial_id", "recorded_at", "mode", "source_host", "camera", "object_name", "reference_litres",
+                "measured_litres", "method", "track_id", "error_litres", "error_pct"]
+
+
+def load_trials(path: Path) -> list[dict[str, Any]]:
+    trials = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                item = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(item, dict) and item.get("trial_id"):
+                trials.append({k: item.get(k) for k in TRIAL_FIELDS})
+    except OSError:
+        pass
+    seen, unique = set(), []
+    for t in trials:                                     # an imported copy of a trial is stored once
+        if t["trial_id"] not in seen:
+            seen.add(t["trial_id"])
+            unique.append(t)
+    return unique
+
+
+def make_trial(mode: str, host: str, camera: str, object_name: str, reference: float, measured: float,
+               method: str, track_id: Any, now: float) -> dict[str, Any]:
+    error = measured - reference
+    return {"trial_id": f"{host}-{mode}-{camera}-{int(now * 1000)}", "recorded_at": now, "mode": mode,
+            "source_host": host, "camera": camera, "object_name": object_name.strip()[:80] or "object",
+            "reference_litres": reference, "measured_litres": measured, "method": (method or "")[:160],
+            "track_id": track_id, "error_litres": error, "error_pct": (100.0 * error / reference) if reference > 0 else None}
+
+
+def append_trials(path: Path, items: Iterable[dict[str, Any]]) -> int:
+    known = {t["trial_id"] for t in load_trials(path)}
+    clean = []
+    for item in items:
+        if not isinstance(item, dict) or not item.get("trial_id") or item["trial_id"] in known:
+            continue
+        try:
+            ref, meas = float(item["reference_litres"]), float(item["measured_litres"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if item.get("mode") not in ("local", "cloud") or item.get("camera") not in CAMERAS or ref <= 0 or meas < 0:
+            continue
+        clean.append({k: item.get(k) for k in TRIAL_FIELDS})
+        known.add(item["trial_id"])
+    if clean:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            for item in clean:
+                handle.write(json.dumps(item) + "\n")
+    return len(clean)
+
+
+def trial_accuracy(trials: list[dict[str, Any]], camera: str) -> dict[str, Any]:
+    mine = [t for t in trials if t["camera"] == camera]
+    objects = {m: {t["object_name"].lower() for t in mine if t["mode"] == m} for m in ("local", "cloud")}
+    shared = objects["local"] & objects["cloud"]
+    out = {"camera": camera, "shared_objects": sorted(shared), "modes": {}}
+    for mode in ("local", "cloud"):
+        rows = [t for t in mine if t["mode"] == mode]
+        paired = [t for t in rows if t["object_name"].lower() in shared]
+        errs = [abs(float(t["measured_litres"]) - float(t["reference_litres"])) for t in rows]
+        pcts = [abs(float(t["error_pct"])) for t in rows if t.get("error_pct") is not None]
+        perr = [abs(float(t["measured_litres"]) - float(t["reference_litres"])) for t in paired]
+        out["modes"][mode] = {
+            "n": len(rows), "objects": sorted(objects[mode]),
+            "mae_l": statistics.fmean(errs) if errs else None, "mape_pct": statistics.fmean(pcts) if pcts else None,
+            "paired_n": len(paired), "paired_mae_l": statistics.fmean(perr) if perr else None,
+        }
+    return out
+
+
+def trials_csv(trials: list[dict[str, Any]]) -> str:
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=TRIAL_FIELDS, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(trials)
+    return output.getvalue()
+
+
+# ------------------------------------------------------------------ continuous operation
+def operation_costs(config: dict[str, Any]) -> dict[str, Any]:
+    """Monthly cost vs running hours per day (30-day month), from the billed rates; storage is billed
+    every month whether the VM runs or not. Local = energy only, when power and tariff are entered."""
+    storage = BILLING_STORAGE["disk_gb"] * BILLING_STORAGE["disk_rate_per_gb_month"]
+    images = BILLING_STORAGE["image_gb"] * BILLING_STORAGE["image_rate_per_gb_month"]
+    hours = list(range(0, 25, 2))
+    series = []
+    for name, p in BILLING_PRESETS.items():
+        rate = p["gpu_rate_per_hour"] + p["machine_rate_per_hour"]
+        series.append({"name": name, "rate_per_hour": rate,
+                       "points": [[h, round(rate * h * 30 + storage + images, 1)] for h in hours]})
+    local = config["local"]
+    if local.get("power_w") is not None and local.get("tariff_per_kwh") is not None:
+        kw = local["power_w"] / 1000.0
+        series.append({"name": "Local laptop (energy only)", "rate_per_hour": kw * local["tariff_per_kwh"],
+                       "points": [[h, round(kw * h * 30 * local["tariff_per_kwh"], 2)] for h in hours]})
+    return {"currency": "SEK", "hours_per_day": hours, "series": series,
+            "storage_per_month": round(storage, 1), "images_per_month": round(images, 1),
+            "idle_after_7_days_per_month": "about 30-40 (disk replaced by an image)",
+            "basis": "rate x hours/day x 30 + 200 GB disk + 2 images every month (VM kept); bucket and network excluded"}
+
+
+def attach_trials(view: dict[str, Any], trials: list[dict[str, Any]]) -> dict[str, Any]:
+    """Known-object trials for the selected camera; when no paired replay exists, their MAE is the
+    accuracy shown (labelled: same objects, different frames)."""
+    acc = trial_accuracy(trials, view["camera"])
+    view["trials"] = {"accuracy": acc, "recent": [t for t in trials if t["camera"] == view["camera"]][-30:]}
+    if view["accuracy_status"] == "evaluated":
+        return view
+    view["accuracy_source"] = "known-object trials (same objects, different frames)" if any(
+        acc["modes"][m]["n"] for m in ("local", "cloud")) else None
+    for row in view["rows"]:
+        if not row.get("available"):
+            continue
+        m = acc["modes"][row["mode"]]
+        row.update(trial_n=m["n"], trial_mae_l=m["mae_l"], trial_mape_pct=m["mape_pct"],
+                   trial_paired_n=m["paired_n"], trial_paired_mae_l=m["paired_mae_l"])
+    for point in view["points"]:
+        m = acc["modes"][point["mode"]]
+        if point.get("y_mae_l") is None and m["mae_l"] is not None:
+            point.update(y_mae_l=m["mae_l"], n=m["n"], availability_pct=None, mae_basis="known-object trials")
+    return view
