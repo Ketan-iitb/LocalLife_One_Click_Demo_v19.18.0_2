@@ -3226,6 +3226,9 @@ class VisionPipeline:
                 dims = dict(self.fill.last_object) if estimate is not None else None
             except Exception:  # noqa: BLE001 - display-only estimate
                 estimate, dims = None, None
+            if estimate is None and (self.fill.__dict__.get("last_object") or {}).get("reason"):
+                # e.g. a box face was measured but its thickness is not observable: say so, no number
+                item.support_method = f"{self.fill.last_object['method']} ({self.fill.last_object['reason']})"
             if dims is not None and item.track_id is not None and dims.get("planar"):
                 resolver.set_rigid(item.track_id, True)      # depth evidence: a flat rigid top
             if estimate is not None and dims is not None:
@@ -3243,10 +3246,6 @@ class VisionPipeline:
                             history.pop(key, None)
                     sample = sorted(samples, key=lambda v: v[1])[len(samples) // 2]
                 _, litres, height_m, length_m, width_m, method = sample
-                if resolved in FLAT_FACED and length_m and width_m and height_m and "slab" not in method:
-                    # A closed rigid box: report the cuboid, V = L x W x H.
-                    litres = round(length_m * width_m * height_m * 1000.0, 2)
-                    method = "cuboid L x W x H above the local support (rigid box)"
                 item.support_volume_l = round(float(litres), 2)
                 item.support_height_cm = round(float(height_m) * 100, 1)
                 if length_m:
@@ -3254,7 +3253,7 @@ class VisionPipeline:
                     item.support_width_cm = round(float(width_m) * 100, 1)
                 if item.track_id is not None:
                     resolver.set_size(item.track_id, item.support_length_cm, item.support_height_cm)
-                item.support_method = method if "slab" in method or "cuboid" in method else \
+                item.support_method = method if method.startswith("box ") or "slab" in method else \
                     "volume integrated above the local surface (not L x W x H; L x W x H is its enclosing box)"
                 if own is None and item.provisional_volume_l is None:
                     item.provisional_volume_l = item.support_volume_l

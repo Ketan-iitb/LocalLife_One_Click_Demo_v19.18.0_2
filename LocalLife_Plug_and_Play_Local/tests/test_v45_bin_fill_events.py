@@ -543,7 +543,7 @@ class V49SlabTests(unittest.TestCase):
                 self.assertLess(abs(tall - 0.07), 0.025, tall)               # thickness, not the raised end
                 self.assertLess(abs(obj["length_m"] - 0.45), 0.04, obj)
                 self.assertLess(abs(obj["width_m"] - 0.15), 0.03, obj)
-                self.assertIn("slab", obj["method"])
+                self.assertTrue("slab" in obj["method"] or obj["method"].startswith("box cuboid"), obj["method"])
 
     def test_flat_box_is_unchanged(self):
         litres, tall, obj = self._measure(0)

@@ -332,13 +332,26 @@ class CameraWatcher:
         is_here = ev.grey[added].astype(np.float32).reshape(-1, ev.grey.shape[-1] if ev.grey.ndim == 3 else 1)
         return float(np.abs(np.median(was_there, axis=0) - np.median(is_here, axis=0)).max()) < 25.0
 
-    def _removed(self, ev: FrameEvidence, before: FrameEvidence, area_mask: np.ndarray) -> bool:
+    def _removed(self, ev: FrameEvidence, before: FrameEvidence, area_mask: np.ndarray,
+                 change: np.ndarray | None = None) -> bool:
         """Was something TAKEN OUT here? Lifting the top bag reveals the one below: not a new deposit."""
         if ev.heights is not None and before.heights is not None and ev.heights.shape == before.heights.shape:
-            diff = (ev.heights - before.heights)[area_mask]
+            full = ev.heights - before.heights
+            diff = full[area_mask]
             diff = diff[np.isfinite(diff)]
             if diff.size >= 10:
-                return float(np.median(diff)) < -0.04
+                offset = 0.0
+                if ev.depth is None:
+                    # Monocular heights (Logitech, no hardware depth): the model's scale re-normalises
+                    # when a large object enters, shifting the WHOLE map. A box laid on the pile read
+                    # as a 4 cm "drop" and was rejected as a removal. Measure the change relative to
+                    # the unchanged part of the bin instead.
+                    still = np.isfinite(full) & ev.region & ~area_mask
+                    if change is not None and change.shape == still.shape:
+                        still &= ~change
+                    if np.count_nonzero(still) >= 50:
+                        offset = float(np.median(full[still]))
+                return float(np.median(diff)) - offset < -0.04
         current = {t.track_id for t in ev.tracks}
         gone = [t for t in before.tracks if t.track_id not in current]
         inside = np.zeros_like(area_mask)
@@ -368,7 +381,7 @@ class CameraWatcher:
         for t in sorted(new_tracks, key=lambda t: -changed_share(t.box)):
             if changed_share(t.box) >= 0.10:
                 added = _box_mask(t.box, change.shape) & change
-                if self._removed(ev, before, added):
+                if self._removed(ev, before, added, change):
                     return "rejected", {**details, "reason": "a bag was removed; the one revealed below is not new"}
                 if self._vacated(ev, before, change, added, region):
                     return "rejected", {**details, "reason": "an existing bag moved: its old spot was vacated"}
@@ -407,7 +420,7 @@ class CameraWatcher:
             largest, labels, n, stats = int(np.count_nonzero(rest)), None, 0, None
         if largest < 0.6 * np.count_nonzero(rest) or largest < MIN_CHANGE * total:
             return "rejected", {**details, "reason": "scattered change, not one new object"}
-        if self._removed(ev, before, rest):
+        if self._removed(ev, before, rest, change):
             return "rejected", {**details, "reason": "a bag was removed; the one revealed below is not new"}
         if self._vacated(ev, before, change, rest, region):
             return "rejected", {**details, "reason": "an existing bag moved: its old spot was vacated"}
@@ -544,11 +557,21 @@ class SessionDeposits:
         if track is None and mask is not None and mask.any():
             # The change was confirmed without a NEW track id (re-used id, merged mask): link it to the
             # detection that covers it, so colour/material/size come from the deposited bag itself.
-            best, best_share = None, 0.0
+            # Prefer the track that FITS the change (overlap / union), and one that was not in the
+            # committed scene: a big old bag box covering the spot is the neighbour, not the deposit.
+            old_ids = set() if watcher.committed is None else {t.track_id for t in watcher.committed.tracks}
+            best, best_share, best_key = None, 0.0, (-1, -1.0)
+            mask_area = np.count_nonzero(mask)
             for t in ev.tracks:
-                share = float(np.count_nonzero(mask & _box_mask(t.box, mask.shape))) / np.count_nonzero(mask)
-                if bag_like(t.label) and share > best_share:
-                    best, best_share = t, share
+                if not bag_like(t.label):
+                    continue
+                box = _box_mask(t.box, mask.shape)
+                inter = float(np.count_nonzero(mask & box))
+                share = inter / mask_area
+                fit = inter / max(1.0, float(np.count_nonzero(mask | box)))
+                key = (int(share >= 0.4 and t.track_id not in old_ids), fit)
+                if share >= 0.4 and key > best_key:
+                    best, best_share, best_key = t, share, key
             if best is not None and best_share >= 0.4:
                 track = details["track"] = best
                 details["evidence"] += f" (linked to track {best.track_id})"

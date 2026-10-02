@@ -557,6 +557,7 @@ class FillEstimator:
         support is the MEDIAN height in a ring around the box (on a +-6 cm uneven pile: mean |error| 6.8 % vs 16.9 % with the 25th percentile, which always over-read), so a bag lying on the pile is
         measured from the pile, not from the bin floor. None when the map is stale or support unclear.
         """
+        self.last_object = {}                            # never a previous object's geometry
         surface = getattr(self, "last_surface", None)
         if not surface or now - surface["at"] > 10.0:      # the pile changes slowly; settled maps stay valid
             return None
@@ -584,6 +585,20 @@ class FillEstimator:
         if support_px.size < 10 or np.count_nonzero(top) < 10:
             return None
         support = float(np.percentile(support_px, 50))
+        # A closed rigid box shows a flat rectangular face: measure it as a cuboid from its own
+        # face and an OBSERVED thickness (side face / support at its low edge), not as the volume
+        # above a ring median -- on uneven bags that support cut the box's low end off (45 cm box
+        # read 27 cm long, 17 cm "tall", 2.4 L).
+        face = _box_face(surface, top, valid, height, support, float(np.percentile(support_px, 25)))
+        if face is not None:
+            self.last_object = {"length_m": face["length"], "width_m": face["width"],
+                                "height_m": face.get("thickness"), "method": face["method"], "planar": True,
+                                "litres": None if face.get("litres") is None else round(face["litres"], 2),
+                                "tilt_deg": face["tilt_deg"], "face_share": face["share"],
+                                "thickness_source": face.get("thickness_source"), "reason": face.get("reason")}
+            if face.get("litres") is None:
+                return None                              # L x W seen, thickness not observable: no number
+            return round(face["litres"], 2), face["thickness"]
         rise_map = np.where(top, height - support, 0.0)
         risen = top & (rise_map > 0.02)
         # One object: the largest connected risen region. A box drawn around a diagonal parcel
@@ -752,6 +767,201 @@ def surface_maps(depth_m: np.ndarray, intrinsics: Any, profile: FillProfile, pla
         facing = np.abs(normal @ up) / length
     flat = np.nan_to_num(facing) >= math.cos(math.radians(55))
     return np.nan_to_num(height, nan=-9.0), flat, valid & np.isfinite(height)
+
+
+BOX_FACE_MIN_SHARE = 0.35       # of the object's valid mask cells on one flat face
+BOX_FACE_MAX_RMS_M = 0.012
+BOX_FACE_MIN_RECT = 0.82        # face hull / its min-area rectangle (an ellipse is 0.785)
+BOX_FACE_MIN_SIDE_M = 0.05
+
+
+def _box_face(surface: dict[str, Any], inside: np.ndarray, valid: np.ndarray, height: np.ndarray,
+              support: float, support_low: float | None = None) -> dict[str, Any] | None:
+    """Closed rigid box seen as one flat RECTANGULAR face -> oriented cuboid; else None.
+
+    L x W: min-area rectangle of the face points IN the face's own plane (not camera axes,
+    not the image box). Thickness, only where the view supports it:
+      1. a visible side face (points below the face, on a plane ~perpendicular to it):
+         thickness = their depth below the face;
+      2. else, a tilted face: the surface just beyond its LOW edge is what it rests on;
+         thickness = (face height at that edge - that surface) / cos(tilt);
+      3. else, a face lying flat: its height above the surrounding surface.
+    A tilted face with neither 1 nor 2 keeps L x W and reports the thickness as unobservable.
+    """
+    if "z" not in surface or "up" not in surface:
+        return None
+    cells = inside & valid
+    rows, cols = np.nonzero(cells)
+    if rows.size < 40:
+        return None
+    try:
+        import cv2
+    except ImportError:  # pragma: no cover
+        return None
+    # The object's face, not the pile around it: a flat stretch of the support inside a loose
+    # mask is flat too, so a plane that is not above the surrounding surface is set aside once.
+    face = None
+    for _ in range(2):
+        face = _face_patch(surface, cells, rows, cols, cv2)
+        if face is None:
+            return None
+        keep_cells = face[0]
+        # vs the LOWER quartile around it: bags higher than a flat box beside it must not hide it
+        floor_ref = support if support_low is None else support_low
+        if float(np.median(height[rows[keep_cells], cols[keep_cells]])) - floor_ref >= 0.02:
+            break
+        cells = cells.copy()
+        cells[rows[keep_cells], cols[keep_cells]] = False
+        rows, cols = np.nonzero(cells)
+        face = None
+        if rows.size < 40:
+            return None
+    if face is None:
+        return None
+    keep, face_img, pts, centre, axes, rms = face
+    share = float(keep.sum()) / len(pts)
+    if share < BOX_FACE_MIN_SHARE or rms > BOX_FACE_MAX_RMS_M:
+        return None
+    return _box_from_face(surface, cells, rows, cols, keep, face_img, pts, centre, axes, rms, share,
+                          valid, height, support, cv2)
+
+
+def _face_patch(surface, cells, rows, cols, cv2):
+    """Largest connected flat patch of the object's cells: (keep, image mask, points, centre, axes, rms)."""
+    pts = np.c_[surface["x"][cells], surface["y"][cells], surface["z"][cells]].astype(np.float64)
+    fit = _ransac_plane(pts)
+    if fit is None:
+        return None
+    keep, centre, axes, rms = fit
+    patch = np.zeros(cells.shape, np.uint8)
+    patch[rows[keep], cols[keep]] = 1
+    # Opening cuts the thin bridges a bleeding mask makes onto neighbouring bags that cross the
+    # face's extended plane; 4-connectivity keeps diagonal leaks out.
+    patch = cv2.morphologyEx(patch, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    count, labels = cv2.connectedComponents(patch, connectivity=4)
+    if count < 2:
+        return None
+    ids = labels[rows, cols]
+    biggest = 1 + int(np.argmax(np.bincount(ids[keep], minlength=count)[1:]))
+    keep = keep & (ids == biggest)
+    if keep.sum() < 30:
+        return None
+    face_img = labels == biggest
+    centre = pts[keep].mean(axis=0)
+    _, sing, axes = np.linalg.svd(pts[keep] - centre, full_matrices=False)
+    rms = float(sing[2] / math.sqrt(int(keep.sum())))
+    return keep, face_img, pts, centre, axes, rms
+
+
+def _box_from_face(surface, cells, rows, cols, keep, face_img, pts, centre, axes, rms, share,
+                   valid, height, support, cv2) -> dict[str, Any] | None:
+    up = np.asarray(surface["up"], dtype=np.float64)
+    normal = axes[2] if float(axes[2] @ up) >= 0 else -axes[2]
+    cos_tilt = float(np.clip(normal @ up, -1.0, 1.0))
+    if cos_tilt < 0.26:                                  # a near-vertical "face" is a wall or a side
+        return None
+    uv = np.c_[(pts[keep] - centre) @ axes[0], (pts[keep] - centre) @ axes[1]].astype(np.float32)
+    corners = cv2.boxPoints(cv2.minAreaRect(uv))          # rectangle axes, free of angle conventions
+    e1, e2 = corners[1] - corners[0], corners[2] - corners[1]
+    e1, e2 = e1 / max(1e-9, float(np.linalg.norm(e1))), e2 / max(1e-9, float(np.linalg.norm(e2)))
+    rot = uv @ np.stack([e1, e2], axis=1).astype(np.float32)
+    # trimmed extents along the rectangle's own axes: a few leaked cells must not widen the box
+    r1, r2 = (float(np.percentile(rot[:, i], 99) - np.percentile(rot[:, i], 1)) for i in (0, 1))
+    rect = float(r1 * r2)
+    core = rot[np.all((rot >= np.percentile(rot, 1, axis=0)) & (rot <= np.percentile(rot, 99, axis=0)), axis=1)]
+    hull = float(cv2.contourArea(cv2.convexHull(core.astype(np.float32)))) if len(core) >= 3 else 0.0
+    # cell centres sit half a cell inside the true edges: add one cell pitch per axis
+    pitch = float(np.sqrt(np.median(surface["area"][cells][keep]))) / max(cos_tilt, 0.3)
+    length, width = float(max(r1, r2)) + pitch, float(min(r1, r2)) + pitch
+    if rect <= 0 or hull / rect < BOX_FACE_MIN_RECT or width < BOX_FACE_MIN_SIDE_M:
+        return None
+    tilt = math.degrees(math.acos(cos_tilt))
+    result: dict[str, Any] = {"length": length, "width": width, "share": round(share, 2),
+                              "tilt_deg": round(tilt, 1), "rms_m": round(rms, 4)}
+    below = (centre - pts) @ normal                      # metres below the face plane
+    thickness, source = None, None
+    # Side faces: a box's side is perpendicular to its top and contains one rectangle edge. Its
+    # points sit ON the plane through that edge (in-plane coordinate = the edge's), below the face,
+    # and run CONTIGUOUSLY down from the edge; the run stops at the first gap, so bags under a
+    # bleeding mask that happen to touch the plane further down are not counted.
+    uv_all = np.c_[(pts - centre) @ axes[0], (pts - centre) @ axes[1]] @ np.stack([e1, e2], axis=1)
+    lo_e = np.percentile(rot, 1, axis=0)
+    hi_e = np.percentile(rot, 99, axis=0)
+    tol = max(0.012, pitch)
+    # Detector masks bleed a cell or two onto the neighbours: look for side faces only inside the
+    # eroded mask, so the bag a box leans on cannot extend its "side" downwards.
+    core_cells = cv2.erode(cells.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)[rows, cols]
+
+    def side_run(allowed: np.ndarray) -> float | None:
+        runs = []
+        for i in (0, 1):
+            j = 1 - i
+            along = (uv_all[:, j] >= lo_e[j]) & (uv_all[:, j] <= hi_e[j])
+            for edge in (hi_e[i] + pitch / 2, lo_e[i] - pitch / 2):
+                on = (~keep) & allowed & along & (np.abs(uv_all[:, i] - edge) <= tol) \
+                    & (below > 0.003) & (below < 0.35)
+                if on.sum() < 6:
+                    continue
+                depths = np.sort(below[on])
+                gaps = np.flatnonzero(np.diff(depths) > 0.02)
+                run = depths[: gaps[0] + 1] if gaps.size else depths
+                # A side seen almost edge-on (the view ray grazing it) has no usable depth extent.
+                basis = (e1, e2)[i]
+                side_normal = basis[0] * axes[0] + basis[1] * axes[1]
+                view = centre / max(1e-9, float(np.linalg.norm(centre)))
+                if abs(float(view @ side_normal)) < math.sin(math.radians(8)):
+                    continue
+                if run[0] <= 0.02 and run.size >= 6:
+                    runs.append(float(run[-1]))
+        return max(runs) if runs else None
+
+    core_run = side_run(core_cells)
+    full_run = side_run(np.ones(len(pts), dtype=bool))
+    # The outer ring adds at most the side's last cell (<= 3 cm in replay); more than that is a
+    # neighbour under a bleeding mask, so the eroded-core run is kept.
+    runs = [r for r in (core_run, full_run if full_run is not None and core_run is not None
+                        and full_run - core_run <= 0.03 else None) if r is not None]
+    if runs:
+        thickness, source = max(runs), "visible side face"
+    if thickness is None and tilt >= 5.0:
+        downhill = -(up - (up @ normal) * normal)
+        downhill /= max(1e-9, float(np.linalg.norm(downhill)))
+        across = np.cross(normal, downhill)
+        all_valid = valid & surface.get("valid", valid)
+        vr, vc = np.nonzero(all_valid)
+        allp = np.c_[surface["x"][all_valid], surface["y"][all_valid], surface["z"][all_valid]].astype(np.float64)
+        s_all, a_all = (allp - centre) @ downhill, (allp - centre) @ across
+        s_face, a_face = (pts[keep] - centre) @ downhill, (pts[keep] - centre) @ across
+        s_edge = float(np.percentile(s_face, 99))
+        band = (s_all > s_edge + 0.02) & (s_all < s_edge + 0.07) & \
+            (a_all > np.percentile(a_face, 5)) & (a_all < np.percentile(a_face, 95)) & \
+            (((centre - allp) @ normal) > 0.0)
+        if band.sum() >= 8:
+            face_h = height[rows[keep], cols[keep]]
+            slope, offset = np.polyfit(s_face, face_h, 1)
+            edge_h = float(slope * s_edge + offset)
+            beside = height[vr[band], vc[band]]
+            rest_h = float(np.percentile(beside, 50))
+            # Only a level, uncluttered surface is evidence of where the box rests: on a pile of
+            # bags beside its edge (spread > 2 cm) this under-read 7 cm as 3-4 cm in replay.
+            level = float(np.percentile(beside, 75) - np.percentile(beside, 25)) <= 0.02
+            if level and edge_h - rest_h > 0.005:
+                thickness = (edge_h - rest_h) / max(cos_tilt, 0.3)
+                source = "surface beside the low edge (assumes the box rests there)"
+    if thickness is None and tilt < 5.0:
+        face_h = float(np.median(height[rows[keep], cols[keep]]))
+        if face_h - support > 0.005:
+            thickness, source = face_h - support, "face height above the surrounding surface"
+    if thickness is None:
+        result.update({"method": "box face: L x W measured, thickness not observable",
+                       "reason": ("tilted box with no visible side face and no level surface seen beside its "
+                                  "low edge") if tilt >= 5.0 else "flat face with no visible side face and no "
+                                  "surface around it lower than the face"})
+        return result
+    result.update({"thickness": thickness, "thickness_source": source,
+                   "litres": length * width * thickness * 1000.0,
+                   "method": f"box cuboid: face L x W (in its own plane) x thickness from {source}"})
+    return result
 
 
 def _ransac_plane(pts: np.ndarray, tol: float = 0.015, iterations: int = 120):
