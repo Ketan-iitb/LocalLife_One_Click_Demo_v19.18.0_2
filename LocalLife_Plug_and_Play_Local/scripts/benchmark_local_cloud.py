@@ -327,6 +327,7 @@ def run(args: argparse.Namespace) -> int:
             "runtime": _find(state, "runtime"),
             "client_host": {"hostname": socket.gethostname(), "platform": platform.platform()},
             "network": args.network, "url": base, "timeout_s": args.timeout, "input_id": input_id,
+            "truth_file": str(Path(args.truth).resolve()) if args.truth else None,
             "superseded_note": "the replay posts synchronously (?sync=1), so no frame is superseded",
         },
         "all": summarise(rows),

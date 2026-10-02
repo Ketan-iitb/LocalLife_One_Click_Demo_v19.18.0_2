@@ -8,8 +8,10 @@ import csv
 import io
 import json
 import logging
+import os
 import time
 from functools import wraps
+from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
@@ -60,6 +62,7 @@ async function update(){try{const response=await fetch('/api/state');const state
 
 
 from .comparison_panel import COMPARISON_PANEL  # noqa: E402
+from .cost_accuracy_panel import COST_ACCURACY_PANEL  # noqa: E402
 from .bin_fill_panel import BIN_FILL_PANEL  # noqa: E402
 
 # The Local-vs-Cloud panel sits directly below the two live camera streams on
@@ -67,8 +70,8 @@ from .bin_fill_panel import BIN_FILL_PANEL  # noqa: E402
 _RESEARCH_STREAMS_END = 'id="logitech-materials"></tbody></table></div></article></section>'
 _OPERATOR_STREAMS_END = 'alt="Logitech dumpster camera"></div></div></div>'
 assert DUAL_DASHBOARD.count(_RESEARCH_STREAMS_END) == 1 and OPERATOR_DASHBOARD.count(_OPERATOR_STREAMS_END) == 1
-RESEARCH_PAGE = DUAL_DASHBOARD.replace(_RESEARCH_STREAMS_END, _RESEARCH_STREAMS_END + BIN_FILL_PANEL + COMPARISON_PANEL)
-OPERATOR_PAGE = OPERATOR_DASHBOARD.replace(_OPERATOR_STREAMS_END, _OPERATOR_STREAMS_END + BIN_FILL_PANEL + COMPARISON_PANEL)
+RESEARCH_PAGE = DUAL_DASHBOARD.replace(_RESEARCH_STREAMS_END, _RESEARCH_STREAMS_END + BIN_FILL_PANEL + COMPARISON_PANEL + COST_ACCURACY_PANEL)
+OPERATOR_PAGE = OPERATOR_DASHBOARD.replace(_OPERATOR_STREAMS_END, _OPERATOR_STREAMS_END + BIN_FILL_PANEL + COMPARISON_PANEL + COST_ACCURACY_PANEL)
 
 
 def _annotate_frame(frame: np.ndarray, pipeline: VisionPipeline) -> np.ndarray:
@@ -327,6 +330,40 @@ def create_app(
         """The comparison both dashboards render: runs, selected pair, rows, summaries."""
         return jsonify(lc_store.comparison(request.args.get("local_run") or None,
                                              request.args.get("cloud_run") or None))
+
+    # ---- Local vs Cloud: Cost and Accuracy (additive report over stored results; cost_accuracy.py)
+    from . import cost_accuracy as ca
+    ca_config_path = settings.results_dir / "cost_accuracy" / "config.json"
+
+    def _ca_view() -> dict[str, Any]:
+        dirs = [settings.results_dir / "benchmark", Path.cwd() / "artifacts" / "benchmark"]
+        if os.environ.get("LOCALLIFE_BENCHMARK_DIR"):
+            dirs.insert(0, Path(os.environ["LOCALLIFE_BENCHMARK_DIR"]))
+        entries = ca.load_benchmark_runs(dirs) + ca.live_runs(lc_store.all_summaries())
+        view = ca.build_view(request.args.get("camera") or "realsense", entries, ca.load_config(ca_config_path),
+                             request.args.get("local") or None, request.args.get("cloud") or None)
+        view["resources"] = ca.configured_resources(Path(__file__).resolve().parents[2] / "gpu.py")
+        return view
+
+    @app.get("/api/cost-accuracy/view")
+    def cost_accuracy_view() -> Any:
+        return jsonify(_ca_view())
+
+    @app.get("/api/cost-accuracy/config")
+    def cost_accuracy_config() -> Any:
+        return jsonify(ca.load_config(ca_config_path))
+
+    @app.post("/api/cost-accuracy/config")
+    @protected
+    def cost_accuracy_save() -> Any:
+        """Rate/input edits change cost calculations only; nothing in the pipelines reads them."""
+        return jsonify(ok=True, config=ca.save_config(ca_config_path, request.get_json(silent=True) or {}))
+
+    @app.get("/api/cost-accuracy.csv")
+    def cost_accuracy_csv() -> Any:
+        view = _ca_view()
+        return Response(ca.view_csv(view), mimetype="text/csv", headers={
+            "Content-Disposition": f"attachment; filename=local_vs_cloud_cost_accuracy_{view['camera']}.csv"})
 
     @app.get("/api/local-cloud/summaries")
     def local_cloud_summaries() -> Any:
