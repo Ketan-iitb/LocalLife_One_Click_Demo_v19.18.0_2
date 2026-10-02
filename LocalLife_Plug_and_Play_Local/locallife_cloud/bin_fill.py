@@ -755,25 +755,43 @@ def surface_maps(depth_m: np.ndarray, intrinsics: Any, profile: FillProfile, pla
 def _tilted_slab(surface: dict[str, Any], risen: np.ndarray, rise_map: np.ndarray) -> dict[str, float] | None:
     """A flat, tilted top face (rigid box / book), or None for rounded shapes (bags).
 
-    Plane fit of the object's 3-D points: flat (RMS < 1.2 cm) and tilted > 15 deg from the
+    Plane fit of the object's 3-D points: flat (RMS < 1.2 cm) and tilted > 5 deg from the
     floor. L x W are its extents in that plane; the thickness is the rise at its LOWEST
-    edge (where it rests on the support), measured perpendicular to the face.
+    edge (where it rests on the support) divided by cos(tilt).
     """
     if "z" not in surface or "up" not in surface or np.count_nonzero(risen) < 30:
         return None
     pts = np.c_[surface["x"][risen], surface["y"][risen], surface["z"][risen]].astype(np.float64)
-    centre = pts.mean(axis=0)
-    _, sing, axes = np.linalg.svd(pts - centre, full_matrices=False)
-    rms = float(sing[2] / math.sqrt(len(pts)))
+    rises = rise_map[risen]
+    keep = np.ones(len(pts), dtype=bool)
+    # The camera also sees a side face of a tilted box; refit on the dominant (top) face,
+    # which must keep >= 70 % of the points so a rounded bag never passes as a slab.
+    for _ in range(4):
+        centre = pts[keep].mean(axis=0)
+        _, sing, axes = np.linalg.svd(pts[keep] - centre, full_matrices=False)
+        rms = float(sing[2] / math.sqrt(int(keep.sum())))
+        if rms <= 0.012:
+            break
+        keep = keep & (np.abs((pts - centre) @ axes[2]) <= 0.015)
+        if keep.sum() < 0.7 * len(pts) or keep.sum() < 30:
+            return None
     normal = axes[2]
     cos_tilt = abs(float(normal @ surface["up"]))
-    if rms > 0.012 or cos_tilt > math.cos(math.radians(15)):
+    if rms > 0.012 or cos_tilt > math.cos(math.radians(5)):
         return None
+    pts, rises = pts[keep], rises[keep]
     along = (pts - centre) @ axes[0]
     across = (pts - centre) @ axes[1]
     length = float(np.percentile(along, 98) - np.percentile(along, 2))
     width = float(np.percentile(across, 98) - np.percentile(across, 2))
-    thickness = float(np.percentile(rise_map[risen], 10)) * cos_tilt
+    # Rise along the slope is linear; extrapolate it to the face's LOW edge. A rigid box resting
+    # with its bottom edge on the support has its top-face low edge T*cos(tilt) above it.
+    downhill = surface["up"] - (surface["up"] @ normal) * normal
+    downhill = downhill / max(1e-9, float(np.linalg.norm(downhill)))
+    s_hill = (pts - pts.mean(axis=0)) @ downhill
+    slope, offset = np.polyfit(s_hill, rises, 1)
+    low_end = float(np.percentile(s_hill, 2) if slope > 0 else np.percentile(s_hill, 98))
+    thickness = float(slope * low_end + offset) / max(cos_tilt, 0.3)
     if thickness <= 0.005 or length <= 0 or width <= 0:
         return None
     return {"length": max(length, width), "width": min(length, width), "thickness": thickness,

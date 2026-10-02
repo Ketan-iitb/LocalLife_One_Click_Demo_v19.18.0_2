@@ -745,6 +745,28 @@ class LogitechTuningTests(unittest.TestCase):
         self.assertEqual(bounded, [])
         self.assertTrue(any("wall or floor" in item for item in warnings))
 
+    def test_white_bag_in_near_corner_of_full_bin_is_kept(self) -> None:
+        # V49: touches two ROI sides and covers ~29 % of it, but is one solid blob.
+        from locallife_cloud.pipeline import readmit_corner_bags
+        corner = np.zeros((80, 100), dtype=bool)
+        corner[38:80, 45:100] = True
+        dark = np.full((80, 100, 3), 60, dtype=np.uint8)
+        frame = dark.copy()
+        frame[corner] = (215, 215, 215)
+        bag = Detection("garbage bag", 0.6, (45, 38, 100, 80), corner.copy())
+        for current in (frame, dark):          # dropped in, or already there at baseline
+            kept, _ = bound_logitech_detections(current, dark, [bag], self.region, min_pixels=20)
+            kept = readmit_corner_bags(current, dark, [bag], kept, self.region, min_pixels=20,
+                                       max_scene_fraction=0.45, foreground_threshold=18)
+            self.assertEqual(len(kept), 1)
+            self.assertEqual(kept[0].area_pixels, int(corner.sum()))
+        # a sparse wall/floor outline is still not readmitted
+        outline = np.zeros((80, 100), dtype=bool)
+        outline[0, :] = outline[-1, :] = outline[:, 0] = outline[:, -1] = True
+        loose = Detection("cardboard box", 0.95, (0, 0, 100, 80), outline)
+        self.assertEqual(readmit_corner_bags(self.frame, self.baseline, [loose], [], self.region, min_pixels=20,
+                                             max_scene_fraction=0.45, foreground_threshold=18), [])
+
     def test_room_wide_exposure_change_is_not_measured_as_object_foreground(self) -> None:
         brighter = np.clip(self.baseline.astype(np.int16) + 22, 0, 255).astype(np.uint8)
         brighter[self.object_mask] = (45, 95, 155)

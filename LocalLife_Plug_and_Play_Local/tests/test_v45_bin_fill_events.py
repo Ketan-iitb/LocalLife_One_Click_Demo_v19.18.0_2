@@ -496,22 +496,59 @@ class V49ParcelTests(unittest.TestCase):
 
 
 class V49SlabTests(unittest.TestCase):
-    def test_tilted_box_volume_excludes_air_under_raised_end(self):
-        # synthetic: a 30x20x6 cm box (3.6 L) tilted 30 deg on a 30 cm pile
+    """A rigid 45 x 15 x 7 cm box (4.73 L) leaning on a 30 cm pile, its low bottom edge on the pile.
+
+    Rendered by first hit along each ray. Before this fix the air under the raised end counted
+    (25 deg: 10.0 L, 24 cm high; 40 deg: 11.7 L, 33 cm high -- the 31 cm seen live)."""
+    KW = CameraIntrinsics(fx=300.0, fy=300.0, ppx=160.0, ppy=120.0, width=320, height=240)
+
+    def _march(self, surface):
+        k = self.KW
+        rows, cols = np.mgrid[0:k.height, 0:k.width]
+        xn, yn = (cols - k.ppx) / k.fx, (rows - k.ppy) / k.fy
+        out = np.full(xn.shape, 1.10)
+        for z in np.arange(0.20, 1.10, 0.002):
+            hit = (out >= 1.10) & (surface(xn * z, yn * z) >= 1.10 - z)
+            out[hit] = z
+        return out
+
+    def _measure(self, deg):
+        length, width, thick, pile = 0.45, 0.15, 0.07, 0.30
+        t = math.radians(deg)
+        x0 = -length * math.cos(t) / 2
+        xa = x0 - thick * math.sin(t)
+        xb, xc = xa + length * math.cos(t), x0 + length * math.cos(t)
+
+        def scene(x, y):
+            top = thick * math.cos(t) + (x - xa) * math.tan(t)
+            end = thick * math.cos(t) + length * math.sin(t) - (x - xb) / max(math.tan(t), 1e-6)
+            z = np.where((x >= xa) & (x < xb), top, np.where((x >= xb) & (x <= xc), end, -1))
+            return np.where((np.abs(y) < width / 2) & (z > 0), pile + z, pile)
+
         prof = _profile(camera_to_empty_floor_m=1.10, usable_height_m=1.00)
-        t = math.radians(30); half = 0.15 * math.cos(t)
-        foot = lambda x, y: (np.abs(x) < half) & (np.abs(y) < 0.10)
-        scene = lambda x, y: np.where(foot(x, y), 0.30 + 0.06 / math.cos(t) + (x + half) * math.tan(t), 0.30)
         with TemporaryDirectory() as d:
             est = bf.FillEstimator("realsense", Path(d), prof)
-            est.recalibrate(_render(prof, lambda x, y: 0 * x), K, None)
-            depth = _render(prof, scene)
-            est.update(np.zeros((K.height, K.width, 3), np.uint8), depth, K, None, 0.0, 1.0)
-            rows, cols = np.nonzero(depth < 1.10 - 0.33)
+            est.recalibrate(self._march(lambda x, y: 0 * x), self.KW, None)
+            depth = self._march(scene)
+            est.update(np.zeros((self.KW.height, self.KW.width, 3), np.uint8), depth, self.KW, None, 0.0, 1.0)
+            rows, cols = np.nonzero(depth < 1.10 - pile - 0.02)
             litres, tall = est.object_volume((cols.min(), rows.min(), cols.max() + 1, rows.max() + 1), None, 1.5)
-        self.assertLess(abs(litres - 3.6) / 3.6, 0.25, litres)     # was 4.86 L (+35 %)
-        self.assertLess(tall, 0.10, tall)                           # thickness, not the 19 cm raised corner
-        self.assertIn("slab", est.last_object["method"])
+        return litres, tall, est.last_object
+
+    def test_leaning_box_volume_and_size(self):
+        for deg in (15, 25, 40):
+            with self.subTest(tilt=deg):
+                litres, tall, obj = self._measure(deg)
+                self.assertLess(abs(litres - 4.73) / 4.73, 0.25, litres)
+                self.assertLess(abs(tall - 0.07), 0.025, tall)               # thickness, not the raised end
+                self.assertLess(abs(obj["length_m"] - 0.45), 0.04, obj)
+                self.assertLess(abs(obj["width_m"] - 0.15), 0.03, obj)
+                self.assertIn("slab", obj["method"])
+
+    def test_flat_box_is_unchanged(self):
+        litres, tall, obj = self._measure(0)
+        self.assertLess(abs(litres - 4.73) / 4.73, 0.05, litres)
+        self.assertNotIn("slab", obj["method"])
 
 
 if __name__ == "__main__":

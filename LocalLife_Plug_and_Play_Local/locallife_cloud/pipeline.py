@@ -31,7 +31,7 @@ from .geometry import (
 from .inference import MetricDepthEstimator, create_segmenter
 from .material_siglip import create_material_classifier
 from .ledger import WastePlantLedger, waste_object_type
-from .logitech import DETECTOR_ONLY_SOURCE, bound_logitech_detections, stabilize_background_depth
+from .logitech import DETECTOR_ONLY_SOURCE, _touched_sides, bound_logitech_detections, object_color, stabilize_background_depth
 from .heightmap_volume import (
     HeightMapSettings,
     HeightMapVolume,
@@ -361,6 +361,43 @@ def filter_waste_detections(
         retained.append(detection)
 
     return deduplicate_overlapping_detections(retained, (frame_height, frame_width))
+
+
+def readmit_corner_bags(
+    frame: np.ndarray, baseline: np.ndarray | None, accepted: list[Detection], kept: list[Detection],
+    region: np.ndarray, *, min_pixels: int, max_scene_fraction: float, foreground_threshold: int,
+) -> list[Detection]:
+    """Logitech: a bag in the near corner of a FULL bin touches two ROI sides and covers > 25 %
+    of it, so `bound_logitech_detections` drops it as a wall/floor leak. A detector mask that is
+    one solid blob (>= 60 % of its box), touches at most two sides and stays within the scene
+    limit is an object: it is kept detector-only (tracked, counted, coloured), never the
+    Logitech metric volume. Sparse wall/floor masks still fail the solidity test."""
+    shape = frame.shape[:2]
+    region_area = max(1, int(np.count_nonzero(region)))
+    taken = np.zeros(shape, dtype=bool)
+    for item in kept:
+        if item.mask is not None and item.mask.shape == shape:
+            taken |= item.mask
+    added: list[Detection] = []
+    for detected in accepted:
+        seed = combined_mask([detected], shape) & region
+        area = int(np.count_nonzero(seed))
+        if area < min_pixels or np.count_nonzero(seed & taken) > 0.3 * area:
+            continue
+        rows, columns = np.nonzero(seed)
+        box = (int(columns.min()), int(rows.min()), int(columns.max()) + 1, int(rows.max()) + 1)
+        footprint = (box[2] - box[0]) * (box[3] - box[1])
+        if area / max(1, footprint) < 0.6 or footprint / region_area > max_scene_fraction \
+                or _touched_sides(seed, region) > 2:
+            continue
+        taken |= seed
+        added.append(Detection(
+            label=detected.label, confidence=detected.confidence, box=box, mask=seed,
+            source=DETECTOR_ONLY_SOURCE,
+            color=object_color(frame, seed, baseline=baseline, label=detected.label,
+                               foreground_threshold=foreground_threshold),
+        ))
+    return kept + added
 
 
 def deduplicate_overlapping_detections(
@@ -1429,6 +1466,7 @@ class VisionPipeline:
                     and calibrated_prediction.shape == self.reference_monocular.shape:
                 rise = self.reference_monocular.astype(np.float32) - calibrated_prediction
                 depth_change = np.isfinite(rise) & (rise >= self.config.logitech_min_object_height_m)
+            raw_logitech = list(detections)
             detections, segmentation_warnings = bound_logitech_detections(
                 frame,
                 self.reference_rgb,
@@ -1446,6 +1484,13 @@ class VisionPipeline:
                 duplicate_overlap=self.config.logitech_duplicate_overlap,
                 depth_change=depth_change,
                 debug=mask_debug,
+            )
+            detections = readmit_corner_bags(
+                frame, self.reference_rgb, raw_logitech, detections, bin_region,
+                min_pixels=minimum_object_pixels(
+                    frame.shape[:2], min(self.config.min_component_pixels, self.config.logitech_min_object_pixels)),
+                max_scene_fraction=self.config.logitech_max_scene_fraction,
+                foreground_threshold=self.config.foreground_threshold,
             )
             self.logitech_mask_debug = {"frame": frame, **mask_debug}
             # Startup, without asking the operator for anything: the floor plane
@@ -6143,6 +6188,12 @@ class VisionPipeline:
                 max_scene_fraction=self.config.logitech_max_scene_fraction,
                 max_expansion=self.config.logitech_max_mask_expansion,
                 duplicate_overlap=self.config.logitech_duplicate_overlap, debug=debug,
+            )
+            final = readmit_corner_bags(
+                frame, self.reference_rgb, accepted, final, region,
+                min_pixels=self.config.logitech_min_object_pixels,
+                max_scene_fraction=self.config.logitech_max_scene_fraction,
+                foreground_threshold=self.config.foreground_threshold,
             )
         raw_view = frame.copy()
         for item, verdict in zip(raw, verdicts):
