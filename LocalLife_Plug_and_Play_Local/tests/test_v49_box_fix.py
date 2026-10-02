@@ -459,3 +459,36 @@ class LogitechObliqueVolumeTests(unittest.TestCase):
             corrected, applied = factors.correct(0.30, "irregular")
             self.assertAlmostEqual(corrected, 0.30 * applied["factor"])
             self.assertAlmostEqual(applied["factor"], 4.7, delta=0.3)                         # median of ratios
+
+
+class UprightBoxOnARoomFloorTests(unittest.TestCase):
+    """Live test setup: a milk carton standing on a room floor, cameras looking across the room. The
+    fill map's 'floor' was the far wall, so the carton's FRONT face was read as its top (22 x 10 x 3 cm,
+    0.71 L). Now the surface it stands on is found locally and two visible faces give the box."""
+
+    def _measure(self, dims, wrong_floor):
+        import cv2
+        from locallife_cloud import bin_fill as bf
+        sys.path.insert(0, str(PROJECT / "tests"))
+        from test_v45_bin_fill_events import _profile
+        depth, mask = _scene(lambda x, y: 0 * x, _obb(*dims, 0, 30, 0.0), 70, cam=0.6, far=4.5)
+        empty, _ = _scene(lambda x, y: 0 * x, None, 70, cam=0.6, far=4.5)
+        depth = depth + np.random.default_rng(1).normal(0, 0.003, depth.shape).astype(np.float32)
+        mask = cv2.dilate(mask.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+        with TemporaryDirectory() as d:
+            est = bf.FillEstimator("realsense", Path(d), _profile(camera_to_empty_floor_m=0.6, usable_height_m=0.5,
+                                                                   tilt_from_vertical_deg=70.0))
+            est.recalibrate(empty, KW, None)
+            est.update(np.zeros((KW.height, KW.width, 3), np.uint8), depth, KW, None, 0.0, 1.0)
+            if wrong_floor:
+                est.last_surface["up"] = np.array([0.0, 0.0, -1.0])     # the far wall taken as the floor
+            r, c = np.nonzero(mask)
+            return est.object_volume((c.min(), r.min(), c.max() + 1, r.max() + 1), mask, 1.5), est.last_object
+
+    def test_upright_carton_from_two_faces_even_with_the_wrong_floor(self):
+        for wrong in (False, True):
+            with self.subTest(wrong_floor=wrong):
+                (litres, height), obj = self._measure((0.09, 0.09, 0.20), wrong)
+                self.assertLess(abs(litres - 1.62) / 1.62, 0.15, (litres, obj))
+                self.assertLess(abs(height - 0.20), 0.02)
+                self.assertIn("visible faces", obj["method"])

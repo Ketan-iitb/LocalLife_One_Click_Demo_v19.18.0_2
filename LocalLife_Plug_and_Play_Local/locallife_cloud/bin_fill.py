@@ -591,6 +591,14 @@ class FillEstimator:
         if support_px.size < 10 or np.count_nonzero(top) < 10:
             return None
         support = float(np.percentile(support_px, 50))
+        local = _local_support(surface, ring & valid, y1, y2)
+        if local is not None:
+            # The object stands on a clear flat surface that is NOT the fill map's floor (a test on a room
+            # floor, where the deepest flat surface was the far wall): measure against what it stands on.
+            surface = {**surface, "up": local["up"], "height": local["height"]}
+            height = surface["height"]
+            support_px = height[ring & ok]
+            support = float(np.percentile(support_px, 50)) if support_px.size else 0.0
         # A closed rigid box shows a flat rectangular face: measure it as a cuboid from its own
         # face and an OBSERVED thickness (side face / support at its low edge), not as the volume
         # above a ring median -- on uneven bags that support cut the box's low end off (45 cm box
@@ -602,9 +610,18 @@ class FillEstimator:
                                 "litres": None if face.get("litres") is None else round(face["litres"], 2),
                                 "tilt_deg": face["tilt_deg"], "face_share": face["share"],
                                 "thickness_source": face.get("thickness_source"), "reason": face.get("reason")}
-            if face.get("litres") is None:
-                return None                              # L x W seen, thickness not observable: no number
-            return round(face["litres"], 2), face["thickness"]
+            if face.get("litres") is not None:
+                return round(face["litres"], 2), face["thickness"]
+        box3d = _oriented_box(surface, top, support)
+        if box3d is not None:
+            # Two or three faces of a box seen from the side (upright carton): each face spans two box
+            # axes, so the visible faces give all three dimensions without any support assumption.
+            self.last_object = {"length_m": box3d["length"], "width_m": box3d["width"],
+                                "height_m": box3d["height"], "method": box3d["method"], "planar": True,
+                                "litres": round(box3d["litres"], 2), "faces": box3d["faces"]}
+            return round(box3d["litres"], 2), box3d["height"]
+        if face is not None:
+            return None                                  # L x W seen, thickness not observable: no number
         rise_map = np.where(top, height - support, 0.0)
         risen = top & (rise_map > 0.02)
         # One object: the largest connected risen region. A box drawn around a diagonal parcel
@@ -670,11 +687,16 @@ class FillEstimator:
         if cx2 - cx1 < 4 or cy2 - cy1 < 4:
             return None
         k = full["intrinsics"]
-        intr = type(k)(fx=k.fx, fy=k.fy, ppx=k.ppx - cx1, ppy=k.ppy - cy1, width=cx2 - cx1, height=cy2 - cy1)
-        crop = depth[cy1:cy2, cx1:cx2].astype(np.float32) / float(full["drift"] or 1.0)
+        # Small objects at full resolution; a large one is strided to ~40k points so a frame with several
+        # big bags stays fast (the fill map is ~19k points; the crop is never coarser than it).
+        stride = max(1, int(math.ceil(math.sqrt((cx2 - cx1) * (cy2 - cy1) / 40000.0))))
+        stride = min(stride, int(surface.get("step", 1)))
+        intr = type(k)(fx=k.fx / stride, fy=k.fy / stride, ppx=(k.ppx - cx1) / stride, ppy=(k.ppy - cy1) / stride,
+                       width=(cx2 - cx1 + stride - 1) // stride, height=(cy2 - cy1 + stride - 1) // stride)
+        crop = depth[cy1:cy2:stride, cx1:cx2:stride].astype(np.float32) / float(full["drift"] or 1.0)
         height, flat, valid = surface_maps(crop, intr, self.profile, full["plane"], full["scale"])
         if full["region"] is not None and full["region"].shape == depth.shape:
-            valid &= full["region"][cy1:cy2, cx1:cx2]
+            valid &= full["region"][cy1:cy2:stride, cx1:cx2:stride]
         if np.count_nonzero(flat & valid) < 0.30 * max(1, int(np.count_nonzero(valid))):
             flat = np.ones_like(flat)
         z = crop * full["scale"]
@@ -682,8 +704,8 @@ class FillEstimator:
         patch = {"at": surface["at"], "step": 1, "height": height, "ok": valid & flat, "valid": valid,
                  "area": (z / intr.fx) * (z / intr.fy), "x": (cols - intr.ppx) * z / intr.fx,
                  "y": (rows - intr.ppy) * z / intr.fy, "z": z, "up": surface["up"]}
-        crop_mask = None if mask is None or getattr(mask, "ndim", 0) != 2 else mask[cy1:cy2, cx1:cx2]
-        return patch, (x1 - cx1, y1 - cy1, x2 - cx1, y2 - cy1), crop_mask
+        crop_mask = None if mask is None or getattr(mask, "ndim", 0) != 2 else mask[cy1:cy2:stride, cx1:cx2:stride]
+        return patch, ((x1 - cx1) / stride, (y1 - cy1) / stride, (x2 - cx1) / stride, (y2 - cy1) / stride), crop_mask
 
     def _up_vector(self, plane) -> np.ndarray:
         if plane is not None:
@@ -1009,6 +1031,85 @@ def _box_from_face(surface, cells, rows, cols, keep, face_img, pts, centre, axes
                    "litres": length * width * thickness * 1000.0,
                    "method": f"box cuboid: face L x W (in its own plane) x thickness from {source}"})
     return result
+
+
+def _local_support(surface: dict[str, Any], ring: np.ndarray, y1: int, y2: int) -> dict[str, Any] | None:
+    """A flat surface the object stands on (points around and below it), when it disagrees with the fill
+    map's floor by more than 25 deg. None inside a bin (the pile is not flat) or when they agree."""
+    if "x" not in surface or "up" not in surface:
+        return None
+    lower = ring.copy()
+    lower[: y1 + int(0.6 * (y2 - y1))] = False         # beside the bottom of the object and below it
+    rows, cols = np.nonzero(lower)
+    if rows.size < 40:
+        return None
+    pts = np.c_[surface["x"][lower], surface["y"][lower], surface["z"][lower]].astype(np.float64)
+    fit = _ransac_plane(pts, tol=0.01, iterations=80)
+    if fit is None:
+        return None
+    keep, centre, axes, rms = fit
+    if keep.sum() < max(30, 0.5 * len(pts)) or rms > 0.008:
+        return None
+    normal = axes[2] if float(axes[2] @ -centre) > 0 else -axes[2]   # towards the camera side
+    up = np.asarray(surface["up"], dtype=np.float64)
+    if float(abs(normal @ up)) > math.cos(math.radians(25)):
+        return None                                     # agrees with the fill floor: keep that one
+    full = np.dstack([surface["x"], surface["y"], surface["z"]]).astype(np.float64)
+    return {"up": normal, "height": (full - centre) @ normal}
+
+
+def _oriented_box(surface: dict[str, Any], cells: np.ndarray, support: float | None = None) -> dict[str, Any] | None:
+    """Box from 2-3 visible faces: planes found one after another in the object's points (only points
+    above what it stands on -- a bleeding mask also picks up that flat floor); two roughly perpendicular
+    planes give the box axes; L x W = the face points' extents along them; H = top above the support."""
+    if "x" not in surface or np.count_nonzero(cells) < 60:
+        return None
+    pts = np.c_[surface["x"][cells], surface["y"][cells], surface["z"][cells]].astype(np.float64)
+    rise = surface["height"][cells].astype(np.float64) - (support or 0.0)
+    near = (np.abs(pts[:, 2] - np.median(pts[:, 2])) < 0.4) & (rise > 0.01)
+    pts, rise = pts[near], rise[near]
+    if len(pts) < 60:
+        return None
+    rest, idx_rest, normals, members = pts, np.arange(len(pts)), [], []
+    for _ in range(3):
+        if len(rest) < 30:
+            break
+        fit = _ransac_plane(rest, tol=0.008, iterations=100)
+        if fit is None:
+            break
+        keep, centre, axes, rms = fit
+        if keep.sum() < max(25, 0.12 * len(pts)) or rms > 0.01:
+            break
+        # A real face is FLAT: tight residuals and few points just outside the band. A rounded bag fills
+        # the band evenly (rms ~ tol / sqrt 3) and keeps going past it -- three dome patches looked like a box.
+        dist = np.abs((rest - centre) @ axes[2])
+        shell = int(np.count_nonzero((dist > 0.008) & (dist < 0.02)))
+        if rms > 0.0038 or shell > 0.3 * keep.sum():
+            break
+        normals.append(axes[2])
+        members.append(idx_rest[keep])
+        rest, idx_rest = rest[~keep], idx_rest[~keep]
+    pair = next(((a, b) for a in range(len(normals)) for b in range(a + 1, len(normals))
+                 if abs(float(normals[a] @ normals[b])) < 0.3), None)
+    on_faces = np.concatenate(members) if members else np.array([], dtype=int)
+    if pair is None or len(on_faces) < 0.6 * len(pts):
+        return None                                      # not a box seen on two faces
+    a1 = normals[pair[0]]
+    a2 = normals[pair[1]] - (normals[pair[1]] @ a1) * a1
+    a2 /= np.linalg.norm(a2)
+    a3 = np.cross(a1, a2)
+    face_pts = pts[on_faces]
+    ext = [float(np.percentile(face_pts @ ax, 99.5) - np.percentile(face_pts @ ax, 0.5)) for ax in (a1, a2, a3)]
+    up = np.asarray(surface.get("up", a3), dtype=np.float64)
+    vertical = int(np.argmax([abs(float(ax @ up)) for ax in (a1, a2, a3)]))
+    if abs(float((a1, a2, a3)[vertical] @ up)) > 0.9:
+        ext[vertical] = float(np.percentile(rise[on_faces], 99.5))   # stands on the support: top above it
+    if min(ext) < 0.02 or max(ext) > 1.5:
+        return None
+    flat = sorted((e for i, e in enumerate(ext) if i != vertical), reverse=True)
+    return {"length": flat[0], "width": flat[1], "height": ext[vertical],
+            "litres": ext[0] * ext[1] * ext[2] * 1000.0, "faces": len(normals),
+            "method": f"box from {len(normals)} visible faces: extents along the faces' own axes (L x W x H)"}
 
 
 def _floor_raster(surface: dict[str, Any], risen: np.ndarray, rise_map: np.ndarray) -> dict[str, float] | None:
