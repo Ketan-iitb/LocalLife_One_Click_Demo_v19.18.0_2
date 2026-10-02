@@ -495,5 +495,24 @@ class V49ParcelTests(unittest.TestCase):
         self.assertLess(abs(litres - truth) / truth, 0.25, (litres, truth))       # the neighbour is excluded
 
 
+class V49SlabTests(unittest.TestCase):
+    def test_tilted_box_volume_excludes_air_under_raised_end(self):
+        # synthetic: a 30x20x6 cm box (3.6 L) tilted 30 deg on a 30 cm pile
+        prof = _profile(camera_to_empty_floor_m=1.10, usable_height_m=1.00)
+        t = math.radians(30); half = 0.15 * math.cos(t)
+        foot = lambda x, y: (np.abs(x) < half) & (np.abs(y) < 0.10)
+        scene = lambda x, y: np.where(foot(x, y), 0.30 + 0.06 / math.cos(t) + (x + half) * math.tan(t), 0.30)
+        with TemporaryDirectory() as d:
+            est = bf.FillEstimator("realsense", Path(d), prof)
+            est.recalibrate(_render(prof, lambda x, y: 0 * x), K, None)
+            depth = _render(prof, scene)
+            est.update(np.zeros((K.height, K.width, 3), np.uint8), depth, K, None, 0.0, 1.0)
+            rows, cols = np.nonzero(depth < 1.10 - 0.33)
+            litres, tall = est.object_volume((cols.min(), rows.min(), cols.max() + 1, rows.max() + 1), None, 1.5)
+        self.assertLess(abs(litres - 3.6) / 3.6, 0.25, litres)     # was 4.86 L (+35 %)
+        self.assertLess(tall, 0.10, tall)                           # thickness, not the 19 cm raised corner
+        self.assertIn("slab", est.last_object["method"])
+
+
 if __name__ == "__main__":
     unittest.main()

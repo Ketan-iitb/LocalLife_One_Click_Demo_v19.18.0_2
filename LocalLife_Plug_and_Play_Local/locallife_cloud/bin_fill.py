@@ -383,7 +383,8 @@ class FillEstimator:
         self.last_surface = {"at": timestamp, "step": step, "height": height, "ok": valid & flat, "valid": valid,
                              "area": (z_all / intrinsics.fx) * (z_all / intrinsics.fy),
                              "x": (cols_ - intrinsics.ppx) * z_all / intrinsics.fx,
-                             "y": (rows_ - intrinsics.ppy) * z_all / intrinsics.fy}
+                             "y": (rows_ - intrinsics.ppy) * z_all / intrinsics.fy, "z": z_all,
+                             "up": self._up_vector(plane)}
         a_, b_, c_ = plane if plane is not None else (0.0, 0.0, None)
         self.last_diag = {
             "floor_source": geometry, "depth_source": depth_label,
@@ -604,12 +605,29 @@ class FillEstimator:
         if litres > 250.0 or tall > self.profile.usable_height_m + RIM_TOLERANCE_M:
             return None                                  # implausible: unavailable, never clamped
         length = width = None
+        method = "surface rise above the local surface"
         if cv2 is not None and "x" in surface:
             pts = np.c_[surface["x"][risen], surface["y"][risen]].astype(np.float32)
             (_, _), (w1, w2), _ = cv2.minAreaRect(pts)     # oriented: a diagonal parcel stays long/thin
             length, width = float(max(w1, w2)), float(min(w1, w2))
-        self.last_object = {"length_m": length, "width_m": width, "height_m": tall, "litres": round(litres, 2)}
+        slab = _tilted_slab(surface, risen, rise_map)
+        if slab is not None and slab["litres"] < litres:
+            # A rigid flat-topped object (box, book) propped on the pile at an angle: integrating
+            # the top surface down to the support counted the AIR under its raised end (a ~4 L box
+            # read 8.3 L, 31 cm "tall"). Its own plane gives in-plane L x W and the thickness.
+            litres, tall = slab["litres"], slab["thickness"]
+            length, width = slab["length"], slab["width"]
+            method = "tilted rigid slab: top-face L x W x thickness"
+        self.last_object = {"length_m": length, "width_m": width, "height_m": tall, "litres": round(litres, 2),
+                            "method": method}
         return round(litres, 2), tall
+
+    def _up_vector(self, plane) -> np.ndarray:
+        if plane is not None:
+            a, b, _ = plane
+            return np.array([a, b, -1.0]) / math.sqrt(a * a + b * b + 1.0)
+        tilt = math.radians(self.profile.tilt_from_vertical_deg or 0.0)
+        return np.array([0.0, -math.sin(tilt), -math.cos(tilt)])
 
     def _hold(self, reason: str, *, warnings: list[str] | None = None, stale_only: bool = False) -> dict[str, Any]:
         """Keep the last valid reading (marked stale, with its age) instead of inventing a fresh one."""
@@ -732,6 +750,34 @@ def surface_maps(depth_m: np.ndarray, intrinsics: Any, profile: FillProfile, pla
         facing = np.abs(normal @ up) / length
     flat = np.nan_to_num(facing) >= math.cos(math.radians(55))
     return np.nan_to_num(height, nan=-9.0), flat, valid & np.isfinite(height)
+
+
+def _tilted_slab(surface: dict[str, Any], risen: np.ndarray, rise_map: np.ndarray) -> dict[str, float] | None:
+    """A flat, tilted top face (rigid box / book), or None for rounded shapes (bags).
+
+    Plane fit of the object's 3-D points: flat (RMS < 1.2 cm) and tilted > 15 deg from the
+    floor. L x W are its extents in that plane; the thickness is the rise at its LOWEST
+    edge (where it rests on the support), measured perpendicular to the face.
+    """
+    if "z" not in surface or "up" not in surface or np.count_nonzero(risen) < 30:
+        return None
+    pts = np.c_[surface["x"][risen], surface["y"][risen], surface["z"][risen]].astype(np.float64)
+    centre = pts.mean(axis=0)
+    _, sing, axes = np.linalg.svd(pts - centre, full_matrices=False)
+    rms = float(sing[2] / math.sqrt(len(pts)))
+    normal = axes[2]
+    cos_tilt = abs(float(normal @ surface["up"]))
+    if rms > 0.012 or cos_tilt > math.cos(math.radians(15)):
+        return None
+    along = (pts - centre) @ axes[0]
+    across = (pts - centre) @ axes[1]
+    length = float(np.percentile(along, 98) - np.percentile(along, 2))
+    width = float(np.percentile(across, 98) - np.percentile(across, 2))
+    thickness = float(np.percentile(rise_map[risen], 10)) * cos_tilt
+    if thickness <= 0.005 or length <= 0 or width <= 0:
+        return None
+    return {"length": max(length, width), "width": min(length, width), "thickness": thickness,
+            "litres": length * width * thickness * 1000.0}
 
 
 def cv2_dilate(mask: np.ndarray) -> np.ndarray:
