@@ -188,6 +188,7 @@ class Detection:
             "color_confidence": round(float(self.color_confidence), 4),
             "sorting_status": self.sorting_status,
             "sorting_reason": self.sorting_reason,
+            **_bin_policy(self),
             "material": self.material,
             "material_confidence": round(float(self.material_confidence), 4),
             "track_id": self.track_id,
@@ -518,3 +519,14 @@ class FrameAnalysis:
             "inference_ms": round(float(self.inference_ms), 2),
             "warnings": self.warnings,
         }
+
+
+def _bin_policy(detection: "Detection") -> dict:
+    """V49 plastic-bags-only verdict for the dashboard (bin_policy.py); never raises."""
+    try:
+        from .bin_policy import verdict
+        v = verdict(detection.label, detection.material, detection.material_confidence, detection.color)
+    except Exception:  # noqa: BLE001 - display only
+        return {}
+    return {"bin_sorting": v["status"], "bin_sorting_text": v["text"], "bin_sorting_reason": v["reason"],
+            "bin_object": v["object"]}

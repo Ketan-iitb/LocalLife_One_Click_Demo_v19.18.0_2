@@ -943,7 +943,10 @@ def _dominant_color_with_support(
     brightness = sample.max(axis=1) if sample.size else np.array([255.0])
     reference = float(np.percentile(brightness, 98))
     # Only a genuinely dark frame (dark background AND dim highlights): an evenly lit grey scene stays grey.
-    if 20.0 < reference < 0.7 * 255.0 and float(np.median(brightness)) < 0.25 * 255.0:
+    # A truly dark object (black bag, raw brightness < 80) is never brightened: the gain turned
+    # black bags blue/cyan. A white bag at half exposure is still >= ~110 raw and is normalised.
+    if 20.0 < reference < 0.7 * 255.0 and float(np.median(brightness)) < 0.25 * 255.0 \
+            and float(np.median(selected.max(axis=1))) >= 80.0:
         selected = np.clip(selected * min(2.5, 0.92 * 255.0 / reference), 0.0, 255.0)
 
     # Do not average unlike colours into a third, fictional colour.  That was

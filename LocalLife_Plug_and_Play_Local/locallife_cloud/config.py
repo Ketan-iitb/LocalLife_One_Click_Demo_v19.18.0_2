@@ -349,7 +349,9 @@ class AppConfig:
     logitech_min_object_pixels: int = 150
     # Logitech detector confidence; same as detector_confidence unless tuned
     # from the /api/cameras/logitech/diagnose-detector raw predictions.
-    logitech_detector_confidence: float = 0.24
+    # V49: 0.15 -- from the oblique (60-70 deg) Logitech view YOLOE scores the same bags lower;
+    # bound_logitech_detections still verifies every mask against the empty scene.
+    logitech_detector_confidence: float = 0.15
     # Flat packets and thin cartons: the RealSense minimum (25 mm) hid them.
     logitech_min_object_height_m: float = 0.010
     # Support-plane cell size for the Logitech height map (metres).
@@ -404,7 +406,9 @@ class AppConfig:
     logitech_provisional_systematic_error_fraction: float = 0.35
     logitech_require_overhead: bool = True
     logitech_max_tilt_degrees: float = 35.0
-    logitech_hard_max_tilt_degrees: float = 65.0
+    # V49: the installed Logitech looks 20-30 deg below the horizon (60-70 deg from vertical);
+    # within this ceiling litres are reported with the tilt uncertainty penalty.
+    logitech_hard_max_tilt_degrees: float = 70.0
     logitech_max_tilt_uncertainty_fraction: float = 0.50
     logitech_duplicate_overlap: float = 0.55
     logitech_min_valid_height_fraction: float = 0.35

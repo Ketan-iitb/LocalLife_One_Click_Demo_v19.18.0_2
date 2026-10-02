@@ -42,6 +42,8 @@ from typing import Any, Callable
 
 import numpy as np
 
+from .bin_policy import apply_to_event
+
 LOGGER = logging.getLogger(__name__)
 
 SMALL = (160, 120)             # evaluation resolution (w, h)
@@ -71,7 +73,7 @@ CSV_FIELDS = (
     "track_id", "colour", "object_type", "detector_label", "material", "length_cm", "width_cm", "height_cm",
     "height_source", "envelope_l", "delta_occupancy_l", "measurement_status", "reason",
     "volume_method", "units", "bin_fill_pct_after", "bin_fill_litres_after",
-    "bin_fill_pct_before", "bin_fill_litres_before",
+    "bin_fill_pct_before", "bin_fill_litres_before", "sorting", "sorting_reason",
 )
 
 
@@ -763,6 +765,8 @@ class SessionDeposits:
     def _write_csv(self, record: dict[str, Any]) -> None:
         if record["event_id"] in self.written:
             return
+        if record.get("counted"):
+            apply_to_event(record)
         try:
             self.directory.mkdir(parents=True, exist_ok=True)
             if self.csv_path.exists():
@@ -811,7 +815,7 @@ class SessionDeposits:
                 "elapsed_s": round(now - self.session_started_at, 1), "resumed": self.resumed,
                 "updated_at": max(frames) if frames else None, "status": status, "cameras": cams,
                 "new_bags_this_session": self.count, "last_confirmed_at": self.last_confirmed_at,
-                "events": [{k: v for k, v in e.items()} for e in self.events],
+                "events": [apply_to_event({k: v for k, v in e.items()}) for e in self.events],
                 "rejected_candidates": len(self.rejected), "ignored_redetections": self.ignored_redetections,
                 "recent_rejections": [{"camera": r["cameras"][0], "reason": r["reason"], "at": r["deposit_time"]}
                                       for r in self.rejected[-5:]],

@@ -460,5 +460,38 @@ class V49ObjectTests(unittest.TestCase):
             self.assertFalse(sd.bag_like(label), label)
 
 
+class V49BinPolicyTests(unittest.TestCase):
+    """Plastic bags only: anything else is a MIS-SORT; bags misread as textile pass on material."""
+
+    def test_verdicts(self):
+        from locallife_cloud.bin_policy import verdict
+        cases = {
+            ("book", "paper", 0.37, "brown"): ("mis_sort", "cardboard box"),
+            ("cardboard shipping box", None, None, None): ("mis_sort", "cardboard box"),
+            ("shoe", None, None, None): ("mis_sort", "shoe"),
+            ("drill", None, None, None): ("mis_sort", "drill"),
+            ("waste bag", "unknown", None, None): ("correct", "waste bag"),
+            ("textile item", "polythene bag", 0.71, "white"): ("correct", "plastic bag"),
+            ("folded clothing", "unknown", None, None): ("check", "folded clothing"),
+            ("paper bag", None, None, None): ("mis_sort", "paper bag"),
+            ("person", None, None, None): ("ignore", "person"),
+        }
+        for args, (status, obj) in cases.items():
+            with self.subTest(label=args[0]):
+                v = verdict(*args)
+                self.assertEqual((v["status"], v["object"]), (status, obj))
+
+    def test_deposit_row_and_ledger_carry_the_alarm(self):
+        from locallife_cloud.bin_policy import apply_to_event
+        from locallife_cloud.session_deposits import CSV_FIELDS
+        row = apply_to_event({"detector_label": "book", "material": "UNKNOWN", "colour": "brown", "track_id": 3})
+        self.assertEqual(row["sorting"], "MIS-SORT")
+        self.assertEqual((row["object_type"], row["material"]), ("cardboard box", "CARDBOARD"))
+        self.assertIn("sorting", CSV_FIELDS)
+        from locallife_cloud.bin_fill_panel import BIN_FILL_PANEL
+        self.assertIn("bf-mis", BIN_FILL_PANEL)
+        self.assertNotIn("bf-alarm", BIN_FILL_PANEL)          # red text only, no alarm banner
+
+
 if __name__ == "__main__":
     unittest.main()
