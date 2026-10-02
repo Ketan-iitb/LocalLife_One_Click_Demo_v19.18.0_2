@@ -390,5 +390,26 @@ class V49Tests(unittest.TestCase):
             self.assertEqual(e["volume_method"], "volume above the local surface (median over the track)")
 
 
+
+class V49IndependenceTests(unittest.TestCase):
+    def test_a_realsense_deposit_never_reaches_the_logitech_counter_and_vice_versa(self) -> None:
+        with TemporaryDirectory() as d:
+            counter = sd.SessionDeposits(Path(d), clock=lambda: 0.0)
+            rs, lg = Scene("realsense", seed=1), Scene("logitech", depth=False, seed=2)
+            for s in (rs, lg):
+                s.add(1, (10, 10, 40, 40))
+                run(counter, s, 0.0, 7.0)
+            run(counter, rs, 7.0, 8.0, hand=True)
+            rs.add(5, (60, 60, 100, 100), height=0.25)                 # a bag ONLY the RealSense sees
+            run(counter, rs, 8.0, 12.0)
+            run(counter, lg, 7.0, 12.0)                                 # Logitech: unchanged scene
+            self.assertEqual((counter.count_for("realsense"), counter.count_for("logitech")), (1, 0))
+            run(counter, lg, 12.0, 13.0, hand=True)
+            lg.add(None, (100, 60, 140, 100), shade=230, tracked=False)  # Logitech-only change, no detection
+            got, _ = run(counter, lg, 13.0, 17.0)
+            self.assertEqual((counter.count_for("realsense"), counter.count_for("logitech")), (1, 1))
+            self.assertIn("foreground", got[0]["evidence"]["logitech"]["evidence"])   # its own pixels, no box
+
+
 if __name__ == "__main__":
     unittest.main()
