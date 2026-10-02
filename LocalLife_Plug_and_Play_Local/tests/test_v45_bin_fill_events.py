@@ -439,5 +439,31 @@ class V48TokenAndNoiseTests(unittest.TestCase):
             self.assertAlmostEqual(r["height_fill_pct"], 40.0, delta=5.0)
 
 
+
+class V49LogitechHoldTests(unittest.TestCase):
+    def test_a_blinking_logitech_detection_is_held_but_a_removed_bag_is_not(self) -> None:
+        from locallife_cloud.types import Detection
+        with TemporaryDirectory() as d:
+            config = AppConfig(detector_model="local-opencv-background", enable_monocular_depth=False,
+                               enable_bucket_sync=False, results_dir=Path(d))
+            station = DualCameraCoordinator(config).camera("logitech")
+            rng = np.random.default_rng(0)
+            frame = rng.integers(30, 80, (240, 320, 3)).astype(np.uint8)
+            frame[60:160, 100:220] = (200, 180, 230)                       # a pink bag
+            bag = Detection("plastic waste bag", 0.6, (100, 60, 220, 160))
+            bag.track_id = 3
+            station._remember_tracks(frame, [bag])
+            held = station._hold_through_dropout(frame, [])                 # detector blinked
+            self.assertEqual(len(held), 1)
+            self.assertEqual((held[0].source, held[0].box), ("held-through-dropout", (100, 60, 220, 160)))
+            self.assertEqual(station._hold_through_dropout(frame, [bag]), [])   # detector back: nothing added
+            gone = frame.copy()
+            gone[60:160, 100:220] = rng.integers(30, 80, (100, 120, 3))        # bag taken out
+            self.assertEqual(station._hold_through_dropout(gone, []), [])
+            seen_at, item, patch = station._held_tracks[3]
+            station._held_tracks[3] = (seen_at - 5.0, item, patch)             # missing for > 2 s
+            self.assertEqual(station._hold_through_dropout(frame, []), [])
+
+
 if __name__ == "__main__":
     unittest.main()

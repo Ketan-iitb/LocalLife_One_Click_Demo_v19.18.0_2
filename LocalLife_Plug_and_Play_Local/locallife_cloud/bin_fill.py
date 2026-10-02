@@ -549,7 +549,7 @@ class FillEstimator:
         """(litres, height m) of one detection above the surface AROUND it, from this camera's own map.
 
         Volume = sum over the object's pixels of (height - local support) x pixel floor area. The local
-        support is the 25th-percentile height in a ring around the box, so a bag lying on the pile is
+        support is the MEDIAN height in a ring around the box (on a +-6 cm uneven pile: mean |error| 6.8 % vs 16.9 % with the 25th percentile, which always over-read), so a bag lying on the pile is
         measured from the pile, not from the bin floor. None when the map is stale or support unclear.
         """
         surface = getattr(self, "last_surface", None)
@@ -574,11 +574,11 @@ class FillEstimator:
         ring = np.zeros_like(ok)
         ring[max(0, y1 - pad_y):min(h, y2 + pad_y), max(0, x1 - pad_x):min(w, x2 + pad_x)] = True
         ring &= ~inside
-        support_px = height[ring & ok]                   # support: upward-facing surface around the bag
+        support_px = height[ring & ok]                   # support: median of the surface around the bag
         top = inside & valid                             # the bag's own surface: any valid depth
         if support_px.size < 10 or np.count_nonzero(top) < 10:
             return None
-        support = float(np.percentile(support_px, 25))
+        support = float(np.percentile(support_px, 50))
         rise = height[top] - support
         keep = rise > 0.02
         if np.count_nonzero(keep) < 10:

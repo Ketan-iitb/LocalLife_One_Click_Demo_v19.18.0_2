@@ -165,6 +165,13 @@ def classification_conflict(detection: Detection) -> str | None:
     return None
 
 
+def _box_iou(a, b) -> float:
+    x1, y1, x2, y2 = max(a[0], b[0]), max(a[1], b[1]), min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / union if union > 0 else 0.0
+
+
 def _is_phantom_detection(detection: Detection) -> bool:
     return is_phantom_source(detection.source)
 
@@ -2652,8 +2659,12 @@ class VisionPipeline:
         # gated behind `_measurement_is_recordable`, exactly as the
         # LOCALLIFE_RECORD_ONLY_MEASURED docstring always promised ("shown live,
         # but never added to experiment databases").
+        if self.camera_id == "logitech":
+            detections = detections + self._hold_through_dropout(frame, detections)
         tracking_detections = detections
         new_ids = self.tracker.update(tracking_detections) if self.config.auto_count else []
+        if self.camera_id == "logitech":
+            self._remember_tracks(frame, detections)
         self.stage_counters["active_tracks_last_frame"] = sum(1 for item in detections if item.track_id is not None)
         self.stage_counters["confirmed_tracks_total"] = int(self.tracker.total_count)
         if self._previous_bin_total_l is not None:
@@ -3411,6 +3422,68 @@ class VisionPipeline:
 
     def reload_bin_profile(self) -> None:
         self._bin_profile = None
+
+    HOLD_SECONDS = 2.0          # Logitech: bridge a detector that blinks for a few frames
+    HOLD_PATCH_DIFF = 18.0      # mean grey difference (after brightness offset) still "the same object"
+
+    @staticmethod
+    def _patch(frame: np.ndarray, box) -> np.ndarray | None:
+        try:
+            import cv2
+        except ImportError:  # pragma: no cover
+            return None
+        x1, y1, x2, y2 = (int(round(v)) for v in box)
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+        if x2 - x1 < 6 or y2 - y1 < 6:
+            return None
+        crop = frame[y1:y2, x1:x2]
+        grey = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+        return cv2.resize(grey, (32, 32), interpolation=cv2.INTER_AREA).astype(np.float32)
+
+    def _remember_tracks(self, frame: np.ndarray, detections: list[Detection]) -> None:
+        held = self.__dict__.setdefault("_held_tracks", {})
+        now = time.time()
+        for item in detections:
+            if item.track_id is None or _is_phantom_detection(item) or item.source == "held-through-dropout":
+                continue
+            patch = self._patch(frame, item.box)
+            if patch is not None:
+                held[item.track_id] = (now, item, patch)
+        for key in [k for k, v in held.items() if now - v[0] > self.HOLD_SECONDS]:
+            held.pop(key, None)
+
+    def _hold_through_dropout(self, frame: np.ndarray, detections: list[Detection]) -> list[Detection]:
+        """Logitech's detector misses a bag for a frame or two, then finds it again -- the bag
+        blinked on and off. A recently tracked bag that is missing from this frame, whose image
+        patch is unchanged and that no current detection overlaps, is kept (same track) for up to
+        2 s. A bag that was taken out or covered changes the patch and is dropped immediately."""
+        import copy
+
+        held = self.__dict__.get("_held_tracks") or {}
+        now = time.time()
+        present = [d.box for d in detections]
+        kept: list[Detection] = []
+        for track_id, (seen_at, item, patch) in held.items():
+            if now - seen_at > self.HOLD_SECONDS:
+                continue
+            if any(_box_iou(item.box, box) > 0.3 for box in present):
+                continue
+            current = self._patch(frame, item.box)
+            if current is None:
+                continue
+            # Tolerate an exposure shift (<= 25 grey levels), not a different object.
+            offset = float(np.clip(np.mean(current - patch), -25.0, 25.0))
+            if float(np.mean(np.abs(current - patch - offset))) > self.HOLD_PATCH_DIFF:
+                continue
+            ghost = copy.copy(item)
+            ghost.track_id = None
+            ghost.source = "held-through-dropout"
+            ghost.confidence = round(float(item.confidence) * 0.8, 3)
+            kept.append(ghost)
+        if kept:
+            self.stage_counters["logitech_held_through_dropout"] += len(kept)
+        return kept
 
     def _emit_deposit_evidence(self, frame, detections, depth_m, intrinsics, bin_region,
                                monocular=None, monocular_intrinsics=None) -> None:
