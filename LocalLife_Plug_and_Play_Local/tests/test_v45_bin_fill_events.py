@@ -404,5 +404,40 @@ class V48GapTests(unittest.TestCase):
                          ["height_fill_pct"], 0.0)
 
 
+
+class V48TokenAndNoiseTests(unittest.TestCase):
+    def test_reset_with_api_token_enabled(self) -> None:
+        # Live bug: on the cloud the API token is on; the panel's reset POST sent no token -> 401,
+        # so the session never changed ("3:48:38 PM (resumed)") although the button "worked".
+        with TemporaryDirectory() as d:
+            config = AppConfig(detector_model="local-opencv-background", enable_monocular_depth=False,
+                               enable_bucket_sync=False, results_dir=Path(d), api_token="secret-token")
+            manager = DualCameraCoordinator(config)
+            client = create_app(config, manager).test_client()
+            before = manager.deposits.session_id
+            self.assertEqual(client.post("/api/bin-fill/session/new").status_code, 401)
+            page = client.get("/").get_data(as_text=True)
+            self.assertIn("bfHeaders()", page)                                 # the panel sends the token
+            ok = client.post("/api/bin-fill/session/new", headers={"X-API-Token": "secret-token"})
+            self.assertEqual(ok.status_code, 200)
+            self.assertNotEqual(ok.get_json()["session"]["session_id"], before)
+            self.assertEqual(ok.get_json()["session"]["new_bags_this_session"], 0)
+
+    def test_heavy_stereo_noise_still_gives_a_fill_reading(self) -> None:
+        rng = np.random.default_rng(2)
+        prof = _profile(camera_to_empty_floor_m=1.10, usable_height_m=1.00)
+        with TemporaryDirectory() as d:
+            est = bf.FillEstimator("realsense", Path(d), prof)
+            est.recalibrate(_render(prof, lambda x, y: 0 * x), K, None)
+            scene = _render(prof, lambda x, y: 0.40 + 0 * x)
+            import cv2
+            ripple = cv2.GaussianBlur(rng.normal(0, 1, scene.shape), (0, 0), 2.0)
+            noisy = scene + ripple / ripple.std() * 0.02     # 2 cm crumpled-plastic waviness: V48 before fix
+                                                            # said "waiting for a clear view of the bin surface"
+            r = est.update(np.zeros((K.height, K.width, 3), np.uint8), noisy, K, None, 0.0, 1.0)
+            self.assertEqual(r["status"], "ok", r.get("reason"))
+            self.assertAlmostEqual(r["height_fill_pct"], 40.0, delta=5.0)
+
+
 if __name__ == "__main__":
     unittest.main()

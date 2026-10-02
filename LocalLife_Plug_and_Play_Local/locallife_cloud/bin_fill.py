@@ -349,12 +349,13 @@ class FillEstimator:
             return self._hold(depth_reason or "no metric depth for this camera")
         if self.camera_moved(frame, region):
             return self._hold("camera or bin moved since the fill profile was saved: re-save it")
-        if motion is not None and motion > STABLE_MOTION:
-            return self._hold("scene moving", stale_only=True)
+        # Moving scenes still refresh the surface map (per-bag volumes need it); only the FILL
+        # reading waits for a settled frame.
+        moving = motion is not None and motion > STABLE_MOTION
         step = max(1, int(depth_m.shape[1] // 160))
         objects = None if objects is None else objects[::step, ::step]
         depth_m, intrinsics, region = _subsample(depth_m, intrinsics, region)
-        if objects is not None and not objects.any() and timestamp - self._last_refit >= 30.0:
+        if objects is not None and not objects.any() and not moving and timestamp - self._last_refit >= 30.0:
             # Nothing detected in the bin: the deepest flat surface is the floor -- refresh it (plug and play).
             self._last_refit = timestamp
             self.recalibrate(depth_m, intrinsics, region, automatic=True)
@@ -364,7 +365,7 @@ class FillEstimator:
         if plane is not None:
             geometry = "saved empty-bin floor plane"
         else:
-            if self.profile.floor_plane is None and timestamp - self._last_fit_try >= 5.0:
+            if self.profile.floor_plane is None and not moving and timestamp - self._last_fit_try >= 5.0:
                 self._last_fit_try = timestamp
                 self.recalibrate(depth_m, intrinsics, region, automatic=True)
             plane, scale = self.profile.floor_plane, float(self.profile.floor_scale or 1.0)
@@ -372,6 +373,14 @@ class FillEstimator:
         height, flat, valid = surface_maps(depth_m, intrinsics, self.profile, plane, scale)
         if region is not None:
             valid &= region
+        flat_share = float(np.count_nonzero(flat & valid)) / max(1, int(np.count_nonzero(valid)))
+        if flat_share < 0.30:
+            # Real stereo noise can tilt most normals past the wall test; then the test is not
+            # informative, and blocking the whole fill on it was wrong (fill stayed "unavailable").
+            flat = np.ones_like(flat)
+        z_all = depth_m * scale
+        self.last_surface = {"at": timestamp, "step": step, "height": height, "ok": valid & flat, "valid": valid,
+                             "area": (z_all / intrinsics.fx) * (z_all / intrinsics.fy)}
         a_, b_, c_ = plane if plane is not None else (0.0, 0.0, None)
         self.last_diag = {
             "floor_source": geometry, "depth_source": depth_label,
@@ -383,7 +392,11 @@ class FillEstimator:
                                                                            else int(np.count_nonzero(region))), 1),
             "statistic": "mean over 5 cm floor cells of the surface top (p90 per cell), gaps < 15 cm closed; < 3 cm = floor",
             "usable_height_cm": round(self.profile.usable_height_m * 100, 1), "frame_at": timestamp,
+            "upward_surface_pct": round(100 * flat_share, 1),
+            "wall_filter": "on" if flat_share >= 0.30 else "off (normals too noisy)",
         }
+        if moving:
+            return self._hold("scene moving", stale_only=True)
         usable = self.profile.usable_height_m
         keep = valid & flat & (height > -BELOW_FLOOR_M) & (height < usable + RIM_TOLERANCE_M)
         coverage = float(np.count_nonzero(keep)) / max(1, int(np.count_nonzero(valid)))
@@ -417,9 +430,6 @@ class FillEstimator:
         # happens to box: every visible upward-facing surface counts; floor noise (< 3 cm) is zero.
         tops = np.where(tops >= FLOOR_NOISE_M, tops, 0.0)
         cells = cell_tops(tops, hx, hy)
-        z_all = depth_m * scale
-        self.last_surface = {"at": timestamp, "step": step, "height": height, "ok": valid & flat, "valid": valid,
-                             "area": (z_all / intrinsics.fx) * (z_all / intrinsics.fy)}
         if len(cells) < 8:
             return self._hold("waiting for a clear view of the bin surface", warnings=warnings)
         reading = fill_reading(cells, coverage, self.profile)

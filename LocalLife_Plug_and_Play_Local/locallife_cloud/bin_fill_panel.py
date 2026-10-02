@@ -28,7 +28,7 @@ BIN_FILL_PANEL = r"""{% raw %}
 
 <script>
 (function(){
-const $=id=>document.getElementById(id);const t=s=>s?new Date(s*1000).toLocaleTimeString():'—';const v=x=>x==null?'N/A':x;
+const $=id=>document.getElementById(id);const bfHeaders=extra=>{const h=Object.assign({},extra||{});try{if(API_TOKEN)h['X-API-Token']=API_TOKEN;}catch(e){}return h;};const t=s=>s?new Date(s*1000).toLocaleTimeString():'—';const v=x=>x==null?'N/A':x;
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const age=s=>s?Math.max(0,Math.round(Date.now()/1000-s))+' s ago':'—';
 const name=id=>id==='realsense'?'RealSense D435':'Logitech C920';
@@ -57,7 +57,7 @@ async function load(){try{const d=await (await fetch('/api/bin-fill',{cache:'no-
  $('bf-session').textContent='Session started '+new Date(s.session_started_at*1000).toLocaleString()+(s.resumed?' (resumed)':'')+' · bags present at start count toward fill, not as new';
 }catch(err){$('bf-session').textContent='Bin fill data unavailable: '+err.message;}}
 
-$('bf-reset').addEventListener('click',async()=>{if(!confirm('Reset? Both bag counts return to 0 and recording starts fresh (earlier rows stay in the CSV).'))return;const r=await (await fetch('/api/bin-fill/session/new',{method:'POST'})).json();expectSession=(r.session||{}).session_id||null;load();});
+$('bf-reset').addEventListener('click',async()=>{if(!confirm('Reset? Both bag counts return to 0 and recording starts fresh (earlier rows stay in the CSV; calibration is kept).'))return;const res=await fetch('/api/bin-fill/session/new',{method:'POST',headers:bfHeaders()});const r=await res.json().catch(()=>({}));if(!res.ok){alert('Reset failed: '+(r.error||res.status));return;}expectSession=(r.session||{}).session_id||null;load();});
 load();setInterval(load,1000);
 })();
 </script>
