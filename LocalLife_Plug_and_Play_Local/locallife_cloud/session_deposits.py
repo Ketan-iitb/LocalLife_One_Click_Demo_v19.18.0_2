@@ -91,6 +91,8 @@ class TrackInfo:
     width_mm: float | None = None
     height_mm: float | None = None
     rejection: str | None = None
+    support_volume_l: float | None = None           # volume above the local surface (median of this track)
+    support_height_cm: float | None = None
 
 
 @dataclass
@@ -158,6 +160,7 @@ class CameraWatcher:
         self.motion = 0.0
         self.last_frame_at: float | None = None
         self.resync = False
+        self.resync_since: float | None = None
         self.votes: dict[int, dict[str, Counter]] = {}
         self.noise = 0.0                    # typical frame-to-frame change of a still scene (sensor/JPEG)
         self.views: list[np.ndarray] = []   # last few small views, for colour voted over several frames
@@ -232,12 +235,16 @@ class CameraWatcher:
             return None
 
         if self.state == "watching":
-            if self.resync:
-                if settled:
-                    self._commit(ev)
-                    self.resync = False
-                return None
             unknown = [t for t in ev.tracks if bag_like(t.label) and not self._known(t)]
+            if self.resync:
+                # After a timeout: re-baseline at the next still moment, or after 15 s regardless.
+                # Waiting only for stillness froze the counter while people kept moving.
+                self.resync_since = self.resync_since or now
+                if settled or now - self.resync_since > 15.0:
+                    self._commit(ev)
+                    self.resync, self.resync_since = False, None
+                if not unknown:
+                    return None
             if self.motion >= enter_limit or unknown:
                 self.state = "candidate"
                 self.candidate_since = now
@@ -252,6 +259,14 @@ class CameraWatcher:
 
         # candidate / settling
         if now - (self.candidate_since or now) > CANDIDATE_TIMEOUT_S:
+            # People keep moving around the bin, so the scene may never be still. A NEW bag-like
+            # track over a persistent change is strong enough to count even then; motion alone is not.
+            outcome = self._evaluate(ev)
+            if outcome[0] == "confirmed" and outcome[1].get("track") is not None:
+                outcome[1]["evidence"] += " (confirmed at the settle timeout; scene still moving)"
+                self._commit(ev)
+                self._end(None)
+                return outcome
             reason = f"scene did not settle within {CANDIDATE_TIMEOUT_S:.0f} s (trigger: {self.candidate_trigger})"
             self._end(reason)
             self.resync = True
@@ -553,17 +568,30 @@ class SessionDeposits:
             if ev.timestamp > until:
                 continue
             track = next((t for t in ev.tracks if t.track_id == track_id), None)
+            if track is not None and track.support_height_cm and (
+                    record["height_cm"] is None or str(record.get("height_source") or "").startswith("detector")):
+                record["height_cm"] = _r(float(track.support_height_cm))
+                record["height_source"] = "height above the local surface around the bag"
+                changed = True
+            if track is not None and track.support_volume_l and record.get("volume_method") != "surface rise integrated over the bag":
+                record["envelope_l"] = round(float(track.support_volume_l), 1)
+                record["volume_method"] = "volume above the local surface (median over the track)"
+                if record["measurement_status"] in ("na", "partial"):
+                    record["measurement_status"] = "approximate"
+                changed = True
             if track is not None and not track.rejection and track.length_mm and track.width_mm:
                 if record["length_cm"] is None:
                     record["length_cm"], record["width_cm"] = _r(track.length_mm / 10), _r(track.width_mm / 10)
                     changed = True
                 if record["height_cm"] is None and track.height_mm:
                     record["height_cm"] = _r(track.height_mm / 10)
-                    record["height_source"] = "detector height (surface under the bag not measured)"
+                    record["height_source"] = "detector height from the bin floor (may include the pile)"
                     changed = True
                 if record["length_cm"] and record["width_cm"] and record["height_cm"]:
-                    record["envelope_l"] = round(record["length_cm"] * record["width_cm"] * record["height_cm"]
-                                                 / 1000.0, 1)
+                    if not (record.get("volume_method") or "").startswith(("volume above", "surface rise")):
+                        record["envelope_l"] = round(record["length_cm"] * record["width_cm"] * record["height_cm"]
+                                                     / 1000.0, 1)
+                        record["volume_method"] = "L x W x H box"
                     if record["measurement_status"] in ("na", "partial"):
                         record["measurement_status"] = "approximate"
                         record["reason"] = "size added after the count (same event)"
@@ -617,10 +645,16 @@ class SessionDeposits:
                         pass
         if added is not None:
             height = added * 100.0
+        elif track is not None and track.support_height_cm:
+            # Above the surface the bag lies on. The detector's own height is measured from the BIN
+            # FLOOR and includes the pile under the bag (a bag read 77 cm tall).
+            height, source = float(track.support_height_cm), "height above the local surface around the bag"
         elif track is not None and track.height_mm and not track.rejection:
-            height, source = track.height_mm / 10.0, "detector height (surface under the bag not measured)"
+            height, source = track.height_mm / 10.0, "detector height from the bin floor (may include the pile)"
         else:
             reasons.append("no reliable before/after surface under the bag (hidden, occluded or no depth)")
+        if volume is None and track is not None and track.support_volume_l:
+            volume = float(track.support_volume_l)          # surface-map integral, median over the track
         envelope = volume if volume is not None else (
             round(length * width * height / 1000.0, 1) if length and width and height else None)
         if envelope is None:
@@ -648,7 +682,8 @@ class SessionDeposits:
             "delta_occupancy_l": None, "delta_label": DELTA_LABEL,
             "measurement_status": status, "reason": "; ".join(reasons) or None,
             "bin_fill_pct_after": None, "bin_fill_litres_after": None,
-            "volume_method": ("surface rise integrated over the bag (after - before)" if volume is not None
+            "volume_method": ("surface rise integrated over the bag" if volume is not None and added is not None
+                              else "volume above the local surface (median over the track)" if volume is not None
                               else "L x W x H box" if envelope is not None else None),
             "units": "cm, L",
             "evidence": {ev.camera: {"evidence": details["evidence"], "trigger": details.get("trigger"),

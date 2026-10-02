@@ -352,5 +352,43 @@ class V48ResetTests(unittest.TestCase):
             self.assertEqual(counter.new_session()["new_bags_this_session"], 0)
 
 
+
+class V49Tests(unittest.TestCase):
+    def test_a_new_bag_counts_even_if_people_keep_moving_but_motion_alone_does_not(self) -> None:
+        with TemporaryDirectory() as d:
+            counter = sd.SessionDeposits(Path(d), clock=lambda: 0.0)
+            scene = Scene()
+            scene.add(1, (10, 10, 40, 40))
+            run(counter, scene, 0.0, 7.0)
+            run(counter, scene, 7.0, 45.0, hand=True)                      # someone moving the whole time
+            self.assertEqual(counter.count, 0)
+            self.assertIn("did not settle", counter.rejected[-1]["reason"])
+            scene.add(9, (100, 70, 140, 110), height=0.25)
+            got, _ = run(counter, scene, 45.0, 80.0, hand=True)              # bag dropped, still moving
+            self.assertEqual(counter.count, 1)
+            self.assertIn("settle timeout", got[0]["evidence"]["realsense"]["evidence"])
+
+    def test_event_size_comes_from_the_local_surface_not_the_bin_floor(self) -> None:
+        with TemporaryDirectory() as d:
+            counter = sd.SessionDeposits(Path(d), clock=lambda: 0.0)
+            scene = Scene(depth=False)                                      # no before/after surface
+            scene.add(1, (10, 10, 40, 40))
+            run(counter, scene, 0.0, 7.0)
+            run(counter, scene, 7.0, 8.0, hand=True)
+            scene.add(9, (60, 60, 100, 100), height=0.77)                   # detector says 77 cm (from floor)
+            original = scene.evidence
+            def with_support(t, **kw):
+                ev = original(t, **kw)
+                for tr in ev.tracks:
+                    if tr.track_id == 9:
+                        tr.support_height_cm, tr.support_volume_l = 24.0, 21.5
+                return ev
+            scene.evidence = with_support
+            got, _ = run(counter, scene, 8.0, 12.0)
+            e = got[0]
+            self.assertEqual((e["height_cm"], e["envelope_l"]), (24.0, 21.5))
+            self.assertEqual(e["volume_method"], "volume above the local surface (median over the track)")
+
+
 if __name__ == "__main__":
     unittest.main()

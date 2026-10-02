@@ -3038,8 +3038,6 @@ class VisionPipeline:
         )
 
         self._apply_bin_bounds(detections)
-        self._emit_deposit_evidence(frame, detections, depth_m, intrinsics, bin_region,
-                                    calibrated_prediction, measure_intrinsics)
         # The saved EMPTY-bin floor plane is the measured pose; a plane fitted through
         # today's waste is not a floor and is never used for the fill.
         fill_plane = (occupancy_plane.coefficients if self.last_occupancy_absolute and occupancy_plane is not None
@@ -3088,6 +3086,11 @@ class VisionPipeline:
                     item.support_height_cm = round(estimate[1] * 100, 1)
                     if own is None and item.provisional_volume_l is None:
                         item.provisional_volume_l = estimate[0]
+        # The counter sees the SAME depth the fill uses (Logitech: model depth when no calibrated
+        # depth exists -- before, it got none and every Logitech event had N/A size) and each
+        # track's local-surface size computed just above.
+        self._emit_deposit_evidence(frame, detections, depth_m, intrinsics, bin_region,
+                                    fill_monocular, measure_intrinsics)
         if persist:
             self.store.append_jsonl("frames.jsonl", analysis.to_dict())
             self._finalise_settled_measurements(detections, timestamp)
@@ -3441,7 +3444,8 @@ class VisionPipeline:
                     colour=item.color or "unknown", material=item.material,
                     material_confidence=float(item.material_confidence or 0.0),
                     length_mm=item.footprint_length_mm, width_mm=item.footprint_width_mm,
-                    height_mm=item.physical_height_mm, rejection=item.volume_rejection_reason))
+                    height_mm=item.physical_height_mm, rejection=item.volume_rejection_reason,
+                    support_volume_l=item.support_volume_l, support_height_cm=item.support_height_cm))
             depth = heights = area = xs = ys = None
             status = None
             # RealSense: aligned hardware depth (also used for the rise check). Logitech: its own
