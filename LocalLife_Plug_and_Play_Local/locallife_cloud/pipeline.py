@@ -3078,23 +3078,31 @@ class VisionPipeline:
             if not _is_phantom_detection(item):
                 try:
                     estimate = self.fill.object_volume(item.box, item.mask, time.time())
+                    dims = dict(self.fill.last_object) if estimate is not None else None
                 except Exception:  # noqa: BLE001 - display-only estimate
-                    estimate = None
+                    estimate, dims = None, None
+                footprint = (dims["length_m"], dims["width_m"]) if dims and dims.get("length_m") else (None, None)
                 if estimate is not None and item.track_id is not None:
                     # Repeatability: the median of this SAME track's recent estimates, not one frame.
                     now = time.time()
                     history = self.__dict__.setdefault("_provisional_history", {})
                     samples = [v for v in history.get(item.track_id, []) if now - v[0] <= 15.0][-7:]
-                    samples.append((now, estimate[0], estimate[1]))
+                    samples.append((now, estimate[0], estimate[1], footprint[0], footprint[1]))
                     history[item.track_id] = samples
                     if len(history) > 300:
                         for key in list(history)[:150]:
                             history.pop(key, None)
                     estimate = (round(float(np.median([v[1] for v in samples])), 2),
                                 float(np.median([v[2] for v in samples])))
+                    sized = [v for v in samples if len(v) > 3 and v[3] is not None]
+                    if sized:
+                        footprint = (float(np.median([v[3] for v in sized])), float(np.median([v[4] for v in sized])))
                 if estimate is not None:
                     item.support_volume_l = estimate[0]
                     item.support_height_cm = round(estimate[1] * 100, 1)
+                    if footprint[0] is not None:
+                        item.support_length_cm = round(footprint[0] * 100, 1)
+                        item.support_width_cm = round(footprint[1] * 100, 1)
                     if own is None and item.provisional_volume_l is None:
                         item.provisional_volume_l = estimate[0]
         # The counter sees the SAME depth the fill uses (Logitech: model depth when no calibrated
@@ -3518,7 +3526,8 @@ class VisionPipeline:
                     material_confidence=float(item.material_confidence or 0.0),
                     length_mm=item.footprint_length_mm, width_mm=item.footprint_width_mm,
                     height_mm=item.physical_height_mm, rejection=item.volume_rejection_reason,
-                    support_volume_l=item.support_volume_l, support_height_cm=item.support_height_cm))
+                    support_volume_l=item.support_volume_l, support_height_cm=item.support_height_cm,
+                    support_length_cm=item.support_length_cm, support_width_cm=item.support_width_cm))
             depth = heights = area = xs = ys = None
             status = None
             # RealSense: aligned hardware depth (also used for the rise check). Logitech: its own

@@ -75,9 +75,15 @@ CSV_FIELDS = (
 )
 
 
+FURNITURE_WORDS = {"chair", "sofa", "couch", "bed", "table", "desk", "door", "wall", "floor", "cabinet"}
+
+
 def bag_like(label: str | None) -> bool:
-    words = set((label or "").lower().replace("-", " ").replace("_", " ").split())
-    return bool(words & BAG_WORDS) and not (words & NOT_BAG_WORDS)
+    """Anything that can be thrown into a bin: bags, but also parcels and boxes the detector
+    names 'book', 'rigid household object', 'packaging'. A box labelled 'book' had been left
+    unlinked, so its count showed no size, colour or material. Never a person or furniture."""
+    words = set((label or "").lower().replace("-", " ").replace("_", " ").replace("[", " ").replace("]", " ").split())
+    return bool(words) and not (words & NOT_BAG_WORDS) and not (words & FURNITURE_WORDS)
 
 
 @dataclass
@@ -94,6 +100,8 @@ class TrackInfo:
     rejection: str | None = None
     support_volume_l: float | None = None           # volume above the local surface (median of this track)
     support_height_cm: float | None = None
+    support_length_cm: float | None = None          # oriented L x W of the same region (median of the track)
+    support_width_cm: float | None = None
 
 
 @dataclass
@@ -601,6 +609,10 @@ class SessionDeposits:
                 record["height_cm"] = _r(float(track.support_height_cm))
                 record["height_source"] = "height above the local surface around the bag"
                 changed = True
+            if track is not None and track.support_length_cm and track.support_width_cm and (
+                    record["length_cm"] is None or record.get("volume_method") != "surface rise integrated over the bag"):
+                record["length_cm"], record["width_cm"] = _r(float(track.support_length_cm)), _r(float(track.support_width_cm))
+                changed = True
             if track is not None and track.support_volume_l and record.get("volume_method") != "surface rise integrated over the bag":
                 record["envelope_l"] = round(float(track.support_volume_l), 1)
                 record["volume_method"] = "volume above the local surface (median over the track)"
@@ -633,7 +645,10 @@ class SessionDeposits:
         reasons: list[str] = []
         length = width = height = None
         source = None
-        if track is not None and track.rejection:
+        if track is not None and track.support_length_cm and track.support_width_cm:
+            # L x W of the SAME risen region the volume and height come from (oriented rectangle).
+            length, width = float(track.support_length_cm), float(track.support_width_cm)
+        elif track is not None and track.rejection:
             reasons.append(f"detector dimensions withheld: {track.rejection}")
         elif track is not None and track.length_mm and track.width_mm:
             length, width = track.length_mm / 10.0, track.width_mm / 10.0

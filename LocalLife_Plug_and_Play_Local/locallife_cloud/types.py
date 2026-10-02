@@ -104,6 +104,8 @@ class Detection:
     # from this camera's own surface map. Display-only; the ledger keeps its own measurement.
     support_volume_l: float | None = None
     support_height_cm: float | None = None
+    support_length_cm: float | None = None          # oriented footprint of the same risen region
+    support_width_cm: float | None = None
     # A small, strongly coloured part distinct from the dominant colour -- the
     # red cap on a grey bottle -- and how the colour was reached
     # (colour_evidence.py). The dominant colour stays in `color`.
@@ -204,6 +206,8 @@ class Detection:
             "provisional_volume_l": self.provisional_volume_l,
             "support_volume_l": self.support_volume_l,
             "support_height_cm": self.support_height_cm,
+            "support_length_cm": self.support_length_cm,
+            "support_width_cm": self.support_width_cm,
             "color_accent": self.color_accent,
             "color_evidence": self.color_evidence,
             "material_evidence": self.material_evidence,

@@ -465,5 +465,35 @@ class V49LogitechHoldTests(unittest.TestCase):
             self.assertEqual(station._hold_through_dropout(frame, []), [])
 
 
+
+class V49ParcelTests(unittest.TestCase):
+    def test_diagonal_parcel_gets_oriented_size_and_its_own_volume_only(self) -> None:
+        # Live: a long parcel lying diagonally read 291 x 283 mm (square) -- the axis-aligned box
+        # plus the pile inside it. Now: the largest risen region, oriented rectangle.
+        import math
+        prof = _profile(camera_to_empty_floor_m=1.10, usable_height_m=1.00)
+        a = math.radians(35)
+        def parcel(x, y):
+            u, v = x * math.cos(a) + y * math.sin(a), -x * math.sin(a) + y * math.cos(a)
+            return (np.abs(u) < 0.15) & (np.abs(v) < 0.06)                   # 30 x 12 cm
+        neighbour = lambda x, y: (x > 0.10) & (x < 0.16) & (y > 0.07) & (y < 0.13)   # in the box corner
+        scene = lambda x, y: np.where(parcel(x, y), 0.37, np.where(neighbour(x, y), 0.38, 0.30))
+        with TemporaryDirectory() as d:
+            est = bf.FillEstimator("realsense", Path(d), prof)
+            est.recalibrate(_render(prof, lambda x, y: 0 * x), K, None)
+            depth = _render(prof, scene)
+            est.update(np.zeros((K.height, K.width, 3), np.uint8), depth, K, None, 0.0, 1.0)
+            top = depth < (1.10 - 0.335)
+            rows, cols = np.nonzero(np.abs(depth - (1.10 - 0.37)) < 0.005)
+            box = (cols.min(), rows.min(), cols.max() + 1, rows.max() + 1)   # axis-aligned, no mask
+            litres, tall = est.object_volume(box, None, 1.5)
+            dims = est.last_object
+        self.assertAlmostEqual(tall, 0.07, delta=0.02)
+        self.assertGreater(dims["length_m"] / dims["width_m"], 1.8, dims)           # long and thin, not square
+        parcel_px = np.abs(depth - (1.10 - 0.37)) < 0.005
+        truth = float(np.sum((depth[parcel_px] / K.fx) * (depth[parcel_px] / K.fy))) * 0.07 * 1000
+        self.assertLess(abs(litres - truth) / truth, 0.25, (litres, truth))       # the neighbour is excluded
+
+
 if __name__ == "__main__":
     unittest.main()

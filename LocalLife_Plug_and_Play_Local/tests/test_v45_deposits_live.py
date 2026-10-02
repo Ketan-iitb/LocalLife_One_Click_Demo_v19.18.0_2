@@ -450,5 +450,15 @@ class V49LedgerTests(unittest.TestCase):
             self.assertEqual(len(rows), 2)
 
 
+
+class V49ObjectTests(unittest.TestCase):
+    def test_parcels_and_boxes_link_like_bags(self) -> None:
+        for label in ("book", "rigid household object", "flexible household object", "packaging object",
+                      "unknown deposited object", "cardboard box"):
+            self.assertTrue(sd.bag_like(label), label)
+        for label in ("person", "hand", "chair", ""):
+            self.assertFalse(sd.bag_like(label), label)
+
+
 if __name__ == "__main__":
     unittest.main()

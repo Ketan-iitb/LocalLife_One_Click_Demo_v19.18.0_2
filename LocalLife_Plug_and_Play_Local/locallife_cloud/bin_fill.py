@@ -379,8 +379,11 @@ class FillEstimator:
             # informative, and blocking the whole fill on it was wrong (fill stayed "unavailable").
             flat = np.ones_like(flat)
         z_all = depth_m * scale
+        rows_, cols_ = np.indices(depth_m.shape)
         self.last_surface = {"at": timestamp, "step": step, "height": height, "ok": valid & flat, "valid": valid,
-                             "area": (z_all / intrinsics.fx) * (z_all / intrinsics.fy)}
+                             "area": (z_all / intrinsics.fx) * (z_all / intrinsics.fy),
+                             "x": (cols_ - intrinsics.ppx) * z_all / intrinsics.fx,
+                             "y": (rows_ - intrinsics.ppy) * z_all / intrinsics.fy}
         a_, b_, c_ = plane if plane is not None else (0.0, 0.0, None)
         self.last_diag = {
             "floor_source": geometry, "depth_source": depth_label,
@@ -579,21 +582,33 @@ class FillEstimator:
         if support_px.size < 10 or np.count_nonzero(top) < 10:
             return None
         support = float(np.percentile(support_px, 50))
-        rise = height[top] - support
-        keep = rise > 0.02
-        if np.count_nonzero(keep) < 10:
+        rise_map = np.where(top, height - support, 0.0)
+        risen = top & (rise_map > 0.02)
+        # One object: the largest connected risen region. A box drawn around a diagonal parcel
+        # also covers pile beside it; those pixels are a separate island and are left out.
+        try:
+            import cv2
+            count, labels, stats, _ = cv2.connectedComponentsWithStats(risen.astype(np.uint8), 8)
+            if count > 2:
+                risen = labels == 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        except ImportError:  # pragma: no cover
+            cv2 = None
+        if np.count_nonzero(risen) < 10:
             return None
-        litres = float(np.sum(rise[keep] * area[top][keep])) * 1000.0
-        # Depth dropouts on the bag: assume they resemble the valid pixels around them.
-        risen_inside = inside & valid
-        risen_inside[risen_inside] = keep
-        grown = cv2_dilate(risen_inside)
-        missing = int(np.count_nonzero(grown & inside & ~valid))
+        litres = float(np.sum(rise_map[risen] * area[risen])) * 1000.0
+        # Depth dropouts on the object: assume they resemble the valid pixels around them.
+        missing = int(np.count_nonzero(cv2_dilate(risen) & inside & ~valid))
         if missing:
-            litres *= 1.0 + missing / max(1, int(np.count_nonzero(keep)))
-        tall = float(np.percentile(rise[keep], 90))
+            litres *= 1.0 + missing / max(1, int(np.count_nonzero(risen)))
+        tall = float(np.percentile(rise_map[risen], 90))
         if litres > 250.0 or tall > self.profile.usable_height_m + RIM_TOLERANCE_M:
             return None                                  # implausible: unavailable, never clamped
+        length = width = None
+        if cv2 is not None and "x" in surface:
+            pts = np.c_[surface["x"][risen], surface["y"][risen]].astype(np.float32)
+            (_, _), (w1, w2), _ = cv2.minAreaRect(pts)     # oriented: a diagonal parcel stays long/thin
+            length, width = float(max(w1, w2)), float(min(w1, w2))
+        self.last_object = {"length_m": length, "width_m": width, "height_m": tall, "litres": round(litres, 2)}
         return round(litres, 2), tall
 
     def _hold(self, reason: str, *, warnings: list[str] | None = None, stale_only: bool = False) -> dict[str, Any]:
