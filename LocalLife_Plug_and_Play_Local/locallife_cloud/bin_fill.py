@@ -967,20 +967,21 @@ def _box_from_face(surface, cells, rows, cols, keep, face_img, pts, centre, axes
 def _ransac_plane(pts: np.ndarray, tol: float = 0.015, iterations: int = 120):
     """Dominant plane of 3-D points: (inlier mask, centre, svd axes, rms). Deterministic seed."""
     rng = np.random.default_rng(7)
-    sample = pts if len(pts) <= 4000 else pts[rng.choice(len(pts), 4000, replace=False)]
-    best, best_count = None, -1
-    for _ in range(iterations):
-        a, b, c = sample[rng.choice(len(sample), 3, replace=False)]
-        normal = np.cross(b - a, c - a)
-        norm = float(np.linalg.norm(normal))
-        if norm < 1e-9:
-            continue
-        normal /= norm
-        count = int(np.count_nonzero(np.abs((sample - a) @ normal) <= tol))
-        if count > best_count:
-            best, best_count = (a, normal), count
-    if best is None:
+    if len(pts) < 3:
         return None
+    sample = pts if len(pts) <= 1500 else pts[rng.choice(len(pts), 1500, replace=False)]
+    # all hypotheses at once (vectorised: the per-iteration loop cost ~20 ms per detection)
+    idx = rng.integers(0, len(sample), size=(iterations, 3))
+    a, b, c = sample[idx[:, 0]], sample[idx[:, 1]], sample[idx[:, 2]]
+    normals = np.cross(b - a, c - a)
+    norms = np.linalg.norm(normals, axis=1)
+    good = norms > 1e-9
+    if not good.any():
+        return None
+    normals, a = normals[good] / norms[good, None], a[good]
+    counts = (np.abs(sample @ normals.T - np.sum(a * normals, axis=1)) <= tol).sum(axis=0)
+    k = int(np.argmax(counts))
+    best = (a[k], normals[k])
     keep = np.abs((pts - best[0]) @ best[1]) <= tol
     for _ in range(2):                                   # refine on the inliers
         if keep.sum() < 3:

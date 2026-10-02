@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import platform
 import socket
 import statistics
@@ -385,6 +386,54 @@ def write_run_summary_csv(path: Path, summary: dict[str, Any]) -> None:
         writer.writerows(rows)
 
 
+def _pct(fraction: Any) -> float | None:
+    """'7/10' -> 70.0; anything else -> None."""
+    try:
+        done, total = (float(v) for v in str(fraction).split("/"))
+        return round(100.0 * done / total, 1) if total else None
+    except ValueError:
+        return None
+
+
+def cost_vs_accuracy(local: dict[str, Any], cloud: dict[str, Any], local_rate: float | None,
+                     cloud_rate: float | None, currency: str) -> list[dict[str, Any]]:
+    """Cost and accuracy side by side, from the SAME replay. Cost = hourly rate / measured
+    throughput; accuracy only where ground truth was supplied. Missing inputs stay N/A."""
+    rows = []
+
+    def per_1000(rate, summary):
+        fps = summary["all"].get("throughput_fps")
+        return None if rate is None or not fps else round(rate / (float(fps) * 3600.0) * 1000.0, 4)
+
+    def acc(summary, key):
+        q = summary["quality"]
+        if q.get("status") != "evaluated":
+            return None
+        return _pct(q.get(key)) if key in ("detection_success", "colour_correct") else q.get(key)
+
+    lc, cc = per_1000(local_rate, local), per_1000(cloud_rate, cloud)
+    for metric, a, b in [
+        (f"rate per running hour ({currency})", local_rate, cloud_rate),
+        (f"cost per 1000 frames ({currency})", lc, cc),
+        ("detection success %", acc(local, "detection_success"), acc(cloud, "detection_success")),
+        ("colour correct %", acc(local, "colour_correct"), acc(cloud, "colour_correct")),
+        ("volume error % (median, lower is better)", acc(local, "volume_pct_error_median"),
+         acc(cloud, "volume_pct_error_median")),
+        ("dimension error % (median, lower is better)", acc(local, "dimension_pct_error_median"),
+         acc(cloud, "dimension_pct_error_median")),
+    ]:
+        rows.append({"metric": metric, "local": "N/A" if a is None else a, "cloud": "N/A" if b is None else b})
+    vl, vc = acc(local, "volume_pct_error_median"), acc(cloud, "volume_pct_error_median")
+    if None not in (lc, cc, vl, vc) and vl != vc:
+        gain = vl - vc                                    # percentage points of volume error removed by cloud
+        rows.append({"metric": f"extra cost per 1000 frames per volume-error point gained ({currency})",
+                     "local": "-", "cloud": round((cc - lc) / gain, 4) if gain > 0 else "cloud is not more accurate"})
+    else:
+        rows.append({"metric": f"extra cost per 1000 frames per volume-error point gained ({currency})",
+                     "local": "-", "cloud": "N/A (needs both rates and --truth on both runs)"})
+    return rows
+
+
 def compare(args: argparse.Namespace) -> int:
     runs = [json.loads((Path(p) / "run_summary.json").read_text(encoding="utf-8")) for p in args.runs]
     by_mode = {r["metadata"]["server_processing_mode"]: r for r in runs}
@@ -436,6 +485,18 @@ def compare(args: argparse.Namespace) -> int:
     lines.append(f"Local run {local['metadata']['run_id']}, cloud run {cloud['metadata']['run_id']}; "
                  f"network: {cloud['metadata'].get('network')}; cloud GPU: {(cloud['metadata'].get('server_gpu') or {}).get('name')}.")
     lines += [f"WARNING: {w}" for w in warnings]
+    cloud_rate = args.cloud_cost_per_hour
+    if cloud_rate is None and os.environ.get("LOCALLIFE_CLOUD_COST_PER_HOUR", "").strip():
+        cloud_rate = float(os.environ["LOCALLIFE_CLOUD_COST_PER_HOUR"])
+    cva = cost_vs_accuracy(local, cloud, args.local_cost_per_hour, cloud_rate, args.currency)
+    with (out / "cost_vs_accuracy.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["metric", "local", "cloud"])
+        writer.writeheader()
+        writer.writerows(cva)
+    lines.append("\n**Cost vs accuracy** (same replay; cost = rate / measured throughput, running time only -- "
+                 "excludes stopped-VM disk, images, egress; accuracy only with --truth)")
+    lines.append("| Metric | Local | Cloud |\n|---|---|---|")
+    lines += [f"| {r['metric']} | {r['local']} | {r['cloud']} |" for r in cva]
     (out / "local_vs_cloud_summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     print("\n".join(lines))
     return 0
@@ -459,6 +520,11 @@ def main(argv: list[str] | None = None) -> int:
     c = sub.add_parser("compare")
     c.add_argument("runs", nargs=2)
     c.add_argument("--out", default="artifacts/benchmark")
+    c.add_argument("--cloud-cost-per-hour", type=float, default=None,
+                   help="VM running rate (default: LOCALLIFE_CLOUD_COST_PER_HOUR); N/A when unset")
+    c.add_argument("--local-cost-per-hour", type=float, default=None,
+                   help="optional laptop running cost (power); N/A when unset")
+    c.add_argument("--currency", default="SEK")
     args = parser.parse_args(argv)
     return run(args) if args.command == "run" else compare(args)
 

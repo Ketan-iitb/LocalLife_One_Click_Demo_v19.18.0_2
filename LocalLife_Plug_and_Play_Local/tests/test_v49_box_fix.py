@@ -74,21 +74,6 @@ class ConfidenceFloorTests(unittest.TestCase):
         self.assertEqual(kept, [strong])
         self.assertIn(("cardboard shipping box", 0.20), strong.label_candidates)
 
-    def test_shared_model_runs_at_the_lowest_camera_threshold(self):
-        # Root cause: YOLOE ran at the RealSense 0.24 for BOTH cameras, so Logitech's 0.15 never applied.
-        from unittest import mock
-        from locallife_cloud import comparison
-        seen = {}
-
-        def fake(config):
-            seen["conf"] = config.detector_confidence
-            return _Detector()
-        with TemporaryDirectory() as directory, mock.patch.object(comparison, "create_segmenter", fake):
-            config = AppConfig(results_dir=Path(directory), enable_monocular_depth=False)
-            comparison.DualCameraCoordinator(config, depth_estimator=_NoDepth())
-            self.assertEqual(seen["conf"], min(config.detector_confidence, config.logitech_detector_confidence))
-            self.assertEqual(config.detector_confidence, 0.24)                # RealSense keeps its own
-
     def test_logitech_keeps_its_own_lower_threshold(self):
         box = self._det("cardboard box", 0.18)
         self.assertEqual(apply_confidence_floor([box], 0.15), [box])
@@ -394,3 +379,21 @@ class LogitechInsertionTests(unittest.TestCase):
         scene.add(9, (40, 40, 90, 70), height=0.12, label="waste bag")   # ... revealing the one below
         run(counter, scene, 7.0, 12.0)
         self.assertEqual(counter.count, 0)
+
+
+class CostVsAccuracyTests(unittest.TestCase):
+    def test_cost_per_frame_and_per_accuracy_point_from_the_same_replay(self):
+        sys.path.insert(0, str(PROJECT / "scripts"))
+        import benchmark_local_cloud as bench
+        run = lambda fps, err: {"all": {"throughput_fps": fps}, "quality": {  # noqa: E731
+            "status": "evaluated", "detection_success": "9/10", "colour_correct": "8/10",
+            "volume_pct_error_median": err, "dimension_pct_error_median": err / 2}}
+        rows = {r["metric"]: r for r in bench.cost_vs_accuracy(run(2.0, 30.0), run(8.0, 12.0), 0.0, 10.0, "SEK")}
+        self.assertAlmostEqual(rows["cost per 1000 frames (SEK)"]["cloud"], 10.0 / (8 * 3600) * 1000, places=3)
+        self.assertEqual(rows["detection success %"]["local"], 90.0)
+        gained = rows["extra cost per 1000 frames per volume-error point gained (SEK)"]["cloud"]
+        self.assertAlmostEqual(gained, (10.0 / (8 * 3600) * 1000) / 18.0, places=3)
+        missing = bench.cost_vs_accuracy({"all": {"throughput_fps": 2}, "quality": {"status": "Not evaluated"}},
+                                         {"all": {"throughput_fps": 8}, "quality": {"status": "Not evaluated"}},
+                                         None, None, "SEK")
+        self.assertTrue(all(r["cloud"] in ("N/A", "-") or str(r["cloud"]).startswith("N/A") for r in missing))

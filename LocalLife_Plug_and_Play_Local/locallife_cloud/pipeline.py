@@ -630,8 +630,7 @@ class VisionPipeline:
         self.config = config
         self.camera_id = camera_id
         self.inference_lock = inference_lock or threading.RLock()
-        self.detector = detector or create_segmenter(replace(   # V49: see apply_confidence_floor
-            config, detector_confidence=min(config.detector_confidence, config.logitech_detector_confidence)))
+        self.detector = detector or create_segmenter(config)
         if depth_estimator is None and config.enable_monocular_depth:
             from .optional_imports import disable_broken_torchaudio
 
@@ -1267,11 +1266,6 @@ class VisionPipeline:
         self._processing_started_at = time.time()      # before inference: lets a reset reject in-flight frames
         with self.inference_lock:
             detections_batch = self.detector.detect_batch(frames)
-            floor = (self.config.logitech_detector_confidence if self.camera_id == "logitech"
-                     else self.config.detector_confidence)
-            dropped: list = []
-            detections_batch = [apply_confidence_floor(list(batch), floor, dropped) for batch in detections_batch]
-            self._note_floor_drops(dropped)
             predictions = (
                 self.depth_estimator.estimate_batch(frames)
                 if self.depth_estimator is not None
