@@ -20,7 +20,7 @@ BIN_FILL_PANEL = r"""{% raw %}
 @media(max-width:900px){#bf-panel .bf-grid{grid-template-columns:1fr}}
 </style>
 <h2>Bin fill &amp; new deposits — each camera independently</h2>
-<div style="margin:6px 0"><button type="button" id="bf-reset">Reset counts &amp; readings</button> <a class="bf-btn" href="/api/session-deposits.xlsx">Download Excel</a> <a class="bf-btn" href="/api/session-deposits.csv">Download CSV</a></div>
+<div style="margin:6px 0"><button type="button" id="bf-reset">Reset counts &amp; readings</button> <a class="bf-btn" href="/api/bag-ledger.csv">Download bag ledger (CSV)</a> <a class="bf-btn" href="/api/session-deposits.xlsx">Download Excel</a> <a class="bf-btn" href="/api/session-deposits.csv">Download CSV</a></div>
 <div id="bf-session" class="bf-muted">Loading…</div>
 <div class="bf-grid"><div class="bf-card" id="bf-cam-realsense"></div><div class="bf-card" id="bf-cam-logitech"></div></div>
 <div class="bf-muted" style="margin-top:6px">Fill = average waste height ÷ 100 cm bin height; litres = 660 L × fill (approximate).</div>
@@ -44,10 +44,10 @@ function card(id,r,w){w=w||{};const cam=id==='realsense'?'RealSense':'Logitech';
  if(e)h+='<div style="margin-top:6px"><b>Latest new bag</b> ('+esc(e.event_id)+', '+t(e.deposit_time)+'): '+esc(e.detector_label&&e.detector_label!=='unknown'?e.detector_label:e.object_type)+' · '+(e.length_cm==null?'L×W N/A':e.length_cm+'×'+e.width_cm)+'×'+v(e.height_cm)+' cm · <b>'+cam+' object volume (L): '+v(e.envelope_l)+'</b> · colour '+esc(e.colour)+' · material '+esc(e.material)+' · '+esc(e.measurement_status)+(e.reason?' – '+esc(e.reason):'')+'</div>';
  h+='<div class="bf-muted">Last frame '+t(r.last_processed_at)+' · last valid fill '+t(r.last_valid_at)+' · last deposit '+t(w.last_confirmed_at)+'</div>';
  if(w.latest_rejection)h+='<div class="bf-muted">'+w.rejected+' rejected — latest: '+esc(w.latest_rejection)+'</div>';
- h+='<div class="bf-scroll"><table><thead><tr><th>Event</th><th>Time</th><th>Object</th><th>Colour</th><th>Material</th><th>L×W×H cm</th><th>'+cam+' object volume (L)</th><th>Status</th></tr></thead><tbody>';
+ h+='<div class="bf-scroll"><table><thead><tr><th>Event</th><th>Time</th><th>Object</th><th>Colour</th><th>Material</th><th>L×W×H cm</th><th>'+cam+' object volume (L)</th><th>Bin L before → after</th><th>Status</th></tr></thead><tbody>';
  const ev=(w.events||[]).slice().reverse();
- for(const x of ev)h+='<tr><td>'+esc(x.event_id)+'</td><td>'+t(x.deposit_time)+'</td><td>'+esc(x.detector_label&&x.detector_label!=='unknown'?x.detector_label:x.object_type)+'</td><td>'+esc(x.colour)+'</td><td>'+esc(x.material)+'</td><td>'+(x.length_cm==null?'N/A':x.length_cm+'×'+x.width_cm)+'×'+v(x.height_cm)+'</td><td>'+v(x.envelope_l)+'</td><td>'+(x.track_id==null?'image change only (no detection)':'detected bag #'+x.track_id)+' · '+esc(x.confidence)+' · '+esc(x.measurement_status)+(x.association&&x.association.startsWith('ambiguous')?' · <span class="bf-warn">ambiguous</span>':'')+'</td></tr>';
- if(!ev.length)h+='<tr><td colspan="8">No new bags yet</td></tr>';return h+'</tbody></table></div>';}
+ for(const x of ev)h+='<tr><td>'+esc(x.event_id)+'</td><td>'+t(x.deposit_time)+'</td><td>'+esc(x.detector_label&&x.detector_label!=='unknown'?x.detector_label:x.object_type)+'</td><td>'+esc(x.colour)+'</td><td>'+esc(x.material)+'</td><td>'+(x.length_cm==null?'N/A':x.length_cm+'×'+x.width_cm)+'×'+v(x.height_cm)+'</td><td>'+v(x.envelope_l)+'</td><td>'+v(x.bin_fill_litres_before)+' → '+v(x.bin_fill_litres_after)+'</td><td>'+(x.track_id==null?'image change only (no detection)':'detected bag #'+x.track_id)+' · '+esc(x.confidence)+' · '+esc(x.measurement_status)+(x.association&&x.association.startsWith('ambiguous')?' · <span class="bf-warn">ambiguous</span>':'')+'</td></tr>';
+ if(!ev.length)h+='<tr><td colspan="9">No new bags yet</td></tr>';return h+'</tbody></table></div>';}
 function form(id,p){const cm=m=>m==null?'':Math.round(m*1000)/10;const f=[['camera_to_empty_floor_cm','camera→empty floor cm',cm(p.camera_to_empty_floor_m)],['usable_height_cm','usable floor→rim cm',cm(p.usable_height_m)],['tilt_from_vertical_deg','tilt °',p.tilt_from_vertical_deg??''],['capacity_l','capacity L',p.capacity_l]];
  return '<form data-cam="'+id+'"><b>'+name(id)+'</b> '+f.map(([k,l,val])=>'<label>'+l+' <input name="'+k+'" data-orig="'+val+'" value="'+val+'"></label>').join('')+'<button type="submit">Save</button></form>';}
 let expectSession=null;

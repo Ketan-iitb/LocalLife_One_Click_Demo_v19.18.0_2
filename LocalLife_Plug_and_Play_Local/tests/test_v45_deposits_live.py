@@ -295,7 +295,8 @@ class V47RecordTests(unittest.TestCase):
     def test_entry_and_confirmation_times_fill_at_drop_and_linked_metadata(self) -> None:
         with TemporaryDirectory() as d:
             counter = sd.SessionDeposits(Path(d), clock=lambda: 0.0)
-            counter.fill_lookup = lambda camera: {"status": "ok", "height_fill_pct": 12.5, "rough_litres": 82.5}
+            fill = {"status": "ok", "height_fill_pct": 12.5, "rough_litres": 82.5, "updated_at": 1.0}
+            counter.fill_lookup = lambda camera: dict(fill)
             scene = Scene()
             scene.add(1, (10, 10, 40, 40))
             run(counter, scene, 0.0, 7.0)
@@ -306,7 +307,11 @@ class V47RecordTests(unittest.TestCase):
             got, _ = run(counter, scene, 8.0, 12.0)
             e = got[0]
             self.assertLess(e["entered_at"], e["confirmed_at"])
-            self.assertEqual((e["bin_fill_pct_after"], e["bin_fill_litres_after"]), (12.5, 82.5))
+            self.assertEqual((e["bin_fill_pct_before"], e["bin_fill_litres_before"]), (12.5, 82.5))
+            self.assertIsNone(e["bin_fill_litres_after"])                   # settled reading not in yet
+            fill.update(height_fill_pct=15.0, rough_litres=99.0, updated_at=13.0)
+            run(counter, scene, 12.0, 14.0)
+            self.assertEqual((e["bin_fill_pct_after"], e["bin_fill_litres_after"]), (15.0, 99.0))
             self.assertEqual(e["colour"], "black")                      # linked to the covering detection
 
     def test_old_csv_schema_is_kept_aside_not_misaligned(self) -> None:
@@ -409,6 +414,40 @@ class V49IndependenceTests(unittest.TestCase):
             got, _ = run(counter, lg, 13.0, 17.0)
             self.assertEqual((counter.count_for("realsense"), counter.count_for("logitech")), (1, 1))
             self.assertIn("foreground", got[0]["evidence"]["logitech"]["evidence"])   # its own pixels, no box
+
+
+
+class V49LedgerTests(unittest.TestCase):
+    def test_bag_ledger_csv_has_one_row_per_drop_with_bin_before_and_after(self) -> None:
+        from locallife_cloud.comparison import DualCameraCoordinator
+        from locallife_cloud.config import AppConfig
+        from locallife_cloud.server import create_app
+        with TemporaryDirectory() as d:
+            config = AppConfig(detector_model="local-opencv-background", enable_monocular_depth=False,
+                               enable_bucket_sync=False, results_dir=Path(d))
+            manager = DualCameraCoordinator(config)
+            client = create_app(config, manager).test_client()
+            counter = manager.deposits
+            counter.session_started_at = 0.0
+            fill = {"status": "ok", "height_fill_pct": 20.0, "rough_litres": 132.0, "updated_at": 1.0}
+            counter.fill_lookup = lambda camera: dict(fill)
+            scene = Scene()
+            scene.add(1, (10, 10, 40, 40))
+            run(counter, scene, 0.0, 7.0)
+            run(counter, scene, 7.0, 8.0, hand=True)
+            scene.add(5, (60, 60, 100, 100), height=0.25)
+            run(counter, scene, 8.0, 12.0)
+            fill.update(height_fill_pct=24.0, rough_litres=158.4, updated_at=13.0)
+            run(counter, scene, 12.0, 14.0)
+            rows = list(csv.reader(client.get("/api/bag-ledger.csv").get_data(as_text=True).splitlines()))
+            self.assertEqual(rows[0][:6], ["Camera", "Bag no.", "Bag ID", "Dropped at", "Colour", "Material"])
+            head = rows[0]
+            row = dict(zip(head, rows[1]))
+            self.assertEqual((row["Camera"], row["Bag no."]), ("realsense", "1"))
+            self.assertEqual((row["Bin volume before L"], row["Bin volume after L"]), ("132.0", "158.4"))
+            self.assertEqual((row["Length cm"], row["Bag volume L"]), ("40.0", "30.0"))
+            self.assertEqual(row["Counted from"], "detected bag")
+            self.assertEqual(len(rows), 2)
 
 
 if __name__ == "__main__":

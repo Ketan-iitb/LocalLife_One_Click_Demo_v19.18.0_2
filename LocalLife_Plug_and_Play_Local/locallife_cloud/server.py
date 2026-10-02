@@ -728,6 +728,39 @@ def create_app(
         return Response(body, mimetype="text/csv", headers={
             "Content-Disposition": "attachment; filename=session_deposits.csv", "Cache-Control": "no-store"})
 
+    @app.get("/api/bag-ledger.csv")
+    def bag_ledger_csv() -> Any:
+        """One row per dropped bag, both cameras, in drop order (current counting session)."""
+        import csv as _csv
+        snap = manager.bin_fill()["deposits"]
+
+        def stamp(value: Any) -> str:
+            return "" if not value else time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(value)))
+
+        def cell(value: Any) -> Any:
+            return "" if value is None else value          # missing stays empty, never 0
+
+        buffer = io.StringIO()
+        writer = _csv.writer(buffer)
+        writer.writerow(["Camera", "Bag no.", "Bag ID", "Dropped at", "Colour", "Material", "Object",
+                         "Length cm", "Width cm", "Height cm", "Bag volume L", "Bag volume method",
+                         "Bin volume before L", "Bin volume after L", "Bin fill before %", "Bin fill after %",
+                         "Counted from", "Status", "Reason", "Session"])
+        for e in sorted(snap["events"], key=lambda item: item["deposit_time"]):
+            writer.writerow([e.get("camera"), e.get("count_after"), e.get("event_id"), stamp(e.get("deposit_time")),
+                             e.get("colour"), e.get("material"),
+                             e.get("detector_label") if e.get("detector_label") not in (None, "unknown")
+                             else e.get("object_type"),
+                             cell(e.get("length_cm")), cell(e.get("width_cm")), cell(e.get("height_cm")),
+                             cell(e.get("envelope_l")), cell(e.get("volume_method")),
+                             cell(e.get("bin_fill_litres_before")), cell(e.get("bin_fill_litres_after")),
+                             cell(e.get("bin_fill_pct_before")), cell(e.get("bin_fill_pct_after")),
+                             "detected bag" if e.get("track_id") is not None else "image change (no detection)",
+                             e.get("measurement_status"), cell(e.get("reason")), snap["session_id"]])
+        return Response(buffer.getvalue(), mimetype="text/csv", headers={
+            "Content-Disposition": f"attachment; filename=bag_ledger_{snap['session_id']}.csv",
+            "Cache-Control": "no-store"})
+
     @app.get("/api/session-deposits.xlsx")
     def session_deposits_xlsx() -> Any:
         """This session's drops, both cameras: summary (bags dropped, fill now) + one row per drop."""
@@ -760,10 +793,12 @@ def create_app(
         rows = book.create_sheet("Deposits")
         columns = ["camera", "event_id", "count_after", "entered_at", "confirmed_at", "colour", "object_type",
                    "material", "length_cm", "width_cm", "height_cm", "envelope_l", "volume_method",
-                   "bin_fill_pct_after", "bin_fill_litres_after", "measurement_status", "confidence", "reason"]
+                   "bin_fill_litres_before", "bin_fill_litres_after", "bin_fill_pct_after",
+                   "measurement_status", "confidence", "reason"]
         rows.append(["Camera", "Event", "Bags dropped so far", "Entered", "Dropped (confirmed)", "Colour", "Type",
                      "Material", "Length cm", "Width cm", "Height cm", "Bag volume L", "Volume method",
-                     "Bin fill after (%)", "Bin filled after (L)", "Status", "Confidence", "Reason"])
+                     "Bin volume before (L)", "Bin volume after (L)", "Bin fill after (%)",
+                     "Status", "Confidence", "Reason"])
         for event in sorted(snap["events"], key=lambda e: e["deposit_time"]):
             rows.append([stamp(event.get(c)) if c in ("entered_at", "confirmed_at") else event.get(c)
                          for c in columns])

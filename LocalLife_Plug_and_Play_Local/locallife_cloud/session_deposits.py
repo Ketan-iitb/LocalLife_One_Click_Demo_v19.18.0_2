@@ -71,6 +71,7 @@ CSV_FIELDS = (
     "track_id", "colour", "object_type", "detector_label", "material", "length_cm", "width_cm", "height_cm",
     "height_source", "envelope_l", "delta_occupancy_l", "measurement_status", "reason",
     "volume_method", "units", "bin_fill_pct_after", "bin_fill_litres_after",
+    "bin_fill_pct_before", "bin_fill_litres_before",
 )
 
 
@@ -414,6 +415,8 @@ class SessionDeposits:
         self._lock = threading.RLock()
         self.watchers: dict[str, CameraWatcher] = {}
         self.fill_lookup: Callable[[str], dict[str, Any]] | None = None   # camera -> its current fill reading
+        self.fill_history: dict[str, list[tuple[float, float, float]]] = {}  # camera -> (valid at, litres, %)
+        self._awaiting_after: list[dict[str, Any]] = []
         self._pending_csv: list[dict[str, Any]] = []
         self._last_frame_at = 0.0
         if not self._resume():
@@ -430,6 +433,7 @@ class SessionDeposits:
         self.resumed = False
         self.ignored_redetections = 0
         self.late_frames_ignored = 0
+        self._awaiting_after = []
         self.generation = getattr(self, "generation", 0) + 1
         self._pending_csv = []
         self.watchers.clear()
@@ -500,6 +504,7 @@ class SessionDeposits:
             outcome = watcher.observe(ev)
             if watcher.pending:
                 self._late_sizes(ev, watcher)
+            self._track_fill(ev.camera)
             self._flush_csv()
             if outcome is None:
                 return None
@@ -540,11 +545,13 @@ class SessionDeposits:
         record["confirmed_at"] = record["deposit_time"]
         if record["colour"] in (None, "unknown") and mask is not None and mask.any():
             record["colour"] = _voted_colour(watcher.views, mask)
-        if self.fill_lookup is not None:
-            reading = self.fill_lookup(ev.camera) or {}
-            if reading.get("status") == "ok":
-                record["bin_fill_pct_after"] = reading.get("height_fill_pct")
-                record["bin_fill_litres_after"] = reading.get("rough_litres")
+        # Bin volume BEFORE: this camera's last valid fill reading from before the bag entered.
+        # AFTER: its first valid reading once the bag has settled (filled in on later frames).
+        entered = record["entered_at"] or record["deposit_time"]
+        before = [h for h in self.fill_history.get(ev.camera, []) if h[0] <= entered]
+        if before:
+            record["bin_fill_litres_before"], record["bin_fill_pct_before"] = before[-1][1], before[-1][2]
+        self._awaiting_after.append(record)
         number = self.count_for(ev.camera) + 1
         record["event_id"] = f"{'RS' if ev.camera == 'realsense' else 'LG'}-{self.session_id[-6:]}-{number:03d}"
         record["count_after"] = number
@@ -560,6 +567,27 @@ class SessionDeposits:
         LOGGER.info("NEW bag %s confirmed by %s (%s); %s count %d", record["event_id"], ev.camera,
                     details["evidence"], ev.camera, number)
         return record
+
+    def _track_fill(self, camera: str) -> None:
+        if self.fill_lookup is None:
+            return
+        reading = self.fill_lookup(camera) or {}
+        valid_at = reading.get("updated_at")
+        if reading.get("status") != "ok" or reading.get("stale") or valid_at is None:
+            return
+        history = self.fill_history.setdefault(camera, [])
+        if not history or valid_at > history[-1][0]:
+            history.append((float(valid_at), reading.get("rough_litres"), reading.get("height_fill_pct")))
+            del history[:-300]
+            changed = False
+            for record in list(self._awaiting_after):
+                if record["camera"] == camera and valid_at > record["deposit_time"]:
+                    record["bin_fill_litres_after"] = reading.get("rough_litres")
+                    record["bin_fill_pct_after"] = reading.get("height_fill_pct")
+                    self._awaiting_after.remove(record)
+                    changed = True
+            if changed:
+                self._save()
 
     def _late_sizes(self, ev: FrameEvidence, watcher: CameraWatcher) -> None:
         keep = []
@@ -682,6 +710,7 @@ class SessionDeposits:
             "delta_occupancy_l": None, "delta_label": DELTA_LABEL,
             "measurement_status": status, "reason": "; ".join(reasons) or None,
             "bin_fill_pct_after": None, "bin_fill_litres_after": None,
+            "bin_fill_pct_before": None, "bin_fill_litres_before": None,
             "volume_method": ("surface rise integrated over the bag" if volume is not None and added is not None
                               else "volume above the local surface (median over the track)" if volume is not None
                               else "L x W x H box" if envelope is not None else None),
@@ -706,7 +735,9 @@ class SessionDeposits:
         now = max(self.clock(), self._last_frame_at)      # frame time: the clock the events use
         keep = []
         for record in self._pending_csv:
-            if force or now - record["deposit_time"] > FINALISE_S:
+            waiting_after = (self.fill_lookup is not None and record.get("bin_fill_litres_after") is None
+                             and now - record["deposit_time"] <= 45.0)
+            if force or (now - record["deposit_time"] > FINALISE_S and not waiting_after):
                 self._write_csv(record)
             else:
                 keep.append(record)
