@@ -28,8 +28,43 @@ from typing import Any, Iterable
 CAMERAS = ("realsense", "logitech")
 HOURS_PER_MONTH = 730.0          # Google Cloud's monthly-estimate convention (24 x 365 / 12)
 
+# Operator-supplied Google Cloud billing for this project (Aug 21 - Oct 2, 2026), SEK. Rates are what
+# was actually billed per running hour; GPU is billed separately from the machine's CPU + RAM.
+BILLING_SOURCE = "billing: Google Cloud billing report for this project, 2026-08-21 to 2026-10-02 (operator-supplied)"
+BILLING_RETRIEVED = "2026-10-02"
+BILLING_PRESETS: dict[str, dict[str, Any]] = {
+    "g2-standard-4 + 1x L4, on-demand (Netherlands)": {
+        "machine_type": "g2-standard-4", "gpu_type": "NVIDIA L4", "region": "europe-west4",
+        "provisioning": "on-demand", "gpu_rate_per_hour": 5.60, "machine_rate_per_hour": 1.47},
+    "g2-standard-8 + 1x L4, on-demand (Belgium)": {
+        "machine_type": "g2-standard-8", "gpu_type": "NVIDIA L4", "region": "europe-west1",
+        "provisioning": "on-demand", "gpu_rate_per_hour": 5.95, "machine_rate_per_hour": 3.12},
+    "g2-standard-4 + 1x L4, Spot (Netherlands)": {
+        "machine_type": "g2-standard-4", "gpu_type": "NVIDIA L4", "region": "europe-west4",
+        "provisioning": "spot", "gpu_rate_per_hour": 3.43, "machine_rate_per_hour": 0.90},
+    "n1-standard-8 + 1x T4, on-demand (Netherlands)": {
+        "machine_type": "n1-standard-8", "gpu_type": "NVIDIA T4", "region": "europe-west4",
+        "provisioning": "on-demand", "gpu_rate_per_hour": 3.39, "machine_rate_per_hour": 4.05},
+}
+BILLING_STORAGE = {"disk_gb": 200, "disk_rate_per_gb_month": 1.08, "image_gb": 48, "image_rate_per_gb_month": 0.49,
+                   "bucket_gb": 1.3}
+BILLING_SUMMARY = {
+    "period": "2026-08-21 to 2026-10-02", "currency": "SEK", "total": 535, "by_month": {"August": 180, "September": 355},
+    "budget_per_month": 2000, "gpu_hours": 34,
+    "breakdown": [("Disk storage while idle", 220), ("GPU time (~34 h)", 150), ("CPU and RAM", 70),
+                  ("Images and snapshots", 59), ("Network", 24), ("Bucket", 11)],
+    "gpu_breakdown": [("L4 on-demand", 82), ("L4 Spot", 40), ("T4", 28)],
+    "notes": ["Billed per second with a one-minute minimum; boot and setup (2-5 min) are billed.",
+              "Stopped VM: only storage -- 200 GB disk ~215 SEK/month (~7 SEK/day); 2 images x ~24 GB ~23 SEK/month; "
+              "bucket a few SEK/month; after 7 idle days the disk is replaced by an image (~30-40 SEK/month).",
+              "Moving zones (no GPU free) goes through a disk image: a few SEK per move.",
+              "Storing the environment cost more than running the GPU.",
+              "Spot is ~40 % cheaper but was interrupted on more than half of its restarts; on-demand L4 was hard to "
+              "get in EU zones."],
+}
+
 DEFAULT_CONFIG: dict[str, Any] = {
-    "currency": "USD",
+    "currency": "SEK",
     "exchange_rate_note": "",
     "cloud": {
         "status": "Unverified estimate",
@@ -50,7 +85,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "other_per_hour": None,
         "billed_cost": None,
         "billed_cost_note": "",
-        "notes": "Excludes taxes, discounts, network egress, images and buckets unless entered above.",
+        "notes": "Run cost counts running hours (GPU + CPU/RAM) and the disk pro rata; images, bucket and network "
+                 "are in the billing summary, not allocated to runs.",
     },
     "local": {
         "power_w": None,
@@ -115,17 +151,37 @@ def clean_config(raw: dict[str, Any] | None) -> dict[str, Any]:
                 value = _bool(given[key])
                 config[section][key] = bool(value) if section == "local" else value
     cloud = config["cloud"]
-    verified = bool(cloud["source_url"].startswith("https://cloud.google.com")
-                    and re.fullmatch(r"\d{4}-\d{2}-\d{2}", cloud["retrieved_on"] or ""))
-    cloud["status"] = "Official-rate estimate" if verified else "Unverified estimate"
+    dated = bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", cloud["retrieved_on"] or ""))
+    if dated and cloud["source_url"].startswith("billing:"):
+        cloud["status"] = "Billing-derived rates"
+    elif dated and cloud["source_url"].startswith("https://cloud.google.com"):
+        cloud["status"] = "Official-rate estimate"
+    else:
+        cloud["status"] = "Unverified estimate"
     return config
 
 
+def preset_config(name: str, current: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Fill the cloud rates from a billed setup (GPU separate from CPU + RAM, so nothing is counted twice)."""
+    preset = BILLING_PRESETS[name]
+    config = clean_config(current)
+    config["currency"] = "SEK"
+    config["cloud"].update(preset, gpu_count=1, gpu_included_in_machine_rate=False,
+                           disk_type="pd-balanced", disk_gb=BILLING_STORAGE["disk_gb"],
+                           disk_rate_per_gb_month=BILLING_STORAGE["disk_rate_per_gb_month"],
+                           source_url=BILLING_SOURCE, retrieved_on=BILLING_RETRIEVED)
+    return clean_config(config)
+
+
+DEFAULT_PRESET = "g2-standard-4 + 1x L4, on-demand (Netherlands)"
+
+
 def load_config(path: Path) -> dict[str, Any]:
+    """Saved inputs, else the project's main billed setup (local inputs stay unknown until entered)."""
     try:
         return clean_config(json.loads(path.read_text(encoding="utf-8")))
     except (OSError, ValueError):
-        return clean_config(None)
+        return preset_config(DEFAULT_PRESET)
 
 
 def save_config(path: Path, raw: dict[str, Any]) -> dict[str, Any]:
@@ -444,6 +500,8 @@ def build_view(camera: str, entries: list[dict[str, Any]], config: dict[str, Any
         "rows": rows, "breakdown": breakdown, "points": points,
         "assumptions": assumptions(config),
         "config": config,
+        "billing": {**BILLING_SUMMARY, "presets": BILLING_PRESETS, "storage": BILLING_STORAGE,
+                    "source": BILLING_SOURCE},
     }
 
 
@@ -451,7 +509,7 @@ def assumptions(config: dict[str, Any]) -> list[str]:
     cloud, local = config["cloud"], config["local"]
     return [
         f"Cloud rates: {cloud['status']}"
-        + (f" (source {cloud['source_url']}, retrieved {cloud['retrieved_on']})" if cloud["source_url"] else
+        + (f" ({cloud['source_url']}, as of {cloud['retrieved_on']})" if cloud["source_url"] else
            " (no official source recorded; enter the rate from the Google Cloud pricing page/calculator)"),
         f"Provisioning: {cloud['provisioning'] or 'not stated'}; region: {cloud['region'] or 'not stated'}; "
         f"machine: {cloud['machine_type'] or 'not stated'}; GPU: {cloud['gpu_type'] or 'not stated'}"

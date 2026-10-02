@@ -71,6 +71,7 @@ class Detection:
     resolved_label: str | None = None
     resolved_share: float | None = None
     support_method: str | None = None
+    support_raw_volume_l: float | None = None        # Logitech: before the known-object factor
     material: str = "unknown"
     material_confidence: float = 0.0
     track_id: int | None = None
@@ -217,6 +218,7 @@ class Detection:
             "support_length_cm": self.support_length_cm,
             "support_width_cm": self.support_width_cm,
             "support_method": self.support_method,
+            "support_raw_volume_l": self.support_raw_volume_l,
             "raw_label": self.label,
             "resolved_label": self.resolved_label,
             "resolved_share": self.resolved_share,

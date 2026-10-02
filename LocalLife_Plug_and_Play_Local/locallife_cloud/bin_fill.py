@@ -354,6 +354,7 @@ class FillEstimator:
         moving = motion is not None and motion > STABLE_MOTION
         step = max(1, int(depth_m.shape[1] // 160))
         objects = None if objects is None else objects[::step, ::step]
+        full = (depth_m, intrinsics, region)          # references only: per-object measurement uses full res
         depth_m, intrinsics, region = _subsample(depth_m, intrinsics, region)
         if objects is not None and not objects.any() and not moving and timestamp - self._last_refit >= 30.0:
             # Nothing detected in the bin: the deepest flat surface is the floor -- refresh it (plug and play).
@@ -384,7 +385,9 @@ class FillEstimator:
                              "area": (z_all / intrinsics.fx) * (z_all / intrinsics.fy),
                              "x": (cols_ - intrinsics.ppx) * z_all / intrinsics.fx,
                              "y": (rows_ - intrinsics.ppy) * z_all / intrinsics.fy, "z": z_all,
-                             "up": self._up_vector(plane)}
+                             "up": self._up_vector(plane),
+                             "full": {"depth": full[0], "intrinsics": full[1], "region": full[2],
+                                      "drift": self.last_drift, "plane": plane, "scale": scale}}
         a_, b_, c_ = plane if plane is not None else (0.0, 0.0, None)
         self.last_diag = {
             "floor_source": geometry, "depth_source": depth_label,
@@ -561,6 +564,9 @@ class FillEstimator:
         surface = getattr(self, "last_surface", None)
         if not surface or now - surface["at"] > 10.0:      # the pile changes slowly; settled maps stay valid
             return None
+        patch = self._object_patch(surface, box, mask)
+        if patch is not None:
+            surface, box, mask = patch
         step, height, ok, area = surface["step"], surface["height"], surface["ok"], surface["area"]
         valid = surface.get("valid", ok)
         h, w = height.shape
@@ -612,7 +618,14 @@ class FillEstimator:
             cv2 = None
         if np.count_nonzero(risen) < 10:
             return None
-        litres = float(np.sum(rise_map[risen] * area[risen])) * 1000.0
+        raster = _floor_raster(surface, risen, rise_map)
+        if raster is not None:
+            # Heights rasterised on the FLOOR plane: right for any camera tilt. Summing rise x the
+            # pixel's camera-facing area assumed a camera looking straight down; at the Logitech's
+            # 45-65 deg it read a 1.54 L carton as 1.07-2.50 L with perfect depth.
+            litres = raster["litres"]
+        else:
+            litres = float(np.sum(rise_map[risen] * area[risen])) * 1000.0
         # Depth dropouts on the object: assume they resemble the valid pixels around them.
         missing = int(np.count_nonzero(cv2_dilate(risen) & inside & ~valid))
         if missing:
@@ -622,7 +635,10 @@ class FillEstimator:
             return None                                  # implausible: unavailable, never clamped
         length = width = None
         method = "surface rise above the local surface"
-        if cv2 is not None and "x" in surface:
+        if raster is not None:
+            length, width = raster["length"], raster["width"]      # on the floor plane, oriented
+            method = "heights rasterised on the floor plane, integrated above the local surface"
+        elif cv2 is not None and "x" in surface:
             pts = np.c_[surface["x"][risen], surface["y"][risen]].astype(np.float32)
             (_, _), (w1, w2), _ = cv2.minAreaRect(pts)     # oriented: a diagonal parcel stays long/thin
             length, width = float(max(w1, w2)), float(min(w1, w2))
@@ -638,6 +654,36 @@ class FillEstimator:
         self.last_object = {"length_m": length, "width_m": width, "height_m": tall, "litres": round(litres, 2),
                             "method": method, "planar": planar}
         return round(litres, 2), tall
+
+    def _object_patch(self, surface: dict[str, Any], box, mask):
+        """The object's neighbourhood at FULL resolution (same floor plane, scale and drift as the fill
+        map). The fill map is subsampled to ~160 px wide; a 9 cm carton seen at 60 deg was 2-3 rows
+        there and read 0.9 L instead of 1.5 L. Only this crop is computed; the fill itself is unchanged."""
+        full = surface.get("full")
+        if not full or surface.get("step", 1) <= 1 or full["depth"] is None or full["intrinsics"] is None:
+            return None
+        depth = full["depth"]
+        h, w = depth.shape[:2]
+        x1, y1, x2, y2 = (int(round(v)) for v in box)
+        pad_x, pad_y = max(12, (x2 - x1) // 2), max(12, (y2 - y1) // 2)
+        cx1, cy1, cx2, cy2 = max(0, x1 - pad_x), max(0, y1 - pad_y), min(w, x2 + pad_x), min(h, y2 + pad_y)
+        if cx2 - cx1 < 4 or cy2 - cy1 < 4:
+            return None
+        k = full["intrinsics"]
+        intr = type(k)(fx=k.fx, fy=k.fy, ppx=k.ppx - cx1, ppy=k.ppy - cy1, width=cx2 - cx1, height=cy2 - cy1)
+        crop = depth[cy1:cy2, cx1:cx2].astype(np.float32) / float(full["drift"] or 1.0)
+        height, flat, valid = surface_maps(crop, intr, self.profile, full["plane"], full["scale"])
+        if full["region"] is not None and full["region"].shape == depth.shape:
+            valid &= full["region"][cy1:cy2, cx1:cx2]
+        if np.count_nonzero(flat & valid) < 0.30 * max(1, int(np.count_nonzero(valid))):
+            flat = np.ones_like(flat)
+        z = crop * full["scale"]
+        rows, cols = np.indices(crop.shape)
+        patch = {"at": surface["at"], "step": 1, "height": height, "ok": valid & flat, "valid": valid,
+                 "area": (z / intr.fx) * (z / intr.fy), "x": (cols - intr.ppx) * z / intr.fx,
+                 "y": (rows - intr.ppy) * z / intr.fy, "z": z, "up": surface["up"]}
+        crop_mask = None if mask is None or getattr(mask, "ndim", 0) != 2 else mask[cy1:cy2, cx1:cx2]
+        return patch, (x1 - cx1, y1 - cy1, x2 - cx1, y2 - cy1), crop_mask
 
     def _up_vector(self, plane) -> np.ndarray:
         if plane is not None:
@@ -890,37 +936,38 @@ def _box_from_face(surface, cells, rows, cols, keep, face_img, pts, centre, axes
     tol = max(0.012, pitch)
     # Detector masks bleed a cell or two onto the neighbours: look for side faces only inside the
     # eroded mask, so the bag a box leans on cannot extend its "side" downwards.
-    core_cells = cv2.erode(cells.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)[rows, cols]
-
-    def side_run(allowed: np.ndarray) -> float | None:
+    def side_run() -> float | None:
+        """A box side is the SAME depth along its whole edge; a bag pressed against it (or a mask bleeding
+        onto one) lengthens the run only where it touches. So each edge is cut into 8 stretches, the
+        contiguous run is measured per stretch, and the edge's depth is their median."""
         runs = []
         for i in (0, 1):
             j = 1 - i
             along = (uv_all[:, j] >= lo_e[j]) & (uv_all[:, j] <= hi_e[j])
             for edge in (hi_e[i] + pitch / 2, lo_e[i] - pitch / 2):
-                on = (~keep) & allowed & along & (np.abs(uv_all[:, i] - edge) <= tol) \
-                    & (below > 0.003) & (below < 0.35)
-                if on.sum() < 6:
-                    continue
-                depths = np.sort(below[on])
-                gaps = np.flatnonzero(np.diff(depths) > 0.02)
-                run = depths[: gaps[0] + 1] if gaps.size else depths
-                # A side seen almost edge-on (the view ray grazing it) has no usable depth extent.
                 basis = (e1, e2)[i]
                 side_normal = basis[0] * axes[0] + basis[1] * axes[1]
                 view = centre / max(1e-9, float(np.linalg.norm(centre)))
                 if abs(float(view @ side_normal)) < math.sin(math.radians(8)):
+                    continue                       # seen edge-on: no usable depth extent
+                on = (~keep) & along & (np.abs(uv_all[:, i] - edge) <= tol) & (below > 0.003) & (below < 0.35)
+                if on.sum() < 6:
                     continue
-                if run[0] <= 0.02 and run.size >= 6:
-                    runs.append(float(run[-1]))
+                pos, depth_on = uv_all[on, j], below[on]
+                edges_ = np.linspace(lo_e[j], hi_e[j], 9)
+                stretch = []
+                for k in range(8):
+                    sel = np.sort(depth_on[(pos >= edges_[k]) & (pos <= edges_[k + 1])])
+                    if sel.size < 3 or sel[0] > 0.02:
+                        continue
+                    gaps = np.flatnonzero(np.diff(sel) > 0.02)
+                    stretch.append(float((sel[: gaps[0] + 1] if gaps.size else sel)[-1]))
+                if len(stretch) >= 3:
+                    runs.append(float(np.median(stretch)))
         return max(runs) if runs else None
 
-    core_run = side_run(core_cells)
-    full_run = side_run(np.ones(len(pts), dtype=bool))
-    # The outer ring adds at most the side's last cell (<= 3 cm in replay); more than that is a
-    # neighbour under a bleeding mask, so the eroded-core run is kept.
-    runs = [r for r in (core_run, full_run if full_run is not None and core_run is not None
-                        and full_run - core_run <= 0.03 else None) if r is not None]
+    run = side_run()
+    runs = [run] if run is not None else []
     if runs:
         thickness, source = max(runs), "visible side face"
     if thickness is None and tilt >= 5.0:
@@ -962,6 +1009,53 @@ def _box_from_face(surface, cells, rows, cols, keep, face_img, pts, centre, axes
                    "litres": length * width * thickness * 1000.0,
                    "method": f"box cuboid: face L x W (in its own plane) x thickness from {source}"})
     return result
+
+
+def _floor_raster(surface: dict[str, Any], risen: np.ndarray, rise_map: np.ndarray) -> dict[str, float] | None:
+    """Object heights on a grid IN THE FLOOR PLANE (max per cell), small gaps closed; volume = sum of
+    cell height x cell area. Independent of the camera's tilt: an oblique view samples the same
+    footprint, only more sparsely along the view direction (the cell size follows that)."""
+    try:
+        import cv2
+    except ImportError:  # pragma: no cover
+        return None
+    if "x" not in surface or "up" not in surface or np.count_nonzero(risen) < 10:
+        return None
+    up = np.asarray(surface["up"], dtype=np.float64)
+    up = up / max(1e-9, float(np.linalg.norm(up)))
+    helper = np.array([1.0, 0.0, 0.0]) if abs(up[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    e1 = np.cross(up, helper)
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross(up, e1)
+    pts = np.c_[surface["x"][risen], surface["y"][risen], surface["z"][risen]].astype(np.float64)
+    heights = rise_map[risen].astype(np.float64)
+    rays = pts / np.maximum(np.linalg.norm(pts, axis=1, keepdims=True), 1e-9)
+    slant = np.maximum(np.abs(rays @ up), 0.25)            # a floor patch looks this much smaller
+    # Along the view direction a pixel covers 1/slant more floor: size cells by that (longer) spacing so
+    # an oblique view leaves no empty rows between samples (the hull scaling below fixes the area).
+    cell = float(np.clip(1.1 * np.sqrt(np.median(surface["area"][risen])) / float(np.median(slant)), 0.004, 0.04))
+    u, v = pts @ e1, pts @ e2
+    iu = np.floor((u - u.min()) / cell).astype(np.int64)
+    iv = np.floor((v - v.min()) / cell).astype(np.int64)
+    grid = np.full((iv.max() + 1, iu.max() + 1), -np.inf)
+    np.maximum.at(grid, (iv, iu), heights)
+    seen = np.isfinite(grid)
+    closed = cv2.morphologyEx(seen.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)).astype(bool)
+    filled = np.where(seen, grid, 0.0)
+    gaps = closed & ~seen
+    if gaps.any():                                         # a gap takes the mean of its seen neighbours
+        total = cv2.blur(filled, (3, 3))
+        count = cv2.blur(seen.astype(np.float64), (3, 3))
+        filled[gaps] = (total[gaps] / np.maximum(count[gaps], 1e-9))
+    # Edge cells are only partly covered; counted whole they inflated a 9 x 9 cm carton to 11.7 cm
+    # at 45 deg. The real footprint is the hull of the measured points themselves.
+    uv = np.c_[u, v].astype(np.float32)
+    hull = float(cv2.contourArea(cv2.convexHull(uv))) if len(uv) >= 3 else 0.0
+    cells_area = float(np.count_nonzero(closed)) * cell * cell
+    scale = min(1.0, hull / cells_area) if cells_area > 0 and hull > 0 else 1.0
+    litres = float(np.sum(filled[closed])) * cell * cell * scale * 1000.0
+    (_, _), (w1, w2), _ = cv2.minAreaRect(uv)
+    return {"litres": litres, "length": float(max(w1, w2)), "width": float(min(w1, w2)), "cell_m": cell}
 
 
 def _ransac_plane(pts: np.ndarray, tol: float = 0.015, iterations: int = 120):
@@ -1036,6 +1130,9 @@ def _tilted_slab(surface: dict[str, Any], risen: np.ndarray, rise_map: np.ndarra
     result: dict[str, Any] = {"planar": True, "share": round(share, 2), "tilt_deg": round(math.degrees(math.acos(min(1.0, cos_tilt))), 1)}
     if cos_tilt > math.cos(math.radians(5)):
         return result                                    # flat-lying: the surface integral is right
+    if cos_tilt < math.cos(math.radians(60)):
+        # Steeper than 60 deg is a SIDE (an upright carton's front, seen by an oblique camera), not a top.
+        return result
     pts, rises = pts[keep], rises[keep]
     along = (pts - centre) @ axes[0]
     across = (pts - centre) @ axes[1]

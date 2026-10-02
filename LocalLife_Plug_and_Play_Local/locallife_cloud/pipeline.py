@@ -807,6 +807,15 @@ class VisionPipeline:
             )
             if camera_id == "logitech" else None
         )
+        # V49: the same frozen-factor rule for the object volume above the local surface (the value the
+        # live table, deposits and ledger show for Logitech), fitted from that value's own raw readings.
+        self.support_volume_factors = (
+            LogitechVolumeFactors(
+                config.results_dir / "calibration" / "logitech_support_volume_factors.json",
+                camera_setup=f"{camera_id}:{config.depth_model}:support",
+            )
+            if camera_id == "logitech" else None
+        )
         # Live Logitech volumes per track, and the trimmed-median stable value.
         self._logitech_volume_samples: dict[int, deque[float]] = defaultdict(lambda: deque(maxlen=9))
         self._logitech_volume_spread: dict[int, float] = {}
@@ -3249,6 +3258,15 @@ class VisionPipeline:
                     resolver.set_size(item.track_id, item.support_length_cm, item.support_height_cm)
                 item.support_method = method if method.startswith("box ") or "slab" in method else \
                     "volume integrated above the local surface (not L x W x H; L x W x H is its enclosing box)"
+                if self.camera_id == "logitech" and self.support_volume_factors is not None:
+                    # Monocular depth flattens relief. A factor frozen from >= 3 KNOWN objects (never
+                    # RealSense values) rescales the volume; the raw value is kept beside it.
+                    item.support_raw_volume_l = item.support_volume_l
+                    corrected, applied = self.support_volume_factors.correct(item.support_volume_l, "irregular")
+                    if applied.get("source") != "uncalibrated_raw" and corrected is not None:
+                        item.support_volume_l = round(float(corrected), 2)
+                        item.support_method += (f"; x {applied['factor']:.3f} Logitech known-object factor "
+                                                f"(raw {item.support_raw_volume_l} L; L x W x H uncorrected)")
                 if own is None and item.provisional_volume_l is None:
                     item.provisional_volume_l = item.support_volume_l
             implied = MATERIAL_OF.get(resolved or "")
@@ -6367,6 +6385,18 @@ class VisionPipeline:
                 tinted[mask] = colour
                 output = (0.55 * output + 0.45 * tinted).astype(np.uint8)
         return output
+
+    def latest_support_raw(self, track_id: int | None = None) -> tuple[float | None, str | None]:
+        """Raw (uncorrected) object volume above the local surface of a Logitech track (largest if none given)."""
+        analysis = self.latest_analysis
+        if analysis is None:
+            return None, None
+        items = [d for d in analysis.detections if d.support_raw_volume_l is not None
+                 and (track_id is None or d.track_id == track_id)]
+        if not items:
+            return None, None
+        best = max(items, key=lambda d: d.area_pixels)
+        return float(best.support_raw_volume_l), best.resolved_label or best.canonical_type or best.label
 
     def latest_raw_volume(self) -> tuple[float | None, str | None, str | None]:
         """The newest raw Logitech volume, its object name and calibration group."""

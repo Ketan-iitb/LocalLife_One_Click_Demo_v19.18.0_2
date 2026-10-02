@@ -96,6 +96,28 @@ class CostTests(unittest.TestCase):
         self.assertEqual(ok["cloud"]["status"], "Official-rate estimate")
 
 
+class BillingPresetTests(unittest.TestCase):
+    def test_billed_setups_count_gpu_once_and_are_labelled_billing_derived(self):
+        expected = {"g2-standard-4 + 1x L4, on-demand (Netherlands)": 7.07,
+                    "g2-standard-8 + 1x L4, on-demand (Belgium)": 9.07,
+                    "g2-standard-4 + 1x L4, Spot (Netherlands)": 4.33,
+                    "n1-standard-8 + 1x T4, on-demand (Netherlands)": 7.44}
+        for name, per_hour in expected.items():
+            cfg = ca.preset_config(name)
+            self.assertEqual(cfg["cloud"]["status"], "Billing-derived rates")
+            self.assertEqual(cfg["currency"], "SEK")
+            self.assertAlmostEqual(ca.cloud_compute_rate(cfg["cloud"])[0], per_hour, places=2)
+        cost = ca.cloud_cost(ca.preset_config("g2-standard-4 + 1x L4, on-demand (Netherlands)")["cloud"], 3600)
+        self.assertAlmostEqual(cost["storage"], 200 * 1.08 / 730.0)          # disk pro rata for one hour
+        self.assertAlmostEqual(sum(v for _, v in ca.BILLING_SUMMARY["breakdown"]), 534, delta=2)   # ~535 SEK bill
+
+    def test_default_config_is_the_main_billed_setup_and_local_stays_unknown(self):
+        with TemporaryDirectory() as d:
+            cfg = ca.load_config(Path(d) / "missing.json")
+        self.assertEqual(cfg["cloud"]["machine_type"], "g2-standard-4")
+        self.assertIsNone(ca.local_cost(cfg["local"], 3600)["total"])
+
+
 class AccuracyTests(unittest.TestCase):
     def setUp(self):
         self.tmp = TemporaryDirectory()

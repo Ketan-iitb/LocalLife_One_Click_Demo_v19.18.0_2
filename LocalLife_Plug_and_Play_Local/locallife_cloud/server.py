@@ -359,6 +359,15 @@ def create_app(
         """Rate/input edits change cost calculations only; nothing in the pipelines reads them."""
         return jsonify(ok=True, config=ca.save_config(ca_config_path, request.get_json(silent=True) or {}))
 
+    @app.post("/api/cost-accuracy/preset")
+    @protected
+    def cost_accuracy_preset() -> Any:
+        """Fill the cloud rates from one billed setup; local inputs are kept."""
+        name = str((request.get_json(silent=True) or {}).get("name") or "")
+        if name not in ca.BILLING_PRESETS:
+            return jsonify(error="unknown setup"), 400
+        return jsonify(ok=True, config=ca.save_config(ca_config_path, ca.preset_config(name, ca.load_config(ca_config_path))))
+
     @app.get("/api/cost-accuracy.csv")
     def cost_accuracy_csv() -> Any:
         view = _ca_view()
@@ -1002,6 +1011,41 @@ def create_app(
     @protected
     def logitech_volume_factor_unfreeze() -> Any:
         return jsonify(ok=True, **manager.camera("logitech").volume_factors.unfreeze())
+
+    @app.get("/api/logitech/support-factor")
+    def logitech_support_factor() -> Any:
+        return jsonify(manager.camera("logitech").support_volume_factors.status())
+
+    @app.post("/api/logitech/support-factor/sample")
+    @protected
+    def logitech_support_factor_sample() -> Any:
+        """A KNOWN object (measured by hand) against Logitech's own raw object volume right now."""
+        payload = request.get_json(silent=True) or {}
+        station = manager.camera("logitech")
+        track = payload.get("track_id")
+        raw, name = station.latest_support_raw(int(track) if track not in (None, "") else None)
+        try:
+            if raw is None:
+                raise ValueError("no Logitech object volume on screen: place the object and wait for a reading")
+            status = station.support_volume_factors.add_sample(
+                str(payload.get("object_name") or name or "object"), "irregular",
+                float(payload["reference_litres"]), raw, reference_source=str(payload.get("reference_source", "manual")))
+        except (KeyError, TypeError, ValueError) as exc:
+            return jsonify(error=str(exc)), 400
+        return jsonify(ok=True, raw_litres=raw, **status)
+
+    @app.post("/api/logitech/support-factor/freeze")
+    @protected
+    def logitech_support_factor_freeze() -> Any:
+        try:
+            return jsonify(ok=True, **manager.camera("logitech").support_volume_factors.freeze())
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+
+    @app.post("/api/logitech/support-factor/unfreeze")
+    @protected
+    def logitech_support_factor_unfreeze() -> Any:
+        return jsonify(ok=True, **manager.camera("logitech").support_volume_factors.unfreeze())
 
     @app.post("/api/logitech/calibrate-empty")
     @protected

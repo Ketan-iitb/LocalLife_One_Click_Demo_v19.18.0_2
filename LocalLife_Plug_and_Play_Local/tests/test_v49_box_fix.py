@@ -235,7 +235,7 @@ def _obb(L, W, T, tilt, yaw, rest_h):
     return p0 + a1 * L / 2 + a3 * T / 2, np.stack([a1, a2, a3]), np.array([L / 2, W / 2, T / 2])
 
 
-def _scene(heights, box, pitch=15.0, cam=1.10):
+def _scene(heights, box, pitch=15.0, cam=1.10, far=2.2):
     """Depth of the nearest hit: bag heightfield, or a SOLID oriented box (air under its raised end)."""
     b = math.radians(pitch)
     rows, cols = np.mgrid[0:KW.height, 0:KW.width]
@@ -244,7 +244,7 @@ def _scene(heights, box, pitch=15.0, cam=1.10):
          + np.array([0, math.sin(b), -math.cos(b)]))
     C = np.array([0, -cam * math.tan(b), cam])
     bag_t = np.full(xn.shape, np.inf)
-    for t in np.arange(0.3, 2.2, 0.0025):
+    for t in np.arange(0.3, far, 0.0025 if far <= 2.2 else 0.003):
         p = C + t * d
         hit = np.isinf(bag_t) & (p[..., 2] <= heights(p[..., 0], p[..., 1]))
         bag_t[hit] = t
@@ -419,3 +419,43 @@ class CostVsAccuracyTests(unittest.TestCase):
                              .startswith("UNVERIFIED"))
         svg = bench.cost_accuracy_svg([{"metric": "cost per 1000 frames (USD)", "local": "N/A", "cloud": "N/A"}], "USD")
         self.assertIn("Not plotted", svg)                           # no data -> no fake points
+
+
+class LogitechObliqueVolumeTests(unittest.TestCase):
+    """The Logitech looks 45-65 deg from vertical. Exact synthetic depth isolates the GEOMETRY:
+    before, a 9 x 9 x 19 cm carton (1.54 L) read 0.88-2.59 L depending on the angle (pixel-column
+    integral + a 160-px-wide map). Monocular depth errors are a separate, calibrated factor."""
+
+    def _volume(self, dims, pitch):
+        from locallife_cloud import bin_fill as bf
+        sys.path.insert(0, str(PROJECT / "tests"))
+        from test_v45_bin_fill_events import _profile
+        depth, mask = _scene(lambda x, y: 0.30 + 0 * x, _obb(*dims, 0, 20, 0.30), pitch, far=4.5)
+        empty, _ = _scene(lambda x, y: 0 * x, None, pitch, far=4.5)
+        with TemporaryDirectory() as d:
+            est = bf.FillEstimator("logitech", Path(d), _profile(camera_to_empty_floor_m=1.10, usable_height_m=1.0,
+                                                                  tilt_from_vertical_deg=float(pitch)))
+            est.recalibrate(empty, KW, None)
+            est.update(np.zeros((KW.height, KW.width, 3), np.uint8), depth, KW, None, 0.0, 1.0)
+            r, c = np.nonzero(mask)
+            return est.object_volume((c.min(), r.min(), c.max() + 1, r.max() + 1), mask, 1.5)
+
+    def test_upright_carton_and_box_at_oblique_angles(self):
+        for dims, truth in (((0.09, 0.09, 0.19), 1.539), ((0.45, 0.15, 0.07), 4.725)):
+            for pitch in (45, 60, 65):
+                with self.subTest(dims=dims, pitch=pitch):
+                    litres, _ = self._volume(dims, pitch)
+                    self.assertLess(abs(litres - truth) / truth, 0.15, litres)
+
+    def test_known_object_factor_applies_only_after_three_samples_and_freeze(self):
+        from locallife_cloud.logitech_factor import LogitechVolumeFactors
+        with TemporaryDirectory() as d:
+            factors = LogitechVolumeFactors(Path(d) / "f.json", camera_setup="logitech:test:support")
+            self.assertEqual(factors.correct(0.30, "irregular")[1]["source"], "uncalibrated_raw")
+            for name, true, raw in (("carton", 1.5, 0.30), ("box", 4.725, 1.0), ("tin", 0.8, 0.17)):
+                factors.add_sample(name, "irregular", true, raw)
+            self.assertEqual(factors.correct(0.30, "irregular")[1]["source"], "uncalibrated_raw")   # not frozen yet
+            factors.freeze()
+            corrected, applied = factors.correct(0.30, "irregular")
+            self.assertAlmostEqual(corrected, 0.30 * applied["factor"])
+            self.assertAlmostEqual(applied["factor"], 4.7, delta=0.3)                         # median of ratios
