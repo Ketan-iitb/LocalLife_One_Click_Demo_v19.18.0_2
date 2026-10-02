@@ -223,3 +223,15 @@ class EndpointTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ResearchLayoutTests(unittest.TestCase):
+    def test_research_page_is_grouped_without_removing_anything(self):
+        from locallife_cloud import server
+        page, base = server.RESEARCH_PAGE, server.DUAL_DASHBOARD
+        self.assertIn("rl-nav", page)                                   # section menu script present
+        for marker in ('id="bf-panel"', 'id="lc-panel"', 'id="ca-panel"', 'class="setup"', 'class="fused"',
+                       'class="comparison"', "Live RealSense detections", "Logitech history", "RealSense colors"):
+            self.assertIn(marker, page)                                 # every block still on the page
+        self.assertNotIn("rl-nav", server.OPERATOR_PAGE)               # operator page unchanged
+        self.assertTrue(page.startswith(base[:200]))

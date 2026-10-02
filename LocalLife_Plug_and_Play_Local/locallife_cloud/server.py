@@ -63,6 +63,7 @@ async function update(){try{const response=await fetch('/api/state');const state
 
 from .comparison_panel import COMPARISON_PANEL  # noqa: E402
 from .cost_accuracy_panel import COST_ACCURACY_PANEL  # noqa: E402
+from .research_layout import RESEARCH_LAYOUT  # noqa: E402
 from .bin_fill_panel import BIN_FILL_PANEL  # noqa: E402
 
 # The Local-vs-Cloud panel sits directly below the two live camera streams on
@@ -71,6 +72,8 @@ _RESEARCH_STREAMS_END = 'id="logitech-materials"></tbody></table></div></article
 _OPERATOR_STREAMS_END = 'alt="Logitech dumpster camera"></div></div></div>'
 assert DUAL_DASHBOARD.count(_RESEARCH_STREAMS_END) == 1 and OPERATOR_DASHBOARD.count(_OPERATOR_STREAMS_END) == 1
 RESEARCH_PAGE = DUAL_DASHBOARD.replace(_RESEARCH_STREAMS_END, _RESEARCH_STREAMS_END + BIN_FILL_PANEL + COMPARISON_PANEL + COST_ACCURACY_PANEL)
+# Same content, grouped and ordered (research_layout.py); nothing removed or renamed.
+RESEARCH_PAGE = RESEARCH_PAGE.replace("</body>", RESEARCH_LAYOUT + "</body>", 1)
 OPERATOR_PAGE = OPERATOR_DASHBOARD.replace(_OPERATOR_STREAMS_END, _OPERATOR_STREAMS_END + BIN_FILL_PANEL + COMPARISON_PANEL + COST_ACCURACY_PANEL)
 
 
