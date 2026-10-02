@@ -3066,7 +3066,7 @@ class VisionPipeline:
         # (above the local support around it) as a PROVISIONAL, display-only value; the ledger is untouched.
         for item in detections:
             own = item.monocular_volume_l if self.camera_id == "logitech" else item.realsense_volume_l
-            if own is None and item.provisional_volume_l is None and not _is_phantom_detection(item):
+            if not _is_phantom_detection(item):
                 try:
                     estimate = self.fill.object_volume(item.box, item.mask, time.time())
                 except Exception:  # noqa: BLE001 - display-only estimate
@@ -3084,9 +3084,10 @@ class VisionPipeline:
                     estimate = (round(float(np.median([v[1] for v in samples])), 2),
                                 float(np.median([v[2] for v in samples])))
                 if estimate is not None:
-                    item.provisional_volume_l = estimate[0]
-                    if item.height_above_baseline_cm is None:
-                        item.height_above_baseline_cm = round(estimate[1] * 100, 1)
+                    item.support_volume_l = estimate[0]
+                    item.support_height_cm = round(estimate[1] * 100, 1)
+                    if own is None and item.provisional_volume_l is None:
+                        item.provisional_volume_l = estimate[0]
         if persist:
             self.store.append_jsonl("frames.jsonl", analysis.to_dict())
             self._finalise_settled_measurements(detections, timestamp)

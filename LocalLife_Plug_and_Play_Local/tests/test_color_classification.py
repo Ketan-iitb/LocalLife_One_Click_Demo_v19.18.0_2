@@ -70,3 +70,15 @@ class PaleYellowColorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class V48DarkFrameColourTests(unittest.TestCase):
+    def test_white_bag_in_an_under_exposed_bin_is_white_not_grey(self) -> None:
+        from locallife_cloud.geometry import classify_color
+        frame = np.full((240, 320, 3), 22, np.uint8)            # dark bin walls (RealSense colour stream)
+        frame[60:180, 90:230] = (128, 132, 130)                  # a white bag at half brightness
+        mask = np.zeros(frame.shape[:2], bool)
+        mask[60:180, 90:230] = True
+        self.assertEqual(classify_color(frame, mask)[0], "white")
+        lit = np.full((240, 320, 3), 128, np.uint8)              # an evenly lit grey scene stays grey
+        self.assertNotEqual(classify_color(lit, mask)[0], "white")

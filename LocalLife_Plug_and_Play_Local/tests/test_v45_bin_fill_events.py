@@ -392,5 +392,17 @@ class V48NoiseTests(unittest.TestCase):
         self.assertIn("valid_depth_pct", reading["diagnostics"])
 
 
+
+class V48GapTests(unittest.TestCase):
+    def test_narrow_gaps_between_bags_are_filled_but_open_floor_is_not(self) -> None:
+        prof = _profile(camera_to_empty_floor_m=1.10, usable_height_m=1.00)
+        bags = {(i, j): (0.0 if i % 4 == 0 else 0.40) for i in range(16) for j in range(12)}   # 5 cm cracks
+        self.assertGreater(bf.fill_reading(bags, 0.9, prof)["height_fill_pct"], 38.0)          # not 30 %
+        half = {(i, j): (0.40 if i < 8 else 0.0) for i in range(16) for j in range(12)}         # 40 cm open floor
+        self.assertLess(bf.fill_reading(half, 0.9, prof)["height_fill_pct"], 23.0)
+        self.assertEqual(bf.fill_reading({(i, j): 0.0 for i in range(9) for j in range(9)}, 0.9, prof)
+                         ["height_fill_pct"], 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

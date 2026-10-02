@@ -936,6 +936,15 @@ def _dominant_color_with_support(
     selected = frame_bgr[material].astype(np.float32)
     if selected.shape[0] > 20_000:
         selected = selected[np.linspace(0, selected.shape[0] - 1, 20_000, dtype=np.int64)]
+    # Exposure: an under-exposed frame (the RealSense colour stream in a dark bin) put a white
+    # bag at half brightness, so it read "grey"/"unknown". Scale by the frame's own bright
+    # reference (98th percentile) -- only for under-exposed frames, gain capped at 2.5x.
+    sample = frame_bgr.reshape(-1, frame_bgr.shape[-1])[:: max(1, frame_bgr.shape[0] * frame_bgr.shape[1] // 40_000)]
+    brightness = sample.max(axis=1) if sample.size else np.array([255.0])
+    reference = float(np.percentile(brightness, 98))
+    # Only a genuinely dark frame (dark background AND dim highlights): an evenly lit grey scene stays grey.
+    if 20.0 < reference < 0.7 * 255.0 and float(np.median(brightness)) < 0.25 * 255.0:
+        selected = np.clip(selected * min(2.5, 0.92 * 255.0 / reference), 0.0, 255.0)
 
     # Do not average unlike colours into a third, fictional colour.  That was
     # happening on the green translucent bag in the hardware screenshots:

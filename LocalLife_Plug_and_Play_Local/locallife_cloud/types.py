@@ -100,6 +100,10 @@ class Detection:
     # stood above the floor). Displayed as provisional; never recorded, because
     # the ledger and history read only the accepted volume fields.
     provisional_volume_l: float | None = None
+    # v48: volume / height above the LOCAL surface around the object (bag lying on the pile),
+    # from this camera's own surface map. Display-only; the ledger keeps its own measurement.
+    support_volume_l: float | None = None
+    support_height_cm: float | None = None
     # A small, strongly coloured part distinct from the dominant colour -- the
     # red cap on a grey bottle -- and how the colour was reached
     # (colour_evidence.py). The dominant colour stays in `color`.
@@ -198,6 +202,8 @@ class Detection:
             "stable_volume_l": self.stable_volume_l,
             "finalized_event_id": self.finalized_event_id,
             "provisional_volume_l": self.provisional_volume_l,
+            "support_volume_l": self.support_volume_l,
+            "support_height_cm": self.support_height_cm,
             "color_accent": self.color_accent,
             "color_evidence": self.color_evidence,
             "material_evidence": self.material_evidence,

@@ -174,6 +174,26 @@ def cell_tops(height: np.ndarray, hx: np.ndarray, hy: np.ndarray) -> dict[tuple[
     return cells
 
 
+def _close_gaps(cells: dict[tuple[int, int], float], cells_wide: int = 3) -> dict[tuple[int, int], float]:
+    """Grey closing (15 cm): a crevice narrower than that between bags is not usable space.
+
+    Wider open floor stays open, so an empty or half-empty bin is not filled in.
+    """
+    if len(cells) < 9:
+        return cells
+    try:
+        import cv2
+    except ImportError:  # pragma: no cover
+        return cells
+    keys = np.array(list(cells.keys()))
+    x0, y0 = keys.min(axis=0)
+    grid = np.zeros(tuple(keys.max(axis=0) - (x0, y0) + 1)[::-1], np.float32)
+    grid[keys[:, 1] - y0, keys[:, 0] - x0] = np.fromiter(cells.values(), dtype=np.float32)
+    kernel = np.ones((cells_wide, cells_wide), np.uint8)
+    closed = cv2.morphologyEx(grid, cv2.MORPH_CLOSE, kernel)
+    return {k: float(max(cells[k], closed[k[1] - y0, k[0] - x0])) for k in cells}
+
+
 def heights_above_plane(depth_m: np.ndarray, intrinsics: Any, coefficients, region=None):
     """(height above the saved empty-bin floor plane, x, y) -- the measured pose, when one exists."""
     a, b, c = (float(v) for v in coefficients)
@@ -189,7 +209,7 @@ def fill_reading(cells: dict[tuple[int, int], float], coverage: float, profile: 
     """The labelled fill quantities from one settled grid of cell tops (heights in metres)."""
     usable = float(profile.usable_height_m)
     # Cells above the rim are waste heaped over it: the height fill saturates at 100 %.
-    tops = np.clip(np.fromiter(cells.values(), dtype=np.float64), 0.0, usable)
+    tops = np.clip(np.fromiter(_close_gaps(cells).values(), dtype=np.float64), 0.0, usable)
     # Fill = mean waste-surface height over the visible bin floor: a few bags in an empty bin
     # give a few per cent, not the height of the tallest bag.
     fill = float(tops.mean()) if fill_m is None else float(min(max(fill_m, 0.0), usable))
@@ -361,7 +381,7 @@ class FillEstimator:
             "depth_scale": round(scale, 3), "scale_drift": round(float(self.last_drift), 3),
             "valid_depth_pct": round(100.0 * np.count_nonzero(valid) / max(1, valid.size if region is None
                                                                            else int(np.count_nonzero(region))), 1),
-            "statistic": "mean over 5 cm floor cells of the surface top (p90 per cell); < 3 cm = floor",
+            "statistic": "mean over 5 cm floor cells of the surface top (p90 per cell), gaps < 15 cm closed; < 3 cm = floor",
             "usable_height_cm": round(self.profile.usable_height_m * 100, 1), "frame_at": timestamp,
         }
         usable = self.profile.usable_height_m
@@ -374,10 +394,16 @@ class FillEstimator:
         below_share = float(np.count_nonzero(valid & (height < -BELOW_FLOOR_M))) / max(1, int(np.count_nonzero(valid)))
         if below_share > BELOW_FLOOR_SHARE:
             warnings.append(f"{below_share:.0%} of depth below the floor reference")   # API only, not shown
+        n_valid = max(1, int(np.count_nonzero(valid)))
+        below_share = float(np.count_nonzero(valid & (height < -BELOW_FLOOR_M))) / n_valid
+        above_share = float(np.count_nonzero(valid & (height > usable + RIM_TOLERANCE_M))) / n_valid
+        self.last_diag.update(below_floor_pct=round(100 * below_share, 1), above_rim_pct=round(100 * above_share, 1))
         if coverage < MIN_COVERAGE or np.count_nonzero(keep) < 30:
-            # Self-heal: a floor that leaves no valid surface for 20 s is wrong (stale or a drifted fit).
-            self._blind_since = getattr(self, "_blind_since", None) or timestamp
-            if self.profile.floor_plane is not None and timestamp - self._blind_since > 20.0:
+            # Self-heal ONLY a provably wrong floor (most surface far below the floor or above the rim).
+            # A full bin that merely hides the floor keeps its good floor.
+            wrong = max(below_share, above_share) > 0.6
+            self._blind_since = (getattr(self, "_blind_since", None) or timestamp) if wrong else None
+            if wrong and self.profile.floor_plane is not None and timestamp - self._blind_since > 20.0:
                 self.forget_floor()
                 self._blind_since = None
             return self._hold("waiting for a clear view of the bin surface", warnings=warnings)
@@ -439,7 +465,7 @@ class FillEstimator:
             # Waste is always closer than the floor: a shallower "floor" is the top of the pile.
             return {"ok": False, "reason": "a deeper floor is already known (pile top is not the floor)"}
         if self.camera_id == "logitech":
-            if automatic and share < 0.35:
+            if automatic and share < (0.35 if self.profile.floor_plane is not None else 0.20):
                 return {"ok": False, "reason": "floor not clearly visible yet (automatic fit needs an open floor)"}
             scale = reference / distance
         else:
