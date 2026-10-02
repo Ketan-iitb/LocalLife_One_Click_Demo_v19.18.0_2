@@ -743,19 +743,18 @@ def create_app(
         buffer = io.StringIO()
         writer = _csv.writer(buffer)
         writer.writerow(["Camera", "Bag no.", "Bag ID", "Dropped at", "Colour", "Material", "Object",
-                         "Length cm", "Width cm", "Height cm", "Bag volume L", "Bag volume method",
+                         "Detector label (raw)", "Length cm", "Width cm", "Height cm", "Bag volume L", "Bag volume method",
                          "Bin volume before L", "Bin volume after L", "Bin fill before %", "Bin fill after %",
                          "Counted from", "Status", "Reason", "Sorting", "Sorting reason", "Session"])
         for e in sorted(snap["events"], key=lambda item: item["deposit_time"]):
             writer.writerow([e.get("camera"), e.get("count_after"), e.get("event_id"), stamp(e.get("deposit_time")),
                              e.get("colour"), e.get("material"),
-                             e.get("detector_label") if e.get("detector_label") not in (None, "unknown")
-                             else e.get("object_type"),
+                             e.get("object_type"), cell(e.get("detector_label")),
                              cell(e.get("length_cm")), cell(e.get("width_cm")), cell(e.get("height_cm")),
                              cell(e.get("envelope_l")), cell(e.get("volume_method")),
                              cell(e.get("bin_fill_litres_before")), cell(e.get("bin_fill_litres_after")),
                              cell(e.get("bin_fill_pct_before")), cell(e.get("bin_fill_pct_after")),
-                             "detected bag" if e.get("track_id") is not None else "image change (no detection)",
+                             "detected object" if e.get("track_id") is not None else "image change (no detection)",
                              e.get("measurement_status"), cell(e.get("reason")), cell(e.get("sorting")),
                              cell(e.get("sorting_reason")), snap["session_id"]])
         return Response(buffer.getvalue(), mimetype="text/csv", headers={
@@ -883,6 +882,20 @@ def create_app(
             region = None if depth is None else station._measurement_region(depth.shape + (3,))
             result[camera_id] = station.fill.recalibrate(depth, geometry, region)
         return jsonify(ok=True, cameras=result, session=manager.reset_counting())
+
+    @app.get("/api/debug/snapshot.zip")
+    def debug_snapshot() -> Any:
+        """V49: frame + depth + masks + detections of both cameras, for offline tuning (read-only)."""
+        from .debug_snapshot import build_zip
+        stations = {}
+        for camera_id in ("realsense", "logitech"):
+            try:
+                stations[camera_id] = manager.camera(camera_id)
+            except (ValueError, AttributeError):
+                pass
+        name = time.strftime("locallife_snapshot_%Y%m%d-%H%M%S.zip")
+        return Response(build_zip(stations), mimetype="application/zip",
+                        headers={"Content-Disposition": f"attachment; filename={name}"})
 
     @app.post("/api/bin-fill/session/new")
     @protected

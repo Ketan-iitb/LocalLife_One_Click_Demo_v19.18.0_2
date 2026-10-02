@@ -24,7 +24,7 @@ from .inference import MetricDepthEstimator, create_segmenter
 from .ledger import waste_object_type
 from .session_deposits import SessionDeposits
 from .paired_events import PairedComparisonLog
-from .pipeline import VisionPipeline, filter_waste_detections
+from .pipeline import VisionPipeline, apply_confidence_floor, filter_waste_detections
 from .storage import ResultStore
 
 
@@ -157,7 +157,11 @@ class DualCameraCoordinator:
         config.validate()
         self.config = config
         self.inference_lock = threading.RLock()
-        shared_detector = detector if detector is not None else create_segmenter(config)
+        # V49: the shared model runs at the lowest per-camera threshold. Logitech's own 0.15 had no
+        # effect while the model itself discarded everything under the RealSense 0.24; each camera
+        # re-applies its own threshold right after detection (apply_confidence_floor).
+        shared_detector = detector if detector is not None else create_segmenter(replace(
+            config, detector_confidence=min(config.detector_confidence, config.logitech_detector_confidence)))
         shared_depth = depth_estimator
         if shared_depth is None and config.enable_monocular_depth:
             # Before transformers is imported: a torchaudio whose compiled
@@ -347,7 +351,14 @@ class DualCameraCoordinator:
             if "logitech" in packets and webcam.depth_estimator is not None:
                 predicted_by_camera["logitech"] = webcam.predict_depth(packets["logitech"]["frame"])
         elapsed_ms = (time.perf_counter() - started) * 1000.0 / len(camera_ids)
-        detections_by_camera = dict(zip(camera_ids, detections_batch, strict=True))
+        detections_by_camera = {}
+        for camera_id, batch in zip(camera_ids, detections_batch, strict=True):
+            station_config = self.camera(camera_id).config
+            dropped: list = []
+            detections_by_camera[camera_id] = apply_confidence_floor(list(batch), (
+                station_config.logitech_detector_confidence if camera_id == "logitech"
+                else station_config.detector_confidence), dropped)
+            self.camera(camera_id)._note_floor_drops(dropped)
         semantic_presence: dict[str, bool] = {}
         # Per-camera "this camera's own neural detector confirmed a BOX-family
         # object this frame". Logitech is this rig's designated appearance and

@@ -168,7 +168,8 @@ class SequenceTests(unittest.TestCase):
             scene.add(5, (60, 60, 100, 100), label="textile item")       # mislabelled bag still counts
             got, _ = run(counter, scene, 8.0, 12.0)
             self.assertEqual(counter.count, 1)
-            self.assertEqual(got[0]["object_type"], "bag-like object")
+            # V49: counted, but not called a bag: no class was resolved for this track.
+            self.assertEqual(got[0]["object_type"], "unresolved (detector: textile item)")
             self.assertEqual(got[0]["detector_label"], "textile item")
 
     def test_a_red_bag_with_the_same_grey_level_is_seen(self) -> None:
@@ -446,7 +447,7 @@ class V49LedgerTests(unittest.TestCase):
             self.assertEqual((row["Camera"], row["Bag no."]), ("realsense", "1"))
             self.assertEqual((row["Bin volume before L"], row["Bin volume after L"]), ("132.0", "158.4"))
             self.assertEqual((row["Length cm"], row["Bag volume L"]), ("40.0", "30.0"))
-            self.assertEqual(row["Counted from"], "detected bag")
+            self.assertEqual(row["Counted from"], "detected object")       # V49: not assumed to be a bag
             self.assertEqual(len(rows), 2)
 
 
@@ -466,7 +467,7 @@ class V49BinPolicyTests(unittest.TestCase):
     def test_verdicts(self):
         from locallife_cloud.bin_policy import verdict
         cases = {
-            ("book", "paper", 0.37, "brown"): ("mis_sort", "cardboard box"),
+            ("book", "paper", 0.37, "brown"): ("mis_sort", "book"),         # a book is not relabelled a box
             ("cardboard shipping box", None, None, None): ("mis_sort", "cardboard box"),
             ("shoe", None, None, None): ("mis_sort", "shoe"),
             ("drill", None, None, None): ("mis_sort", "drill"),
@@ -484,9 +485,11 @@ class V49BinPolicyTests(unittest.TestCase):
     def test_deposit_row_and_ledger_carry_the_alarm(self):
         from locallife_cloud.bin_policy import apply_to_event
         from locallife_cloud.session_deposits import CSV_FIELDS
-        row = apply_to_event({"detector_label": "book", "material": "UNKNOWN", "colour": "brown", "track_id": 3})
+        row = apply_to_event({"detector_label": "book", "object_class": "cardboard box", "material": "CARDBOARD",
+                              "colour": "brown", "track_id": 3})
         self.assertEqual(row["sorting"], "MIS-SORT")
-        self.assertEqual((row["object_type"], row["material"]), ("cardboard box", "CARDBOARD"))
+        unresolved = apply_to_event({"detector_label": "book", "object_class": None, "track_id": 3})
+        self.assertEqual(unresolved["sorting_status"], "check")         # uncertainty is kept, not guessed
         self.assertIn("sorting", CSV_FIELDS)
         from locallife_cloud.bin_fill_panel import BIN_FILL_PANEL
         self.assertIn("bf-mis", BIN_FILL_PANEL)

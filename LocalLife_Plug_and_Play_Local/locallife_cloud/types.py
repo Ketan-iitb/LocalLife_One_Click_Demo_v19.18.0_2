@@ -64,6 +64,13 @@ class Detection:
     # Deterministic allowed / mis-sort / unknown verdict (playbook section 12).
     sorting_status: str = "unknown"
     sorting_reason: str = ""
+    bin_verdict: dict | None = None                 # V49 per-track plastic-bags-only verdict
+    # V49: every overlapping proposal for this object this frame (incl. suppressed duplicates),
+    # and the class resolved over the whole track (object_class.py). `label` stays the raw class.
+    label_candidates: list = field(default_factory=list, repr=False)
+    resolved_label: str | None = None
+    resolved_share: float | None = None
+    support_method: str | None = None
     material: str = "unknown"
     material_confidence: float = 0.0
     track_id: int | None = None
@@ -209,6 +216,10 @@ class Detection:
             "support_height_cm": self.support_height_cm,
             "support_length_cm": self.support_length_cm,
             "support_width_cm": self.support_width_cm,
+            "support_method": self.support_method,
+            "raw_label": self.label,
+            "resolved_label": self.resolved_label,
+            "resolved_share": self.resolved_share,
             "color_accent": self.color_accent,
             "color_evidence": self.color_evidence,
             "material_evidence": self.material_evidence,
@@ -525,7 +536,8 @@ def _bin_policy(detection: "Detection") -> dict:
     """V49 plastic-bags-only verdict for the dashboard (bin_policy.py); never raises."""
     try:
         from .bin_policy import verdict
-        v = verdict(detection.label, detection.material, detection.material_confidence, detection.color)
+        v = getattr(detection, "bin_verdict", None) or verdict(
+            detection.label, detection.material, detection.material_confidence, detection.color)
     except Exception:  # noqa: BLE001 - display only
         return {}
     return {"bin_sorting": v["status"], "bin_sorting_text": v["text"], "bin_sorting_reason": v["reason"],

@@ -19,12 +19,11 @@ from .sorting_rules import MIS_SORT_FAMILIES, label_words
 CORRECT, MIS_SORT, CHECK, IGNORE = "correct", "mis_sort", "check", "ignore"
 TEXT = {CORRECT: "OK (plastic bag)", MIS_SORT: "MIS-SORT", CHECK: "CHECK", IGNORE: "—"}
 
-_BOXLIKE = {"box", "boxes", "carton", "cartons", "cardboard", "book", "books", "shipping", "parcel",
-            "package", "packaging", "crate"}
+_BOXLIKE = {"box", "boxes", "carton", "cartons", "cardboard", "shipping", "parcel", "package", "packaging", "crate"}
 _HARD = set().union(*(v for k, v in MIS_SORT_FAMILIES.items() if k not in {"textile", "person"})) | _BOXLIKE | {
     "bottle", "bottles", "can", "cans", "tin", "jar", "glass", "newspaper", "magazine", "toy", "ball",
     "helmet", "shoebox", "plate", "cup", "mug", "phone", "keyboard", "mouse", "remote", "umbrella",
-    "suitcase", "backpack", "handbag", "metal", "wood", "wooden", "brick", "stone",
+    "suitcase", "backpack", "handbag", "metal", "wood", "wooden", "brick", "stone", "book", "books",
 }
 _BAG = {"bag", "bags", "sack", "sacks", "binbag", "garbage", "trash", "rubbish", "refuse", "polythene", "plastic"}
 _PERSON = MIS_SORT_FAMILIES["person"] | {"person", "people", "hands"}
@@ -63,13 +62,18 @@ def _out(status: str, reason: str, obj: str | None, material: str | None) -> dic
 
 
 def apply_to_event(event: dict) -> dict:
-    """Sets sorting fields on a deposit row (detector label + consensus material); idempotent."""
-    v = verdict(event.get("detector_label"), event.get("material"), None, event.get("colour"))
-    if event.get("track_id") is None and v["status"] == CHECK:
+    """Sorting fields of a deposit row from its RESOLVED object class and material; idempotent.
+
+    A foreground change alone proves a deposit, not its class: no track, or a track whose class is
+    not resolved yet, stays CHECK -- never a guessed OK or MIS-SORT."""
+    resolved = event.get("object_class")
+    if event.get("track_id") is None:
         v = _out(CHECK, "image change only — no detection to classify", None, None)
+    elif not resolved:
+        v = _out(CHECK, f"object class not resolved (detector: {event.get('detector_label')})", None, None)
+    else:
+        v = verdict(resolved, event.get("material"), None, event.get("colour"))
     event["sorting"] = v["text"]
     event["sorting_status"] = v["status"]
     event["sorting_reason"] = v["reason"]
-    if v["object"] == "cardboard box":
-        event["object_type"], event["material"] = "cardboard box", "CARDBOARD"
     return event

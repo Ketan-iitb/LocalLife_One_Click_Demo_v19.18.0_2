@@ -549,7 +549,8 @@ class FillEstimator:
         return (np.where(valid, height, np.nan).astype(np.float32), area.astype(np.float32),
                 x.astype(np.float32), y.astype(np.float32))
 
-    def object_volume(self, box, mask: np.ndarray | None, now: float) -> tuple[float, float] | None:
+    def object_volume(self, box, mask: np.ndarray | None, now: float,
+                      rigid_hint: bool = False) -> tuple[float, float] | None:
         """(litres, height m) of one detection above the surface AROUND it, from this camera's own map.
 
         Volume = sum over the object's pixels of (height - local support) x pixel floor area. The local
@@ -610,8 +611,9 @@ class FillEstimator:
             pts = np.c_[surface["x"][risen], surface["y"][risen]].astype(np.float32)
             (_, _), (w1, w2), _ = cv2.minAreaRect(pts)     # oriented: a diagonal parcel stays long/thin
             length, width = float(max(w1, w2)), float(min(w1, w2))
-        slab = _tilted_slab(surface, risen, rise_map)
-        if slab is not None and slab["litres"] < litres:
+        slab = _tilted_slab(surface, risen, rise_map, min_share=0.4 if rigid_hint else 0.7)
+        planar = bool(slab and slab.get("planar") and slab.get("share", 0) >= 0.7)
+        if slab is not None and slab.get("litres") is not None and slab["litres"] < litres:
             # A rigid flat-topped object (box, book) propped on the pile at an angle: integrating
             # the top surface down to the support counted the AIR under its raised end (a ~4 L box
             # read 8.3 L, 31 cm "tall"). Its own plane gives in-plane L x W and the thickness.
@@ -619,7 +621,7 @@ class FillEstimator:
             length, width = slab["length"], slab["width"]
             method = "tilted rigid slab: top-face L x W x thickness"
         self.last_object = {"length_m": length, "width_m": width, "height_m": tall, "litres": round(litres, 2),
-                            "method": method}
+                            "method": method, "planar": planar}
         return round(litres, 2), tall
 
     def _up_vector(self, plane) -> np.ndarray:
@@ -752,40 +754,82 @@ def surface_maps(depth_m: np.ndarray, intrinsics: Any, profile: FillProfile, pla
     return np.nan_to_num(height, nan=-9.0), flat, valid & np.isfinite(height)
 
 
-def _tilted_slab(surface: dict[str, Any], risen: np.ndarray, rise_map: np.ndarray) -> dict[str, float] | None:
-    """A flat, tilted top face (rigid box / book), or None for rounded shapes (bags).
+def _ransac_plane(pts: np.ndarray, tol: float = 0.015, iterations: int = 120):
+    """Dominant plane of 3-D points: (inlier mask, centre, svd axes, rms). Deterministic seed."""
+    rng = np.random.default_rng(7)
+    sample = pts if len(pts) <= 4000 else pts[rng.choice(len(pts), 4000, replace=False)]
+    best, best_count = None, -1
+    for _ in range(iterations):
+        a, b, c = sample[rng.choice(len(sample), 3, replace=False)]
+        normal = np.cross(b - a, c - a)
+        norm = float(np.linalg.norm(normal))
+        if norm < 1e-9:
+            continue
+        normal /= norm
+        count = int(np.count_nonzero(np.abs((sample - a) @ normal) <= tol))
+        if count > best_count:
+            best, best_count = (a, normal), count
+    if best is None:
+        return None
+    keep = np.abs((pts - best[0]) @ best[1]) <= tol
+    for _ in range(2):                                   # refine on the inliers
+        if keep.sum() < 3:
+            return None
+        centre = pts[keep].mean(axis=0)
+        _, sing, axes = np.linalg.svd(pts[keep] - centre, full_matrices=False)
+        keep = np.abs((pts - centre) @ axes[2]) <= tol
+    centre = pts[keep].mean(axis=0)
+    _, sing, axes = np.linalg.svd(pts[keep] - centre, full_matrices=False)
+    return keep, centre, axes, float(sing[2] / math.sqrt(max(1, int(keep.sum()))))
 
-    Plane fit of the object's 3-D points: flat (RMS < 1.2 cm) and tilted > 5 deg from the
-    floor. L x W are its extents in that plane; the thickness is the rise at its LOWEST
-    edge (where it rests on the support) divided by cos(tilt).
+
+def _tilted_slab(surface: dict[str, Any], risen: np.ndarray, rise_map: np.ndarray,
+                 min_share: float = 0.7) -> dict[str, Any] | None:
+    """A flat top face (rigid box / book) -> slab dims; None for rounded shapes (bags).
+
+    RANSAC plane of the object's 3-D points; its inliers must be one connected patch holding
+    >= `min_share` of the object (0.7 by default so a rounded bag never passes; lower only when
+    the object already looks rigid -- box-like label or cardboard colour -- because a neighbour
+    or the visible side face then shares its mask). "planar" is reported at any tilt; slab dims
+    only past 5 deg: L x W = extents in the plane, thickness = rise at the face's LOW edge /
+    cos(tilt) (a rigid box rests on its low edge).
     """
     if "z" not in surface or "up" not in surface or np.count_nonzero(risen) < 30:
         return None
+    rows, cols = np.nonzero(risen)
     pts = np.c_[surface["x"][risen], surface["y"][risen], surface["z"][risen]].astype(np.float64)
     rises = rise_map[risen]
-    keep = np.ones(len(pts), dtype=bool)
-    # The camera also sees a side face of a tilted box; refit on the dominant (top) face,
-    # which must keep >= 70 % of the points so a rounded bag never passes as a slab.
-    for _ in range(4):
-        centre = pts[keep].mean(axis=0)
-        _, sing, axes = np.linalg.svd(pts[keep] - centre, full_matrices=False)
-        rms = float(sing[2] / math.sqrt(int(keep.sum())))
-        if rms <= 0.012:
-            break
-        keep = keep & (np.abs((pts - centre) @ axes[2]) <= 0.015)
-        if keep.sum() < 0.7 * len(pts) or keep.sum() < 30:
-            return None
+    fit = _ransac_plane(pts)
+    if fit is None:
+        return None
+    keep, centre, axes, rms = fit
+    try:                                                 # one connected face, not coplanar bits around
+        import cv2
+        patch = np.zeros(risen.shape, np.uint8)
+        patch[rows[keep], cols[keep]] = 1
+        count, labels = cv2.connectedComponents(patch, connectivity=8)
+        if count > 2:
+            ids = labels[rows, cols]
+            biggest = 1 + int(np.argmax(np.bincount(ids[keep], minlength=count)[1:]))
+            keep = keep & (ids == biggest)
+            centre = pts[keep].mean(axis=0)
+            _, sing, axes = np.linalg.svd(pts[keep] - centre, full_matrices=False)
+            rms = float(sing[2] / math.sqrt(max(1, int(keep.sum()))))
+    except ImportError:  # pragma: no cover
+        pass
+    share = float(keep.sum()) / len(pts)
+    if keep.sum() < 30 or share < min_share or rms > 0.012:
+        return None
     normal = axes[2]
     cos_tilt = abs(float(normal @ surface["up"]))
-    if rms > 0.012 or cos_tilt > math.cos(math.radians(5)):
-        return None
+    result: dict[str, Any] = {"planar": True, "share": round(share, 2), "tilt_deg": round(math.degrees(math.acos(min(1.0, cos_tilt))), 1)}
+    if cos_tilt > math.cos(math.radians(5)):
+        return result                                    # flat-lying: the surface integral is right
     pts, rises = pts[keep], rises[keep]
     along = (pts - centre) @ axes[0]
     across = (pts - centre) @ axes[1]
     length = float(np.percentile(along, 98) - np.percentile(along, 2))
     width = float(np.percentile(across, 98) - np.percentile(across, 2))
-    # Rise along the slope is linear; extrapolate it to the face's LOW edge. A rigid box resting
-    # with its bottom edge on the support has its top-face low edge T*cos(tilt) above it.
     downhill = surface["up"] - (surface["up"] @ normal) * normal
     downhill = downhill / max(1e-9, float(np.linalg.norm(downhill)))
     s_hill = (pts - pts.mean(axis=0)) @ downhill
@@ -793,9 +837,10 @@ def _tilted_slab(surface: dict[str, Any], risen: np.ndarray, rise_map: np.ndarra
     low_end = float(np.percentile(s_hill, 2) if slope > 0 else np.percentile(s_hill, 98))
     thickness = float(slope * low_end + offset) / max(cos_tilt, 0.3)
     if thickness <= 0.005 or length <= 0 or width <= 0:
-        return None
-    return {"length": max(length, width), "width": min(length, width), "thickness": thickness,
-            "litres": length * width * thickness * 1000.0}
+        return result
+    result.update({"length": max(length, width), "width": min(length, width), "thickness": thickness,
+                   "litres": length * width * thickness * 1000.0})
+    return result
 
 
 def cv2_dilate(mask: np.ndarray) -> np.ndarray:

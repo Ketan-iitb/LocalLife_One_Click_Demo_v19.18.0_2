@@ -73,7 +73,7 @@ CSV_FIELDS = (
     "track_id", "colour", "object_type", "detector_label", "material", "length_cm", "width_cm", "height_cm",
     "height_source", "envelope_l", "delta_occupancy_l", "measurement_status", "reason",
     "volume_method", "units", "bin_fill_pct_after", "bin_fill_litres_after",
-    "bin_fill_pct_before", "bin_fill_litres_before", "sorting", "sorting_reason",
+    "bin_fill_pct_before", "bin_fill_litres_before", "sorting", "sorting_reason", "object_class",
 )
 
 
@@ -104,6 +104,8 @@ class TrackInfo:
     support_height_cm: float | None = None
     support_length_cm: float | None = None          # oriented L x W of the same region (median of the track)
     support_width_cm: float | None = None
+    support_method: str | None = None               # how the support L/W/H/volume set was measured
+    object_class: str | None = None                 # class resolved over the track; `label` stays raw
 
 
 @dataclass
@@ -606,6 +608,11 @@ class SessionDeposits:
             if ev.timestamp > until:
                 continue
             track = next((t for t in ev.tracks if t.track_id == track_id), None)
+            if track is not None:
+                changed = _refresh_from_track(record, track) or changed
+                if _coherent_support(track) is not None:
+                    keep.append((record, track_id, until))    # keep following until the window closes
+                    continue
             if track is not None and track.support_height_cm and (
                     record["height_cm"] is None or str(record.get("height_source") or "").startswith("detector")):
                 record["height_cm"] = _r(float(track.support_height_cm))
@@ -637,7 +644,7 @@ class SessionDeposits:
                     if record["measurement_status"] in ("na", "partial"):
                         record["measurement_status"] = "approximate"
                         record["reason"] = "size added after the count (same event)"
-                    continue                       # complete: stop following it
+                    # complete, but class/colour/material may still resolve: follow to the window end
             keep.append((record, track_id, until))
         watcher.pending = keep
         if changed:
@@ -647,6 +654,7 @@ class SessionDeposits:
         reasons: list[str] = []
         length = width = height = None
         source = None
+        coherent = _coherent_support(track)
         if track is not None and track.support_length_cm and track.support_width_cm:
             # L x W of the SAME risen region the volume and height come from (oriented rectangle).
             length, width = float(track.support_length_cm), float(track.support_width_cm)
@@ -659,7 +667,7 @@ class SessionDeposits:
         mask = details.get("mask")
         before = watcher.committed
         added = None
-        if mask is not None and mask.any():
+        if coherent is None and mask is not None and mask.any():
             if ev.heights is not None and before is not None and before.heights is not None:
                 diff = (ev.heights - before.heights)[mask]
                 diff = diff[np.isfinite(diff) & (diff > 0.02)]
@@ -673,7 +681,7 @@ class SessionDeposits:
                     added = float(np.percentile(diff, 90))
                     source = "local depth rise along the line of sight (pose unknown, approximate)"
         volume = None
-        if mask is not None and mask.any() and ev.heights is not None and before is not None \
+        if coherent is None and mask is not None and mask.any() and ev.heights is not None and before is not None \
                 and before.heights is not None and ev.area is not None:
             rise = (ev.heights - before.heights)
             bag = mask & np.isfinite(rise) & (rise > 0.02)
@@ -688,7 +696,10 @@ class SessionDeposits:
                         reasons = [r for r in reasons if not r.startswith("no single tracked bag")]
                     except ImportError:  # pragma: no cover
                         pass
-        if added is not None:
+        if coherent is not None:
+            # L, W, H and volume of ONE measurement of the track's own mask above its local support.
+            length, width, height, volume, source = coherent
+        elif added is not None:
             height = added * 100.0
         elif track is not None and track.support_height_cm:
             # Above the surface the bag lies on. The detector's own height is measured from the BIN
@@ -709,18 +720,22 @@ class SessionDeposits:
         else:
             status = "approximate"
         track_id = None if track is None else track.track_id
-        label = "unknown" if track is None else track.label
+        label = "unknown" if track is None else track.label          # raw detector class
         evidence = details["evidence"]
         confidence = ("high" if track is not None and "rise" in evidence or (track is not None and ev.depth is not None)
                       else "medium" if track is not None or "depth rise" in evidence else "low (foreground only)")
-        material = watcher.consensus(track_id, "material", "UNKNOWN")
+        material = _track_material(track) or watcher.consensus(track_id, "material", "UNKNOWN")
         return {
             "session_id": self.session_id, "event_id": None, "counted": True, "camera": ev.camera,
             "confidence": confidence,
             "count_after": None, "deposit_time": float(ev.timestamp), "cameras": [ev.camera],
             "association": "single camera", "track_id": track_id,
-            "colour": watcher.consensus(track_id, "colour", "unknown" if track is None else track.colour),
-            "object_type": "bag-like object" if track is None or bag_like(label) else label,
+            # The track's own colour consensus -- the value the live table shows -- not a one-frame fallback.
+            "colour": track.colour if track is not None and track.colour not in (None, "", "unknown")
+            else watcher.consensus(track_id, "colour", "unknown"),
+            "object_class": None if track is None else track.object_class,
+            "object_type": ("unclassified (image change only)" if track is None
+                            else track.object_class or f"unresolved (detector: {label})"),
             "detector_label": label, "material": material.upper() if material != "UNKNOWN" else material,
             "length_cm": _r(length), "width_cm": _r(width), "height_cm": _r(height), "height_source": source,
             "envelope_l": envelope, "envelope_label": ENVELOPE_LABEL,
@@ -728,7 +743,8 @@ class SessionDeposits:
             "measurement_status": status, "reason": "; ".join(reasons) or None,
             "bin_fill_pct_after": None, "bin_fill_litres_after": None,
             "bin_fill_pct_before": None, "bin_fill_litres_before": None,
-            "volume_method": ("surface rise integrated over the bag" if volume is not None and added is not None
+            "volume_method": (coherent[4] if coherent is not None
+                              else "surface rise integrated over the bag" if volume is not None and added is not None
                               else "volume above the local surface (median over the track)" if volume is not None
                               else "L x W x H box" if envelope is not None else None),
             "units": "cm, L",
@@ -839,3 +855,41 @@ def _voted_colour(views: list[np.ndarray], mask: np.ndarray) -> str:
 
 def _r(value: float | None) -> float | None:
     return None if value is None else round(value, 1)
+
+
+def _coherent_support(track: "TrackInfo | None"):
+    """(L cm, W cm, H cm, litres, method) of one support measurement of the track, or None."""
+    if track is None or not (track.support_volume_l and track.support_length_cm and track.support_width_cm
+                             and track.support_height_cm):
+        return None
+    return (float(track.support_length_cm), float(track.support_width_cm), float(track.support_height_cm),
+            round(float(track.support_volume_l), 2),
+            track.support_method or "volume above the local surface around the object")
+
+
+def _track_material(track: "TrackInfo | None") -> str | None:
+    if track is None or not track.material or str(track.material).lower() == "unknown" \
+            or float(track.material_confidence or 0.0) < 0.5:
+        return None
+    return str(track.material).upper()
+
+
+def _refresh_from_track(record: dict[str, Any], track: "TrackInfo") -> bool:
+    """Late, better evidence for the SAME event (never a new count): resolved class, material,
+    colour and one coherent L/W/H/volume set, all from this track."""
+    before = dict(record)
+    if track.object_class:
+        record["object_class"] = record["object_type"] = track.object_class
+    material = _track_material(track)
+    if material:
+        record["material"] = material
+    if track.colour and track.colour != "unknown":
+        record["colour"] = track.colour
+    coherent = _coherent_support(track)
+    if coherent is not None:
+        length, width, height, litres, method = coherent
+        record.update({"length_cm": _r(length), "width_cm": _r(width), "height_cm": _r(height),
+                       "envelope_l": litres, "volume_method": method, "height_source": method})
+        if record.get("measurement_status") in ("na", "partial"):
+            record["measurement_status"] = "approximate"
+    return record != before

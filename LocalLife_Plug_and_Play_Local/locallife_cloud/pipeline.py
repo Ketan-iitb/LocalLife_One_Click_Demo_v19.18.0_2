@@ -41,6 +41,8 @@ from .heightmap_volume import (
 from uuid import uuid4
 
 from .sorting_rules import classify_sorting, mis_sort_family
+from .bin_policy import verdict as bin_verdict
+from .object_class import FLAT_FACED, MATERIAL_OF, ClassResolver
 from . import __version__
 from .stable_identity import Observation, StabilitySettings, StableObjectRegistry, observations_from
 from .footprint import DimensionSmoother
@@ -400,6 +402,50 @@ def readmit_corner_bags(
     return kept + added
 
 
+def _count_floor_drops(dropped: list, model_floor: float) -> int:
+    return sum(1 for d in dropped if str(d.source).startswith("yolo") and d.confidence >= model_floor)
+
+
+def _interior_mask(mask: np.ndarray) -> np.ndarray:
+    """The mask shrunk by ~8 % of its size: the object's own face, not the pixels it shares with neighbours."""
+    area = int(np.count_nonzero(mask))
+    radius = max(1, min(25, int(np.sqrt(area) * 0.08)))
+    try:
+        import cv2
+        inner = cv2.erode(mask.astype(np.uint8), np.ones((2 * radius + 1, 2 * radius + 1), np.uint8)).astype(bool)
+    except ImportError:  # pragma: no cover
+        return mask
+    return inner if np.count_nonzero(inner) >= max(60, area // 5) else mask
+
+
+def apply_confidence_floor(detections: list[Detection], threshold: float,
+                           dropped: list | None = None) -> list[Detection]:
+    """V49: the shared detector runs at the LOWEST camera threshold (Logitech 0.15); each camera
+    keeps only its own (RealSense still 0.24, so its detection set is unchanged). A weaker proposal
+    on the same pixels is kept as class evidence on the surviving detection, not discarded:
+    YOLOE splits one shipping box over "cardboard shipping box", "carton box", "book", ...
+    """
+    kept = [d for d in detections if not str(d.source).startswith("yolo") or d.confidence >= threshold]
+    kept_ids = {id(d) for d in kept}
+    if dropped is not None:
+        dropped.extend(d for d in detections if id(d) not in kept_ids)
+    for item in kept:
+        if not item.label_candidates:
+            item.label_candidates = [(item.label, float(item.confidence))]
+    for weak in detections:
+        if id(weak) in kept_ids or weak.mask is None:
+            continue
+        weak_area = int(np.count_nonzero(weak.mask))
+        for item in kept:
+            if item.mask is None or item.mask.shape != weak.mask.shape:
+                continue
+            smaller = max(1, min(weak_area, int(np.count_nonzero(item.mask))))
+            if np.count_nonzero(weak.mask & item.mask) / smaller >= 0.5:
+                item.label_candidates.append((weak.label, float(weak.confidence)))
+                break
+    return kept
+
+
 def deduplicate_overlapping_detections(
     detections: list[Detection],
     frame_shape: tuple[int, ...],
@@ -417,6 +463,9 @@ def deduplicate_overlapping_detections(
     """
     frame_height, frame_width = frame_shape[:2]
     unique: list[Detection] = []
+    for item in detections:
+        if not item.label_candidates:
+            item.label_candidates = [(item.label, float(item.confidence))]
     for candidate in sorted(detections, key=lambda item: (-item.confidence, -item.area_pixels)):
         duplicate = False
         candidate_mask = combined_mask([candidate], (frame_height, frame_width))
@@ -459,6 +508,11 @@ def deduplicate_overlapping_detections(
                 ))
             ):
                 duplicate = True
+                # V49: the same object under another prompt is class EVIDENCE, not noise
+                # (object_class.py). A merely box-contained neighbour is not the same object.
+                if nested >= 0.5 or intersection_over_union(candidate.box, existing.box) >= iou_threshold:
+                    existing.label_candidates.extend(
+                        candidate.label_candidates or [(candidate.label, float(candidate.confidence))])
                 break
         if not duplicate:
             unique.append(candidate)
@@ -576,7 +630,8 @@ class VisionPipeline:
         self.config = config
         self.camera_id = camera_id
         self.inference_lock = inference_lock or threading.RLock()
-        self.detector = detector or create_segmenter(config)
+        self.detector = detector or create_segmenter(replace(   # V49: see apply_confidence_floor
+            config, detector_confidence=min(config.detector_confidence, config.logitech_detector_confidence)))
         if depth_estimator is None and config.enable_monocular_depth:
             from .optional_imports import disable_broken_torchaudio
 
@@ -1212,6 +1267,11 @@ class VisionPipeline:
         self._processing_started_at = time.time()      # before inference: lets a reset reject in-flight frames
         with self.inference_lock:
             detections_batch = self.detector.detect_batch(frames)
+            floor = (self.config.logitech_detector_confidence if self.camera_id == "logitech"
+                     else self.config.detector_confidence)
+            dropped: list = []
+            detections_batch = [apply_confidence_floor(list(batch), floor, dropped) for batch in detections_batch]
+            self._note_floor_drops(dropped)
             predictions = (
                 self.depth_estimator.estimate_batch(frames)
                 if self.depth_estimator is not None
@@ -1392,8 +1452,14 @@ class VisionPipeline:
         logitech = self.camera_id == "logitech"
         counters = self.stage_counters
         counters["frames_processed"] += 1
-        counters["raw_detections"] += len(detections)
+        # Proposals the per-camera floor removed before this filter (apply_confidence_floor) are
+        # still raw detections and this filter's "below_confidence" -- counted from the old model
+        # floor, so the stage report reads exactly as before.
+        floor_drops = int(self.__dict__.pop("_floor_dropped_count", 0) or 0)
+        counters["raw_detections"] += len(detections) + floor_drops
         rejections: Counter = Counter()
+        if floor_drops:
+            rejections["below_confidence"] += floor_drops
         detections = filter_waste_detections(
             detections, frame.shape, bin_region, self.config, rejections=rejections,
             # Logitech-only: a can is a few hundred pixels in a 640x480 C920 frame.
@@ -1467,6 +1533,7 @@ class VisionPipeline:
                 rise = self.reference_monocular.astype(np.float32) - calibrated_prediction
                 depth_change = np.isfinite(rise) & (rise >= self.config.logitech_min_object_height_m)
             raw_logitech = list(detections)
+            self._raw_logitech_snapshot = raw_logitech
             detections, segmentation_warnings = bound_logitech_detections(
                 frame,
                 self.reference_rgb,
@@ -1492,6 +1559,13 @@ class VisionPipeline:
                 max_scene_fraction=self.config.logitech_max_scene_fraction,
                 foreground_threshold=self.config.foreground_threshold,
             )
+            # bound_logitech_detections (protected) rebuilds each Detection: carry the class evidence over.
+            for item in detections:
+                if not item.label_candidates:
+                    origin = next((raw for raw in raw_logitech if raw.label == item.label
+                                   and abs(raw.confidence - item.confidence) < 1e-9), None)
+                    item.label_candidates = list(origin.label_candidates) if origin is not None and \
+                        origin.label_candidates else [(item.label, float(item.confidence))]
             self.logitech_mask_debug = {"frame": frame, **mask_debug}
             # Startup, without asking the operator for anything: the floor plane
             # gives the camera height, and a still, empty view gives the
@@ -2710,6 +2784,15 @@ class VisionPipeline:
         new_ids = self.tracker.update(tracking_detections) if self.config.auto_count else []
         if self.camera_id == "logitech":
             self._remember_tracks(frame, detections)
+        # V49: one class per track from all of its evidence (object_class.py); `label` stays raw.
+        resolver = self.__dict__.setdefault("_class_resolver", ClassResolver())
+        for detection in detections:
+            if detection.track_id is None or _is_phantom_detection(detection):
+                continue
+            if detection.source != "tracked-prediction":
+                resolver.update(detection.track_id, detection.label_candidates
+                                or [(detection.label, float(detection.confidence))])
+            detection.resolved_label, detection.resolved_share, _ = resolver.resolve(detection.track_id)
         self.stage_counters["active_tracks_last_frame"] = sum(1 for item in detections if item.track_id is not None)
         self.stage_counters["confirmed_tracks_total"] = int(self.tracker.total_count)
         if self._previous_bin_total_l is not None:
@@ -2743,7 +2826,9 @@ class VisionPipeline:
             )
             self._apply_cylinder_geometry(detection)
             self._withhold_unreliable_geometry(detection)
-            detection.canonical_type = canonical_object_type(detection.label, detection.confidence)
+            detection.canonical_type = (
+                canonical_object_type(detection.resolved_label, 1.0) if detection.resolved_label
+                else canonical_object_type(detection.label, detection.confidence))
             if self.camera_id == "logitech" and self.volume_factors is not None:
                 # Raw geometry first, then the frozen factor -- both kept.
                 raw = detection.raw_volume_l = detection.monocular_volume_l
@@ -2800,8 +2885,13 @@ class VisionPipeline:
             # rather than replacing it. Geometry is not read or changed.
             colour_mask = measurement_masks.get(id(detection), detection.mask)
             if colour_mask is not None and detection.source != "tracked-prediction":
+                # V49: sample by the RESOLVED class. A box the detector called a "bag" in this frame was
+                # sampled on the bag "skin band" at its edge -- i.e. on the white bags around it (grey).
+                # A flat-faced rigid object is sampled on its interior, away from its neighbours.
+                if detection.resolved_label in FLAT_FACED:
+                    colour_mask = _interior_mask(colour_mask)
                 colour = describe_colour(
-                    frame, colour_mask, label=detection.label,
+                    frame, colour_mask, label=detection.resolved_label or detection.label,
                     background_bgr=self.reference_rgb,
                 )
                 if colour.state != "no_mask":
@@ -3116,40 +3206,77 @@ class VisionPipeline:
             fill_objects |= mask
         self._update_fill(frame, depth_m, intrinsics, fill_monocular, measure_intrinsics,
                           bin_region, time.time(), fill_plane, fill_objects)    # same wall clock as occupancy events
-        # A detection whose own measurement is still pending gets this camera's surface-map estimate
-        # (above the local support around it) as a PROVISIONAL, display-only value; the ledger is untouched.
+        # V49 debug snapshot (references only; written to disk only when the operator asks).
+        self._snapshot_inputs = {"frame": frame, "depth_m": depth_m if self.camera_id == "realsense" else fill_monocular,
+                                 "intrinsics": intrinsics if self.camera_id == "realsense" else measure_intrinsics,
+                                 "region": bin_region, "detections": list(detections),
+                                 "raw_detections": list(self.__dict__.get("_raw_logitech_snapshot") or []),
+                                 "mask_debug": dict(getattr(self, "logitech_mask_debug", {}) or {}), "at": time.time()}
+        # V49: object size/volume above the local support, class-consistent material and the
+        # sorting verdict -- all from this track's RESOLVED class (object_class.py), one coherent set.
+        resolver = self.__dict__.setdefault("_class_resolver", ClassResolver())
         for item in detections:
             own = item.monocular_volume_l if self.camera_id == "logitech" else item.realsense_volume_l
-            if not _is_phantom_detection(item):
-                try:
-                    estimate = self.fill.object_volume(item.box, item.mask, time.time())
-                    dims = dict(self.fill.last_object) if estimate is not None else None
-                except Exception:  # noqa: BLE001 - display-only estimate
-                    estimate, dims = None, None
-                footprint = (dims["length_m"], dims["width_m"]) if dims and dims.get("length_m") else (None, None)
-                if estimate is not None and item.track_id is not None:
-                    # Repeatability: the median of this SAME track's recent estimates, not one frame.
-                    now = time.time()
+            if _is_phantom_detection(item):
+                continue
+            resolved = item.resolved_label
+            try:
+                estimate = self.fill.object_volume(item.box, item.mask, time.time(),
+                                                   rigid_hint=resolved in FLAT_FACED)
+                dims = dict(self.fill.last_object) if estimate is not None else None
+            except Exception:  # noqa: BLE001 - display-only estimate
+                estimate, dims = None, None
+            if dims is not None and item.track_id is not None and dims.get("planar"):
+                resolver.set_rigid(item.track_id, True)      # depth evidence: a flat rigid top
+            if estimate is not None and dims is not None:
+                sample = (time.time(), estimate[0], estimate[1], dims.get("length_m"), dims.get("width_m"),
+                          dims.get("method") or "volume above the local surface")
+                if item.track_id is not None:
+                    # Repeatability over this SAME track's recent frames, as ONE coherent sample (the
+                    # median-volume frame): separate medians of L, W, H and V do not belong together.
                     history = self.__dict__.setdefault("_provisional_history", {})
-                    samples = [v for v in history.get(item.track_id, []) if now - v[0] <= 15.0][-7:]
-                    samples.append((now, estimate[0], estimate[1], footprint[0], footprint[1]))
+                    samples = [v for v in history.get(item.track_id, []) if sample[0] - v[0] <= 15.0][-7:]
+                    samples.append(sample)
                     history[item.track_id] = samples
                     if len(history) > 300:
                         for key in list(history)[:150]:
                             history.pop(key, None)
-                    estimate = (round(float(np.median([v[1] for v in samples])), 2),
-                                float(np.median([v[2] for v in samples])))
-                    sized = [v for v in samples if len(v) > 3 and v[3] is not None]
-                    if sized:
-                        footprint = (float(np.median([v[3] for v in sized])), float(np.median([v[4] for v in sized])))
-                if estimate is not None:
-                    item.support_volume_l = estimate[0]
-                    item.support_height_cm = round(estimate[1] * 100, 1)
-                    if footprint[0] is not None:
-                        item.support_length_cm = round(footprint[0] * 100, 1)
-                        item.support_width_cm = round(footprint[1] * 100, 1)
-                    if own is None and item.provisional_volume_l is None:
-                        item.provisional_volume_l = estimate[0]
+                    sample = sorted(samples, key=lambda v: v[1])[len(samples) // 2]
+                _, litres, height_m, length_m, width_m, method = sample
+                if resolved in FLAT_FACED and length_m and width_m and height_m and "slab" not in method:
+                    # A closed rigid box: report the cuboid, V = L x W x H.
+                    litres = round(length_m * width_m * height_m * 1000.0, 2)
+                    method = "cuboid L x W x H above the local support (rigid box)"
+                item.support_volume_l = round(float(litres), 2)
+                item.support_height_cm = round(float(height_m) * 100, 1)
+                if length_m:
+                    item.support_length_cm = round(float(length_m) * 100, 1)
+                    item.support_width_cm = round(float(width_m) * 100, 1)
+                if item.track_id is not None:
+                    resolver.set_size(item.track_id, item.support_length_cm, item.support_height_cm)
+                item.support_method = method if "slab" in method or "cuboid" in method else \
+                    "volume integrated above the local surface (not L x W x H; L x W x H is its enclosing box)"
+                if own is None and item.provisional_volume_l is None:
+                    item.provisional_volume_l = item.support_volume_l
+            implied = MATERIAL_OF.get(resolved or "")
+            if implied and (item.resolved_share or 0.0) >= 0.5:
+                item.material, item.material_confidence = implied, float(item.resolved_share)
+                item.material_evidence = {"source": "resolved object class", "class": resolved,
+                                          "share": item.resolved_share}
+            elif item.track_id is not None and resolver.rigid.get(item.track_id) \
+                    and str(item.material).lower() in {"polythene bag", "plastic"}:
+                # The crop classifier saw the bags AROUND a rigid flat-topped object.
+                item.material, item.material_confidence = "unknown", 0.0
+                item.material_evidence = {"source": "withheld: a flat rigid top is not a polythene bag"}
+            try:
+                if resolved:
+                    item.bin_verdict = bin_verdict(resolved, item.material, item.material_confidence, item.color)
+                else:
+                    item.bin_verdict = {"status": "check", "text": "CHECK", "object": "unresolved",
+                                        "reason": f"object class not resolved yet (detector: {item.label})",
+                                        "material": item.material or "unknown"}
+            except Exception:  # noqa: BLE001 - display only
+                item.bin_verdict = None
         # The counter sees the SAME depth the fill uses (Logitech: model depth when no calibrated
         # depth exists -- before, it got none and every Logitech event had N/A size) and each
         # track's local-surface size computed just above.
@@ -3572,7 +3699,8 @@ class VisionPipeline:
                     length_mm=item.footprint_length_mm, width_mm=item.footprint_width_mm,
                     height_mm=item.physical_height_mm, rejection=item.volume_rejection_reason,
                     support_volume_l=item.support_volume_l, support_height_cm=item.support_height_cm,
-                    support_length_cm=item.support_length_cm, support_width_cm=item.support_width_cm))
+                    support_length_cm=item.support_length_cm, support_width_cm=item.support_width_cm,
+                    support_method=item.support_method, object_class=item.resolved_label))
             depth = heights = area = xs = ys = None
             status = None
             # RealSense: aligned hardware depth (also used for the rise check). Logitech: its own
@@ -3603,6 +3731,9 @@ class VisionPipeline:
                                               started_at=self.__dict__.get("_processing_started_at")))
         except Exception:  # noqa: BLE001 - the counter must never stop the pipeline
             LOGGER.exception("%s deposit evidence failed", self.camera_id)
+
+    def _note_floor_drops(self, dropped: list) -> None:
+        self._floor_dropped_count = _count_floor_drops(dropped, self.config.detector_confidence)
 
     def _update_fill(self, frame, depth_m, intrinsics, calibrated_prediction, measure_intrinsics,
                      bin_region, timestamp: float, floor_plane=None, objects=None) -> None:
