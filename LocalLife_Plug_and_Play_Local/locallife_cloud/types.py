@@ -607,4 +607,7 @@ def _bin_policy(detection: "Detection") -> dict:
     except Exception:  # noqa: BLE001 - display only
         return {}
     return {"bin_sorting": v["status"], "bin_sorting_text": v["text"], "bin_sorting_reason": v["reason"],
-            "bin_object": v["object"]}
+            "bin_object": v["object"], "bin_sorting_decision": v.get("decision", "uncertain"),
+            "bin_expected_stream": v.get("expected_stream"),
+            "bin_sorting_evidence": {"detector_label": detection.label, "resolved_label": detection.resolved_label,
+                                     "material": v.get("material"), "colour": detection.color}}

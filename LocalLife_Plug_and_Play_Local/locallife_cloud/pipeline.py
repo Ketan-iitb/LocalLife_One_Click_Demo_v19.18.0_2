@@ -2971,14 +2971,26 @@ class VisionPipeline:
                 # A tracked prediction repeats the previous frame's colour;
                 # counting it as a new vote made one early brown/black error
                 # impossible to correct after the detector recovered.
+                # Only a confident single-colour frame votes: a frame whose own
+                # evidence found no dominant colour ("mixed"/"unknown") is not
+                # evidence for any colour.
+                state = (detection.color_evidence or {}).get("state")
                 if (
-                    detection.color not in {"unknown", ""}
+                    detection.color not in {"unknown", "", "mixed"}
+                    and state in (None, "solid", "see_through_or_background_coloured")
                     and detection.observation_status == "fresh"
                     and not _is_phantom_detection(detection)
                 ):
                     colors.append(detection.color)
                 if colors:
-                    detection.color = Counter(colors).most_common(1)[0][0]
+                    winner, votes = Counter(colors).most_common(1)[0]
+                    detection.color = winner
+                    detection.color_evidence = {
+                        **(detection.color_evidence or {}),
+                        "temporal_votes": len(colors),
+                        "temporal_agreement": round(votes / len(colors), 4),
+                        "temporal_meaning": "share of this track's confident frames that named this colour",
+                    }
             # Playbook section 12. Applied to every detection, tracked or not,
             # so a mis-sorted object that never earns a track is still called
             # out rather than silently dropping off the event record.
@@ -3123,51 +3135,7 @@ class VisionPipeline:
                 # that is not itself eligible to create a new record.
                 self.ledger.refresh(detection)
 
-        newly_deposited: list[Detection] = []
-        if self.config.auto_deposit and self.config.operating_mode == "waste":
-            for detection in detections:
-                if detection.track_id is None or self.ledger.is_deposited(detection.track_id):
-                    continue
-                if _is_phantom_detection(detection) or detection.source == "yoloe-unchanged":
-                    continue
-                if detection.accepted_class is None:
-                    continue
-                track = self.tracker.tracks.get(detection.track_id)
-                if track is None or not track.counted:
-                    continue
-                if (
-                    detection.depth_coverage_percent is not None
-                    and detection.depth_coverage_percent < self.config.minimum_depth_coverage * 100.0
-                ):
-                    continue
-                history = list(self._volume_history.get(detection.track_id, ()))
-                if len(history) < self.config.settle_frames:
-                    continue
-                recent = np.asarray(history[-self.config.settle_frames :], dtype=np.float64)
-                median = float(np.median(recent))
-                tolerance_l = max(0.15, median * self.config.settle_volume_tolerance)
-                if float(np.max(recent) - np.min(recent)) <= tolerance_l:
-                    if not self._record_added_volume(detection, bin_total, scene_grid):
-                        warnings.append(
-                            f"Deposit withheld: {detection.volume_rejection_reason}"
-                        )
-                        # A withheld deposit is a real outcome, not an absence:
-                        # record it with its reason so a run's rejections are
-                        # auditable instead of vanishing from the export.
-                        self.persist_measurement_event(
-                            detection, timestamp,
-                            status=STATUS_REJECTED,
-                            status_reason=detection.volume_rejection_reason,
-                        )
-                        continue
-                    # Persist BEFORE the ledger marks the deposit complete, so
-                    # the dashboard can never show a finalised row that was
-                    # never written to disk.
-                    self.persist_measurement_event(detection, timestamp)
-                    self.ledger.deposit(detection, timestamp=timestamp)
-                    self._committed_scene = scene_grid
-                    self.deposit_state.committed()
-                    newly_deposited.append(detection)
+        newly_deposited = self._settle_deposits(detections, bin_total, scene_grid, timestamp, warnings)
         # This frame's occupancy becomes the "before" state that whatever
         # appears next will be measured against.
         if bin_total is not None:
@@ -3287,6 +3255,105 @@ class VisionPipeline:
                                  "region": bin_region, "detections": list(detections),
                                  "raw_detections": list(self.__dict__.get("_raw_logitech_snapshot") or []),
                                  "mask_debug": dict(getattr(self, "logitech_mask_debug", {}) or {}), "at": time.time()}
+        self._apply_support_geometry_and_class(detections)
+        # The counter sees the SAME depth the fill uses (Logitech: model depth when no calibrated
+        # depth exists -- before, it got none and every Logitech event had N/A size) and each
+        # track's local-surface size computed just above.
+        self._emit_deposit_evidence(frame, detections, depth_m, intrinsics, bin_region,
+                                    fill_monocular, measure_intrinsics)
+        if persist:
+            self.store.append_jsonl("frames.jsonl", analysis.to_dict())
+            self._finalise_settled_measurements(detections, timestamp)
+            starting_count = self.tracker.total_count - len(new_ids)
+            for index, track_id in enumerate(new_ids, start=1):
+                detection = next(item for item in detections if item.track_id == track_id)
+                self.store.append_jsonl(
+                    "events.jsonl",
+                    {
+                        "event": "confirmed-object",
+                        "timestamp": timestamp,
+                        "count": starting_count + index,
+                        "detection": detection.to_dict(),
+                    },
+                )
+        if (
+            self.config.advance_reference_on_deposit
+            and newly_deposited
+            and len(newly_deposited) == len(detections)
+        ):
+            self._remember_occupied_objects(newly_deposited)
+            self._advance_reference()
+            self.committed_bags = self.ledger.summary()["deposited_bags"]
+            self.tracker.tracks.clear()
+            self._volume_history.clear()
+            self._box_measurement_history.clear()
+            self._box_frames_considered.clear()
+            self._geometry_lock.clear()
+            self._logitech_geometry.clear()
+            self._track_signatures.clear()
+            self._color_history.clear()
+            self._material_history.clear()
+            self._material_scores.clear()
+            self._material_frame_counts.clear()
+            LOGGER.info(
+                "Automatically recorded %s settled waste item(s); updated the bin reference",
+                len(newly_deposited),
+            )
+        return analysis
+
+    # ------------------------------------------------ _assemble stages
+    def _settle_deposits(self, detections: list[Detection], bin_total: Any, scene_grid: Any,
+                         timestamp: float, warnings: list[str]) -> list[Detection]:
+        """Event stage: settled, confirmed tracks become stable measurement records."""
+        newly_deposited: list[Detection] = []
+        if self.config.auto_deposit and self.config.operating_mode == "waste":
+            for detection in detections:
+                if detection.track_id is None or self.ledger.is_deposited(detection.track_id):
+                    continue
+                if _is_phantom_detection(detection) or detection.source == "yoloe-unchanged":
+                    continue
+                if detection.accepted_class is None:
+                    continue
+                track = self.tracker.tracks.get(detection.track_id)
+                if track is None or not track.counted:
+                    continue
+                if (
+                    detection.depth_coverage_percent is not None
+                    and detection.depth_coverage_percent < self.config.minimum_depth_coverage * 100.0
+                ):
+                    continue
+                history = list(self._volume_history.get(detection.track_id, ()))
+                if len(history) < self.config.settle_frames:
+                    continue
+                recent = np.asarray(history[-self.config.settle_frames :], dtype=np.float64)
+                median = float(np.median(recent))
+                tolerance_l = max(0.15, median * self.config.settle_volume_tolerance)
+                if float(np.max(recent) - np.min(recent)) <= tolerance_l:
+                    if not self._record_added_volume(detection, bin_total, scene_grid):
+                        warnings.append(
+                            f"Deposit withheld: {detection.volume_rejection_reason}"
+                        )
+                        # A withheld deposit is a real outcome, not an absence:
+                        # record it with its reason so a run's rejections are
+                        # auditable instead of vanishing from the export.
+                        self.persist_measurement_event(
+                            detection, timestamp,
+                            status=STATUS_REJECTED,
+                            status_reason=detection.volume_rejection_reason,
+                        )
+                        continue
+                    # Persist BEFORE the ledger marks the deposit complete, so
+                    # the dashboard can never show a finalised row that was
+                    # never written to disk.
+                    self.persist_measurement_event(detection, timestamp)
+                    self.ledger.deposit(detection, timestamp=timestamp)
+                    self._committed_scene = scene_grid
+                    self.deposit_state.committed()
+                    newly_deposited.append(detection)
+        return newly_deposited
+
+    def _apply_support_geometry_and_class(self, detections: list[Detection]) -> None:
+        """Appearance/class stage (V49): support-surface size, class-consistent material, sorting verdict."""
         # V49: object size/volume above the local support, class-consistent material and the
         # sorting verdict -- all from this track's RESOLVED class (object_class.py), one coherent set.
         resolver = self.__dict__.setdefault("_class_resolver", ClassResolver())
@@ -3361,53 +3428,10 @@ class VisionPipeline:
                 else:
                     item.bin_verdict = {"status": "check", "text": "CHECK", "object": "unresolved",
                                         "reason": f"object class not resolved yet (detector: {item.label})",
-                                        "material": item.material or "unknown"}
+                                        "material": item.material or "unknown", "decision": "uncertain",
+                                        "expected_stream": "plastic bags only"}
             except Exception:  # noqa: BLE001 - display only
                 item.bin_verdict = None
-        # The counter sees the SAME depth the fill uses (Logitech: model depth when no calibrated
-        # depth exists -- before, it got none and every Logitech event had N/A size) and each
-        # track's local-surface size computed just above.
-        self._emit_deposit_evidence(frame, detections, depth_m, intrinsics, bin_region,
-                                    fill_monocular, measure_intrinsics)
-        if persist:
-            self.store.append_jsonl("frames.jsonl", analysis.to_dict())
-            self._finalise_settled_measurements(detections, timestamp)
-            starting_count = self.tracker.total_count - len(new_ids)
-            for index, track_id in enumerate(new_ids, start=1):
-                detection = next(item for item in detections if item.track_id == track_id)
-                self.store.append_jsonl(
-                    "events.jsonl",
-                    {
-                        "event": "confirmed-object",
-                        "timestamp": timestamp,
-                        "count": starting_count + index,
-                        "detection": detection.to_dict(),
-                    },
-                )
-        if (
-            self.config.advance_reference_on_deposit
-            and newly_deposited
-            and len(newly_deposited) == len(detections)
-        ):
-            self._remember_occupied_objects(newly_deposited)
-            self._advance_reference()
-            self.committed_bags = self.ledger.summary()["deposited_bags"]
-            self.tracker.tracks.clear()
-            self._volume_history.clear()
-            self._box_measurement_history.clear()
-            self._box_frames_considered.clear()
-            self._geometry_lock.clear()
-            self._logitech_geometry.clear()
-            self._track_signatures.clear()
-            self._color_history.clear()
-            self._material_history.clear()
-            self._material_scores.clear()
-            self._material_frame_counts.clear()
-            LOGGER.info(
-                "Automatically recorded %s settled waste item(s); updated the bin reference",
-                len(newly_deposited),
-            )
-        return analysis
 
     def accept_current(self) -> dict[str, Any]:
         with self.lock:

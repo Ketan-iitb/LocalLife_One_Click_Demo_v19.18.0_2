@@ -68,16 +68,34 @@ from .comparison_panel import COMPARISON_PANEL  # noqa: E402
 from .cost_accuracy_panel import COST_ACCURACY_PANEL  # noqa: E402
 from .research_layout import RESEARCH_LAYOUT  # noqa: E402
 from .bin_fill_panel import BIN_FILL_PANEL  # noqa: E402
+from .experiment_panel import EXPERIMENT_PANEL  # noqa: E402
 
 # The Local-vs-Cloud panel sits directly below the two live camera streams on
 # both pages; the templates themselves are left as they are.
 _RESEARCH_STREAMS_END = 'id="logitech-materials"></tbody></table></div></article></section>'
 _OPERATOR_STREAMS_END = 'alt="Logitech dumpster camera"></div></div></div>'
 assert DUAL_DASHBOARD.count(_RESEARCH_STREAMS_END) == 1 and OPERATOR_DASHBOARD.count(_OPERATOR_STREAMS_END) == 1
-RESEARCH_PAGE = DUAL_DASHBOARD.replace(_RESEARCH_STREAMS_END, _RESEARCH_STREAMS_END + BIN_FILL_PANEL + COMPARISON_PANEL + COST_ACCURACY_PANEL)
+RESEARCH_PAGE = DUAL_DASHBOARD.replace(_RESEARCH_STREAMS_END, _RESEARCH_STREAMS_END + BIN_FILL_PANEL + COMPARISON_PANEL + COST_ACCURACY_PANEL + EXPERIMENT_PANEL)
 # Same content, grouped and ordered (research_layout.py); nothing removed or renamed.
 RESEARCH_PAGE = RESEARCH_PAGE.replace("</body>", RESEARCH_LAYOUT + "</body>", 1)
 OPERATOR_PAGE = OPERATOR_DASHBOARD.replace(_OPERATOR_STREAMS_END, _OPERATOR_STREAMS_END + BIN_FILL_PANEL + COMPARISON_PANEL + COST_ACCURACY_PANEL)
+
+# A page served to a NON-loopback viewer carries no API token (embedding it let
+# anyone who could open the page call every protected endpoint). Such a viewer
+# is asked for the token once, on the first 401, and it is kept in this tab's
+# sessionStorage. Loopback viewers (the local launcher, and the cloud dashboard
+# reached through its SSH tunnel) get the token embedded exactly as before.
+TOKEN_PROMPT = r"""{% raw %}<script>(function(){const original=window.fetch.bind(window);
+function stored(){try{return sessionStorage.getItem('locallife-api-token')||''}catch(e){return ''}}
+window.fetch=async function(input,init){init=Object.assign({},init||{});const headers=new Headers(init.headers||{});
+if(!headers.has('X-API-Token')&&stored())headers.set('X-API-Token',stored());init.headers=headers;
+let response=await original(input,init);
+if(response.status===401&&!init.__retried){const token=prompt('This action needs the LocalLife API token:');
+if(token){try{sessionStorage.setItem('locallife-api-token',token)}catch(e){}headers.set('X-API-Token',token);
+response=await original(input,Object.assign({},init,{headers,__retried:true}))}}return response}})();</script>{% endraw %}"""
+RESEARCH_PAGE = RESEARCH_PAGE.replace("</body>", TOKEN_PROMPT + "</body>", 1)
+OPERATOR_PAGE = OPERATOR_PAGE.replace("</body>", TOKEN_PROMPT + "</body>", 1)
+_LOOPBACK = {"127.0.0.1", "::1", "localhost"}
 
 
 def _annotate_frame(frame: np.ndarray, pipeline: VisionPipeline) -> np.ndarray:
@@ -269,10 +287,13 @@ def create_app(
     def payload_too_large(_: Any) -> Any:
         return jsonify(error=f"Upload exceeds {settings.max_upload_mb} MB"), 413
 
+    def _page_token() -> str:
+        return settings.api_token if (request.remote_addr or "") in _LOOPBACK else ""
+
     @app.get("/")
     def index() -> str:
         """Operator page (Accuracy Deployment v3.0) -- the default landing page."""
-        return render_template_string(OPERATOR_PAGE, api_token=settings.api_token)
+        return render_template_string(OPERATOR_PAGE, api_token=_page_token())
 
     @app.get("/research")
     def research_dashboard() -> str:
@@ -282,7 +303,7 @@ def create_app(
         # localhost, e.g. the normal 0.0.0.0 launcher run) those calls need the
         # token too, so it is embedded into the page here and attached by the
         # JS fetch calls.
-        return render_template_string(RESEARCH_PAGE, api_token=settings.api_token)
+        return render_template_string(RESEARCH_PAGE, api_token=_page_token())
 
     @app.get("/api/color-map")
     def get_color_map() -> Any:

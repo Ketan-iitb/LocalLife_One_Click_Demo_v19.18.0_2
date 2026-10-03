@@ -56,9 +56,16 @@ def verdict(label: str | None, material: str | None = None, material_confidence:
     return _out(CHECK, f"{label or 'object'}: material {mat or 'unknown'} — check by eye", label, material)
 
 
+EXPECTED_STREAM = "plastic bags only"
+_DECISION = {CORRECT: "supported", MIS_SORT: "supported", CHECK: "uncertain", IGNORE: "not_applicable"}
+
+
 def _out(status: str, reason: str, obj: str | None, material: str | None) -> dict[str, str]:
+    # `decision` says whether the evidence supports the verdict at all.
+    # Contents of an opaque bag are never inferred from its exterior.
     return {"status": status, "text": TEXT[status], "reason": reason, "object": obj or "unknown",
-            "material": material or "unknown"}
+            "material": material or "unknown", "expected_stream": EXPECTED_STREAM,
+            "decision": _DECISION[status], "contents": "not inferred (only the exterior is seen)"}
 
 
 def apply_to_event(event: dict) -> dict:

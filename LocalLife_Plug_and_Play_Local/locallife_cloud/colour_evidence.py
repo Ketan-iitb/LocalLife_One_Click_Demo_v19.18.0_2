@@ -69,6 +69,9 @@ class ColourEvidence:
     shadow_pixels: int = 0
     sampled_region: str = "surface"
     shares: dict | None = None
+    # Per-channel (B, G, R) chroma gains applied for lighting drift since the
+    # empty reference was captured; None when not applied.
+    illumination_gains: list | None = None
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -87,6 +90,35 @@ def _erode(mask: np.ndarray, iterations: int) -> np.ndarray:
             out = (padded[1:-1, 1:-1] & padded[:-2, 1:-1] & padded[2:, 1:-1]
                    & padded[1:-1, :-2] & padded[1:-1, 2:])
         return out
+
+
+def _illumination_gains(frame_bgr: np.ndarray, background_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray | None:
+    """Chroma-only correction for a lighting/white-balance change since the
+    empty reference: compare the floor just around the object now with the
+    same floor in the reference. Brightness is left alone (normalised gains),
+    so a shadow cast by the object does not brighten it; only a colour cast
+    (warm lamp, auto white balance) is undone. Returns None when the evidence
+    is too thin or the correction would be negligible."""
+    try:
+        import cv2
+    except ImportError:  # pragma: no cover
+        return None
+    m = mask.astype(np.uint8)
+    ring = (cv2.dilate(m, np.ones((3, 3), np.uint8), iterations=12) > 0) & \
+        ~(cv2.dilate(m, np.ones((3, 3), np.uint8), iterations=4) > 0)
+    if int(np.count_nonzero(ring)) < 200:
+        return None
+    live = frame_bgr[ring].astype(np.float64)
+    reference = background_bgr[ring].astype(np.float64)
+    usable = (live.max(axis=1) < 250) & (reference.max(axis=1) < 250) & (live.min(axis=1) > 8) \
+        & (reference.min(axis=1) > 8)
+    if int(np.count_nonzero(usable)) < 200:
+        return None
+    gains = np.median(reference[usable], axis=0) / np.maximum(np.median(live[usable], axis=0), 1e-6)
+    gains = gains / float(np.mean(gains))
+    if float(np.max(np.abs(gains - 1.0))) < 0.02:
+        return None
+    return np.clip(gains, 0.8, 1.25)
 
 
 def _is_bag(label: str | None) -> bool:
@@ -135,10 +167,15 @@ def describe_colour(
     if usable.sum() < max(MIN_USABLE_PIXELS, MIN_USABLE_FRACTION * pixels.shape[0]):
         return evidence
     pixels, saturation = pixels[usable], saturation[usable]
+    raw_pixels = pixels
 
     if background_bgr is not None and background_bgr.shape == frame_bgr.shape:
+        gains = _illumination_gains(frame_bgr, background_bgr, mask)
+        if gains is not None:
+            pixels = np.clip(pixels * gains.astype(np.float32), 0.0, 1.0)
+            evidence.illumination_gains = [round(float(g), 4) for g in gains]
         behind = background_bgr[surface][usable].astype(np.float32) / 255.0
-        see_through = float(np.mean(np.abs(pixels - behind).max(axis=1) <= SEE_THROUGH_DIFFERENCE))
+        see_through = float(np.mean(np.abs(raw_pixels - behind).max(axis=1) <= SEE_THROUGH_DIFFERENCE))
         if see_through >= SEE_THROUGH_SHARE:
             # Mostly the floor, seen through it -- or an object the colour of
             # the floor. A bag is called transparent; anything else uncertain.

@@ -1403,8 +1403,8 @@ def estimate_box_volume_cuboid(
 
 def _min_area_axes(footprint: np.ndarray, trim_percentile: float) -> tuple[np.ndarray, np.ndarray]:
     """Coordinates along the axes of the minimum-area trimmed bounding
-    rectangle: a coarse 1-degree sweep over a subsample, refined to 0.1 deg."""
-    sample = footprint[:: max(1, footprint.shape[0] // 4000)]
+    rectangle: a coarse 3-degree sweep over a subsample, refined to 0.25 deg."""
+    sample = footprint[:: max(1, footprint.shape[0] // 1500)]
 
     def areas(angles: np.ndarray) -> np.ndarray:
         cos, sin = np.cos(angles), np.sin(angles)
@@ -1414,9 +1414,9 @@ def _min_area_axes(footprint: np.ndarray, trim_percentile: float) -> tuple[np.nd
         low2, high2 = np.percentile(second, (trim_percentile, 100 - trim_percentile), axis=0)
         return (high1 - low1) * (high2 - low2)
 
-    coarse = np.radians(np.arange(0.0, 90.0, 1.0))
+    coarse = np.radians(np.arange(0.0, 90.0, 3.0))
     best = float(coarse[int(np.argmin(areas(coarse)))])
-    fine = best + np.radians(np.arange(-1.0, 1.05, 0.1))
+    fine = best + np.radians(np.arange(-3.0, 3.01, 0.25))
     angle = float(fine[int(np.argmin(areas(fine)))])
     cos, sin = np.cos(angle), np.sin(angle)
     return (footprint[:, 0] * cos + footprint[:, 1] * sin,

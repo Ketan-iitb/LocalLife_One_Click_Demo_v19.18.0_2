@@ -55,13 +55,13 @@ function organise(){
  if(extra.length){setupFold=fold('setup-results','Setup guide, fused result and recipe result','rl-fold rl-anchor',false);setupFold.id='rl-setup';extra.forEach(s=>setupFold.appendChild(s));}
  // order after the cameras: bin fill, local vs cloud, cost & accuracy, camera comparison, setup
  let anchor=cams;
- for(const el of [main.querySelector('#bf-panel'),main.querySelector('#lc-panel'),main.querySelector('#ca-panel'),compFold,setupFold]){
+ for(const el of [main.querySelector('#bf-panel'),main.querySelector('#lc-panel'),main.querySelector('#ca-panel'),main.querySelector('#xp-panel'),compFold,setupFold]){
   if(!el||!anchor)continue;anchor.after(el);anchor=el;}
  if(cams){cams.id=cams.id||'rl-cameras';cams.classList.add('rl-anchor');}
- for(const id of ['bf-panel','lc-panel','ca-panel']){const el=main.querySelector('#'+id);if(el)el.classList.add('rl-anchor');}
+ for(const id of ['bf-panel','lc-panel','ca-panel','xp-panel']){const el=main.querySelector('#'+id);if(el)el.classList.add('rl-anchor');}
  // 1. section menu
  const nav=document.createElement('nav');nav.id='rl-nav';
- const links=[[cams&&cams.id,'Cameras'],['bf-panel','Bin fill & deposits'],['lc-panel','Local vs Cloud'],['ca-panel','Cost & accuracy'],[compFold&&compFold.id,'Camera comparison'],[setupFold&&setupFold.id,'Setup & results']];
+ const links=[[cams&&cams.id,'Cameras'],['bf-panel','Bin fill & deposits'],['lc-panel','Local vs Cloud'],['ca-panel','Cost & accuracy'],['xp-panel','Experiment trials'],[compFold&&compFold.id,'Camera comparison'],[setupFold&&setupFold.id,'Setup & results']];
  nav.innerHTML=links.filter(([id])=>id&&document.getElementById(id)).map(([id,t])=>'<a href="#'+id+'">'+t+'</a>').join('');
  nav.addEventListener('click',e=>{const a=e.target.closest('a');if(!a)return;const t=document.getElementById(a.getAttribute('href').slice(1));if(t&&t.tagName==='DETAILS')t.open=true;});
  (cams||main.firstElementChild).before(nav);

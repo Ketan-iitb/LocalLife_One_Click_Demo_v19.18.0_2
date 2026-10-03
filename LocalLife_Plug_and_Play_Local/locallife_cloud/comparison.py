@@ -50,6 +50,20 @@ def _event_time(record: dict[str, Any]) -> float:
     return float(record.get("deposited_at") or record.get("observed_at") or 0.0)
 
 
+class _LockedClassifier:
+    """Thread-safe pass-through around one shared material classifier."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner, self._lock = inner, threading.Lock()
+
+    def classify(self, *args: Any, **kwargs: Any) -> Any:
+        with self._lock:
+            return self._inner.classify(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
 def match_deposits(
     realsense_records: list[dict[str, Any]],
     logitech_records: list[dict[str, Any]],
@@ -169,13 +183,22 @@ class DualCameraCoordinator:
         hardware = replace(config, results_dir=config.results_dir / "realsense", enable_monocular_depth=False)
         webcam = replace(config, results_dir=config.results_dir / "logitech",
                          roi=config.logitech_roi if config.logitech_roi is not None else config.roi)
+        # One material model for both stations (it used to be loaded twice),
+        # serialised by a lock because the two stations can run concurrently.
+        shared_material = None
+        if config.enable_material_classification:
+            from .material_siglip import create_material_classifier
+
+            shared_material = _LockedClassifier(
+                create_material_classifier(config, getattr(shared_detector, "device", None)))
         self.pipelines = {
             "realsense": VisionPipeline(
-                hardware, detector=shared_detector, camera_id="realsense", inference_lock=self.inference_lock
+                hardware, detector=shared_detector, camera_id="realsense", inference_lock=self.inference_lock,
+                material_classifier=shared_material,
             ),
             "logitech": VisionPipeline(
                 webcam, detector=shared_detector, depth_estimator=shared_depth,
-                camera_id="logitech", inference_lock=self.inference_lock,
+                camera_id="logitech", inference_lock=self.inference_lock, material_classifier=shared_material,
             ),
         }
         self._recent_semantic_presence: dict[str, float] = {}
