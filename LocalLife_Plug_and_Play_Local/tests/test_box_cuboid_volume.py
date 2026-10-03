@@ -185,29 +185,36 @@ class BoxCuboidVolumeTests(unittest.TestCase):
         self.assertEqual(np.count_nonzero(recovered & second_mask), 0)
 
     def test_footprint_recovers_true_dimensions_with_no_erosion(self) -> None:
-        # Numerically verified exact ground truth (corner-to-corner 3-D
-        # distance on the box's own top plane) for this exact scene:
-        # length ~= 43.070 mm, width ~= 28.208 mm.
+        # 43.07 x 28.21 mm is the extent between the outermost pixel CENTRES
+        # after the old 2 % trim; the physical (pixel-edge) footprint is larger.
         depth, mask, intrinsics, plane = self._scene_and_plane()
+        # Pixel-edge footprint: the centre-to-centre extent of 2*half pixels
+        # spans 2*half - 1 pixel pitches, so the true edge extent is that times
+        # 2*half / (2*half - 1). Trimming bias is compensated (uniform spread).
         result = estimate_box_volume_cuboid(depth, intrinsics, mask, plane, mask_erosion_px=0)
         self.assertIsNotNone(result)
-        self.assertAlmostEqual(result.length_mm, 43.070, delta=0.3)
-        self.assertAlmostEqual(result.width_mm, 28.208, delta=0.3)
+        centres = estimate_box_volume_cuboid(depth, intrinsics, mask, plane, mask_erosion_px=0,
+                                             footprint_trim_percentile=0.0)
+        true_length = centres.length_mm * (2 * self.COL_HALF) / (2 * self.COL_HALF - 1)
+        true_width = centres.width_mm * (2 * self.ROW_HALF) / (2 * self.ROW_HALF - 1)
+        self.assertAlmostEqual(result.length_mm, true_length, delta=0.6)
+        self.assertAlmostEqual(result.width_mm, true_width, delta=0.6)
 
-    def test_default_mask_erosion_shrinks_the_footprint_as_expected(self) -> None:
-        # Numerically verified exact ground truth after accounting for the
-        # default 2px erosion on each side (PDF section 4.1): the footprint
-        # shrinks to the pixel range [row_half-2, col_half-2] on each edge.
-        # length ~= 38.697 mm, width ~= 23.302 mm.
+    def test_default_mask_erosion_is_compensated_not_reported_as_shrinkage(self) -> None:
+        # The default 2 px erosion (PDF section 4.1) removes ~2 pixel
+        # footprints from each side. That bias used to reach the reported L/W
+        # (38.7 x 23.3 mm here instead of ~44.5 x ~28.9 mm, -19 % volume).
+        # It is now added back from the measured pixel footprint, so eroded and
+        # un-eroded masks of a clean top face agree, and the add-back is
+        # reported in the result.
         depth, mask, intrinsics, plane = self._scene_and_plane()
         result = estimate_box_volume_cuboid(depth, intrinsics, mask, plane)
-        self.assertIsNotNone(result)
-        self.assertAlmostEqual(result.length_mm, 38.697, delta=0.3)
-        self.assertAlmostEqual(result.width_mm, 23.302, delta=0.3)
-        # And the un-eroded measurement must be strictly larger in both axes.
         no_erosion = estimate_box_volume_cuboid(depth, intrinsics, mask, plane, mask_erosion_px=0)
-        self.assertGreater(no_erosion.length_mm, result.length_mm)
-        self.assertGreater(no_erosion.width_mm, result.width_mm)
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result.length_mm, no_erosion.length_mm, delta=0.8)
+        self.assertAlmostEqual(result.width_mm, no_erosion.width_mm, delta=0.8)
+        self.assertGreater(result.boundary_compensation_mm, 0.0)
+        self.assertLess(no_erosion.boundary_compensation_mm, result.boundary_compensation_mm)  # half-pixel term only
 
     def test_volume_liters_equals_length_times_width_times_height(self) -> None:
         depth, mask, intrinsics, plane = self._scene_and_plane()

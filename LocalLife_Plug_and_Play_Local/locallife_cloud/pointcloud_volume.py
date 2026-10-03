@@ -98,10 +98,19 @@ class PointCloudVolumeResult:
     tolerance_liters: float = 0.0
     views_used: int = 1
     flags: tuple[str, ...] = field(default_factory=tuple)
+    # Continuous measured volume, always kept. `liters` equals it unless the
+    # caller opted in to class snapping and the value fell inside a class
+    # window; then `liters` is the class value and `snapped_to_class` is True.
+    raw_liters: float | None = None
+    class_value_liters: float | None = None
+    snapped_to_class: bool = False
 
     def to_dict(self) -> dict:
         return {
             "liters": round(float(self.liters), 6),
+            "raw_liters": None if self.raw_liters is None else round(float(self.raw_liters), 6),
+            "class_value_liters": self.class_value_liters,
+            "snapped_to_class": bool(self.snapped_to_class),
             "method": self.method,
             "point_count": int(self.point_count),
             "confidence": round(float(self.confidence), 4),
@@ -768,7 +777,7 @@ def estimate_volume_heightmap(
     *,
     cell_size_m: float = _DEFAULT_HEIGHTMAP_CELL_SIZE_M,
     plane_equation: tuple[float, float, float, float] | None = None,
-    class_sizes_l: tuple[float, ...] = (5.0, 10.0),
+    class_sizes_l: tuple[float, ...] = (),
     tolerance_frac: float = 0.15,
     discretize_window_frac: float = 0.30,
     confidence_cap: tuple[float, float] = (0.5, 0.7),
@@ -849,11 +858,14 @@ def estimate_volume_heightmap(
     volume_m3 = float(np.nansum(filled_grid[valid_cells]) * cell_area_m2)
     raw_liters = max(0.0, volume_m3 * 1000.0)
 
+    # Class snapping is opt-in (class_sizes_l empty by default). When it fires,
+    # the class value is reported AND flagged, and the continuous value stays
+    # in `raw_liters`; it is a classification, not a measured volume.
     reported_liters, was_discretized = discretize_bag_volume(
         raw_liters, class_sizes_l=class_sizes_l, window_frac=discretize_window_frac
     )
 
-    flags: list[str] = ["bag_discrete_approx"] if not was_discretized else []
+    flags: list[str] = ["volume_snapped_to_class"] if was_discretized else []
 
     base_confidence = float(np.clip(points.shape[0] / 3000.0, confidence_cap[0], confidence_cap[1]))
     if not was_discretized:
@@ -872,6 +884,9 @@ def estimate_volume_heightmap(
         tolerance_liters=tolerance_liters,
         views_used=1,
         flags=tuple(flags),
+        raw_liters=raw_liters,
+        class_value_liters=float(reported_liters) if was_discretized else None,
+        snapped_to_class=bool(was_discretized),
     )
 
 
@@ -888,6 +903,8 @@ def estimate_volume_recipe(
     depth_m_view2: np.ndarray | None = None,
     intrinsics_view2: CameraIntrinsics | None = None,
     mask_view2: np.ndarray | None = None,
+    bag_class_sizes_l: tuple[float, ...] = (),
+    bag_discretize_window: float = 0.30,
 ) -> PointCloudVolumeResult:
     """End-to-end v3 §5: mask -> point cloud -> clean -> pose-normalize ->
     volume. `object_type` is `"box"` (plane-fit volume, v3 §5.3) or `"bag"`
@@ -950,5 +967,8 @@ def estimate_volume_recipe(
         # z=0, so the heightmap grid can integrate directly against
         # world-Z (0,0,1,0) rather than refitting a plane on the object
         # cloud alone (the very fallback this module avoids for boxes).
-        return estimate_volume_heightmap(normalized_points, plane_equation=(0.0, 0.0, 1.0, 0.0))
-    return estimate_volume_heightmap(points, plane_equation=None)
+        return estimate_volume_heightmap(normalized_points, plane_equation=(0.0, 0.0, 1.0, 0.0),
+                                         class_sizes_l=bag_class_sizes_l,
+                                         discretize_window_frac=bag_discretize_window)
+    return estimate_volume_heightmap(points, plane_equation=None, class_sizes_l=bag_class_sizes_l,
+                                     discretize_window_frac=bag_discretize_window)

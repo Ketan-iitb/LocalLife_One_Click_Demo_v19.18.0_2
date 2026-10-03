@@ -85,9 +85,13 @@ class PrecisionVolumeTests(unittest.TestCase):
         self.assertAlmostEqual(result.liters, expected, places=5)
         self.assertGreater(result.liters, 45.0)
 
-    def test_reference_plane_geometry_uses_backplane_pixel_footprint(self) -> None:
+    def test_reference_plane_footprint_is_taken_at_the_measured_surface(self) -> None:
+        # The old back-plane footprint z_ref^2/(fx*fy) inflated this elevated
+        # top by (2.0/1.5)^2 to 80 L. The footprint now belongs to the measured
+        # point; with no fitted plane (optical-axis normal) that is exactly the
+        # surface-columns figure.
         result = estimate_volume(self.depth, self.baseline, self.camera, geometry_mode="reference-plane")
-        self.assertAlmostEqual(result.liters, 80.0, places=5)
+        self.assertAlmostEqual(result.liters, 45.0, places=5)
 
     def test_known_volume_factor_changes_value_without_hiding_raw_measurement(self) -> None:
         result = estimate_volume(self.depth, self.baseline, self.camera, calibration_factor=1.2)

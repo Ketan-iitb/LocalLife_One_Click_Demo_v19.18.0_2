@@ -568,7 +568,7 @@ def view_csv(view: dict[str, Any]) -> str:
 # mode. Local and cloud trials of the same object are different frames, so they are reported as
 # "same objects, different frames" -- weaker than a replay, but real, and never estimated.
 TRIAL_FIELDS = ["trial_id", "recorded_at", "mode", "source_host", "camera", "object_name", "reference_litres",
-                "measured_litres", "method", "track_id", "error_litres", "error_pct"]
+                "measured_litres", "method", "track_id", "error_litres", "error_pct", "frame_timestamp"]
 
 
 def load_trials(path: Path) -> list[dict[str, Any]]:
@@ -592,9 +592,9 @@ def load_trials(path: Path) -> list[dict[str, Any]]:
 
 
 def make_trial(mode: str, host: str, camera: str, object_name: str, reference: float, measured: float,
-               method: str, track_id: Any, now: float) -> dict[str, Any]:
+               method: str, track_id: Any, now: float, frame_timestamp: float | None = None) -> dict[str, Any]:
     error = measured - reference
-    return {"trial_id": f"{host}-{mode}-{camera}-{int(now * 1000)}", "recorded_at": now, "mode": mode,
+    return {"frame_timestamp": frame_timestamp, "trial_id": f"{host}-{mode}-{camera}-{int(now * 1000)}", "recorded_at": now, "mode": mode,
             "source_host": host, "camera": camera, "object_name": object_name.strip()[:80] or "object",
             "reference_litres": reference, "measured_litres": measured, "method": (method or "")[:160],
             "track_id": track_id, "error_litres": error, "error_pct": (100.0 * error / reference) if reference > 0 else None}
@@ -628,17 +628,46 @@ def trial_accuracy(trials: list[dict[str, Any]], camera: str) -> dict[str, Any]:
     shared = objects["local"] & objects["cloud"]
     out = {"camera": camera, "shared_objects": sorted(shared), "modes": {}}
     for mode in ("local", "cloud"):
-        rows = [t for t in mine if t["mode"] == mode]
+        recorded = [t for t in mine if t["mode"] == mode]
+        rows = _placements(recorded)
         paired = [t for t in rows if t["object_name"].lower() in shared]
         errs = [abs(float(t["measured_litres"]) - float(t["reference_litres"])) for t in rows]
         pcts = [abs(float(t["error_pct"])) for t in rows if t.get("error_pct") is not None]
         perr = [abs(float(t["measured_litres"]) - float(t["reference_litres"])) for t in paired]
         out["modes"][mode] = {
-            "n": len(rows), "objects": sorted(objects[mode]),
+            "n": len(rows), "recordings": len(recorded),
+            "n_meaning": "independent placements (one per object and track; repeated readings of one "
+                         "placement and repeated polls of one processed frame count once)",
+            "objects": sorted(objects[mode]),
             "mae_l": statistics.fmean(errs) if errs else None, "mape_pct": statistics.fmean(pcts) if pcts else None,
             "paired_n": len(paired), "paired_mae_l": statistics.fmean(perr) if perr else None,
         }
     return out
+
+
+def _placements(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse non-independent recordings: one value per (object, track) placement,
+    the median of its distinct processed frames."""
+    seen_frames: set = set()
+    groups: dict[tuple, list[dict[str, Any]]] = {}
+    for row in rows:
+        frame = row.get("frame_timestamp")
+        if frame is not None:
+            key = (row.get("camera"), row.get("mode"), frame)
+            if key in seen_frames:
+                continue
+            seen_frames.add(key)
+        track = row.get("track_id")
+        group_key = (row["object_name"].lower(), track if track is not None else row.get("trial_id"))
+        groups.setdefault(group_key, []).append(row)
+    merged = []
+    for items in groups.values():
+        measured = statistics.median(float(t["measured_litres"]) for t in items)
+        reference = float(items[0]["reference_litres"])
+        error = measured - reference
+        merged.append({**items[0], "measured_litres": measured, "error_litres": error,
+                       "error_pct": 100.0 * error / reference if reference > 0 else None})
+    return merged
 
 
 def trials_csv(trials: list[dict[str, Any]]) -> str:

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from math import hypot, log
 
-from .geometry import intersection_over_union, is_phantom_source
+from .geometry import intersection_over_union, is_phantom_detection
 from .types import Detection
 
 
@@ -42,7 +42,7 @@ def _clone_detection(detection: Detection) -> Detection:
 # most one is ever kept alive at a time -- the fixed measurement bin holds one
 # physical object, so two simultaneous phantom boxes are never both real.
 def _is_phantom(track: "Track") -> bool:
-    return track.last_detection is not None and is_phantom_source(track.last_detection.source)
+    return track.last_detection is not None and is_phantom_detection(track.last_detection)
 
 
 @dataclass(slots=True)
@@ -190,7 +190,8 @@ class ObjectTracker:
                 continue
             item = _clone_detection(track.last_detection)
             item.track_id = track.track_id
-            item.source = "tracked-prediction"
+            item.source = "tracked-prediction"          # display only; provenance is kept
+            item.observation_status = "predicted"
             item.tracking_status = "predicted"
             item.confidence = max(0.0, item.confidence * (0.88 ** track.missing))
             item.measurement_quality = "tracking-through-brief-detector-dropout"

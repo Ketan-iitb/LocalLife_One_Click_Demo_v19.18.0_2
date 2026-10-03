@@ -661,6 +661,24 @@ def _height_map_measurement(
     )
 
 
+def _plane_footprint_area(
+    object_depth: np.ndarray, valid: np.ndarray, intrinsics: CameraIntrinsics,
+    reference_plane: ReferencePlane | None,
+) -> np.ndarray:
+    """Support-plane area of each valid pixel's measured surface patch."""
+    from .heightmap_volume import _sample_floor_area
+
+    rows, columns = np.nonzero(valid)
+    z = object_depth.astype(np.float64)
+    x = (columns.astype(np.float64) - intrinsics.ppx) * z / intrinsics.fx
+    y = (rows.astype(np.float64) - intrinsics.ppy) * z / intrinsics.fy
+    normal = None
+    if reference_plane is not None and reference_plane.coefficients is not None:
+        a, b, _ = reference_plane.coefficients
+        normal = np.array((a, b, -1.0)) / float(np.sqrt(a * a + b * b + 1.0))
+    return _sample_floor_area(x, y, z, intrinsics, normal)
+
+
 def estimate_volume(
     depth_m: np.ndarray | None,
     baseline_m: np.ndarray | None,
@@ -834,7 +852,17 @@ def estimate_volume(
         contributions_m3 = (reference_depth**3 - object_depth**3) / (3.0 * focal_product)
         pixel_area_m2 = contributions_m3 / object_height
     elif geometry_mode == "reference-plane":
-        pixel_area_m2 = (reference_depth * reference_depth) / focal_product
+        # Footprint of each column on the support plane, taken at the MEASURED
+        # surface point. The old form used the reference (floor) depth,
+        # z_ref^2/(fx*fy): an elevated object's pixel covers z_obj^2/(fx*fy),
+        # so its footprint was inflated by (z_ref/z_obj)^2 -- a flat top at
+        # 0.8 m over a 1.0 m floor read 18.00 L instead of 11.52 L (+56 %).
+        # Carrying the pixel's patch along its ray onto the plane with unit
+        # normal n gives z^3/(fx*fy*|n.p|) (heightmap_volume._sample_floor_area),
+        # exact for horizontal (top-face) surfaces at any tilt and equal to
+        # surface-columns for an overhead camera. Wall pixels still contribute
+        # under this horizontal-patch assumption; "height-map-grid" does not.
+        pixel_area_m2 = _plane_footprint_area(depth[valid], valid, intrinsics, reference_plane)
         contributions_m3 = object_height * pixel_area_m2
     elif geometry_mode == "triangulated-surface":
         contributions_m3, pixel_area_m2 = _triangulated_height_field(
@@ -1158,6 +1186,7 @@ def estimate_box_volume_cuboid(
     footprint_trim_percentile: float = 2.0,
     min_height_m: float = 0.025,
     max_height_m: float = 0.80,
+    depth_noise_m: float = 0.004,
 ) -> BoxVolumeMeasurement | None:
     """Table-relative rigid-box volume: robust height above the fitted table
     plane, times a robust footprint length/width, per the "Revised
@@ -1214,7 +1243,11 @@ def estimate_box_volume_cuboid(
     )
     valid = _largest_connected_region(valid)
     valid_count = int(np.count_nonzero(valid))
-    depth_valid_ratio = valid_count / max(1, raw_object_pixels)
+    # Coverage of the pixels this method actually samples (the eroded mask).
+    # Dividing by the un-eroded mask counted the erosion itself as missing
+    # depth: a 20 x 20 px object read 64 % "valid" with perfect depth.
+    sampled_pixels = int(np.count_nonzero(eroded_mask)) or raw_object_pixels
+    depth_valid_ratio = valid_count / max(1, sampled_pixels)
     if valid_count < min_points:
         return None
 
@@ -1239,15 +1272,21 @@ def estimate_box_volume_cuboid(
         top_band = height[height >= threshold]
     if top_band.size == 0:
         return None
+    # The band above a high percentile of a FLAT, noisy top is that top's
+    # upper noise tail (about +1.7 sigma for the upper 10 %). The top surface
+    # is instead the cluster of points within a few noise widths below that
+    # band; its median is the height, nearly unbiased by symmetric noise.
+    cluster_floor = float(np.min(top_band)) - max(3.0 * depth_noise_m, 0.006)
+    top_cluster = height[height >= cluster_floor]
+    if top_cluster.size >= top_band.size:
+        top_band = top_cluster
     height_m = float(np.median(top_band))
     height_p98_m = float(np.percentile(height, fallback_height_percentile))
     if height_m <= 0:
         return None
 
     # In-plane orthonormal basis (u_hat, v_hat), perpendicular to the plane
-    # normal. Any such basis works as the intermediate frame: the actual
-    # object-aligned axes are recovered afterward via PCA, which is
-    # rotation-independent within that plane.
+    # normal; the object-aligned axes are then found within that plane.
     normal = np.array((a, b, -1.0), dtype=np.float64) / denom
     seed = np.array((1.0, 0.0, 0.0)) if abs(normal[0]) < 0.9 else np.array((0.0, 1.0, 0.0))
     u_hat = seed - float(np.dot(seed, normal)) * normal
@@ -1255,21 +1294,48 @@ def estimate_box_volume_cuboid(
     v_hat = np.cross(normal, u_hat)
 
     points = np.column_stack((x, y, z))
-    u = points @ u_hat
-    v = points @ v_hat
-    footprint = np.column_stack((u, v))
-    footprint -= footprint.mean(axis=0)
-    covariance = np.cov(footprint, rowvar=False)
-    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
-    # eigh returns ascending eigenvalues; the largest-variance axis last.
-    principal = footprint @ eigenvectors
-    axis_a = principal[:, 1]
-    axis_b = principal[:, 0]
+    footprint = np.column_stack((points @ u_hat, points @ v_hat))
+    footprint -= np.median(footprint, axis=0)
+    # Orientation: the minimum-area trimmed rectangle, not PCA. For a
+    # near-square footprint the two PCA eigenvalues are almost equal, the
+    # eigenvectors are arbitrary, and extents measured along a 45-degree axis
+    # read the diagonal (x1.41 per side).
+    axis_a, axis_b = _min_area_axes(footprint, footprint_trim_percentile)
     low_a, high_a = np.percentile(axis_a, (footprint_trim_percentile, 100 - footprint_trim_percentile))
     low_b, high_b = np.percentile(axis_b, (footprint_trim_percentile, 100 - footprint_trim_percentile))
-    length_m = max(0.0, float(high_a - low_a))
-    width_m = max(0.0, float(high_b - low_b))
-    if length_m <= 0 or width_m <= 0:
+    # Boundary bias, derived rather than tuned. (1) Trimming p % at each end of
+    # a uniform spread of points over an extent E leaves E*(1 - 2p/100).
+    # (2) Eroding the mask by e pixels removes about e pixel footprints from
+    # each side. Both shrink L and W; both are put back. (2) is exact for an
+    # overhead view; on a tilted view a visible side wall already reaches the
+    # footprint edge on that side, so it can over-add up to e pixels there --
+    # carried in the uncertainty below, not hidden.
+    from .heightmap_volume import _sample_floor_area
+
+    pixel_m = float(np.sqrt(np.median(_sample_floor_area(x, y, z, intrinsics, normal))))
+    keep_fraction = max(1e-3, 1.0 - 2.0 * footprint_trim_percentile / 100.0)
+    erosion_m = max(0, int(mask_erosion_px)) * pixel_m
+    # (3) Points sit at pixel centres; each stands for +-half a pixel, so the
+    # outermost centres span one pixel footprint less than the object.
+    # (2) and (3) apply only to a side bounded by a TOP-FACE edge. Where a side
+    # wall is visible (a tilted view), wall points well below the top already
+    # reach that edge of the footprint, and nothing is added there.
+    side_add = erosion_m + 0.5 * pixel_m
+    low_points = height < 0.7 * height_m
+    wall_count = max(5, int(0.02 * height.size))
+
+    def _added(axis: np.ndarray, low: float, high: float) -> tuple[float, int]:
+        near_low = low_points & (axis <= low + 2.0 * pixel_m)
+        near_high = low_points & (axis >= high - 2.0 * pixel_m)
+        walls = int(np.count_nonzero(near_low) >= wall_count) + int(np.count_nonzero(near_high) >= wall_count)
+        return (2 - walls) * side_add, walls
+
+    added_a, walls_a = _added(axis_a, float(low_a), float(high_a))
+    added_b, walls_b = _added(axis_b, float(low_b), float(high_b))
+    extent_a = float(high_a - low_a) / keep_fraction + added_a
+    extent_b = float(high_b - low_b) / keep_fraction + added_b
+    length_m, width_m = max(extent_a, extent_b), min(extent_a, extent_b)
+    if float(high_a - low_a) <= 0 or float(high_b - low_b) <= 0:
         return None
 
     volume_l = length_m * width_m * height_m * 1000.0
@@ -1281,7 +1347,32 @@ def estimate_box_volume_cuboid(
     if plane_rmse_mm > 8.0:
         flags.append("high_plane_rmse")
     if mask_clipped:
+        # Only the visible part was measured: the volume is a lower bound.
         flags.append("mask_clipped")
+        flags.append("partial_view_lower_bound")
+
+    # Method-matched uncertainty: L*W*H error propagation from this method's
+    # own error sources. Heuristic 1-sigma terms, not a fitted error model.
+    viewing_cos = float(np.median(np.abs(points @ normal) / np.linalg.norm(points, axis=1)))
+    tilted = viewing_cos < 0.97
+    sigma_boundary = float(np.sqrt(2.0) * pixel_m)               # +-1 px segmentation per side
+    # Whether a side shows a wall is decided from a point threshold; if that
+    # call is wrong the side is off by one add-back.
+    sigma_compensation = side_add if (tilted or walls_a or walls_b) else 0.0
+    sigma_lw = float(np.hypot(sigma_boundary, sigma_compensation))
+    sigma_height = float(np.sqrt(depth_noise_m ** 2 / max(1, top_band.size)
+                                 + reference_plane.residual_rmse_m ** 2))
+    relative = float(np.sqrt((sigma_lw / length_m) ** 2 + (sigma_lw / width_m) ** 2
+                             + (sigma_height / height_m) ** 2))
+    components = {
+        "segmentation_boundary_mm_per_dimension": round(sigma_boundary * 1000.0, 3),
+        "erosion_compensation_mm_per_dimension": round(sigma_compensation * 1000.0, 3),
+        "height_depth_noise_and_support_plane_mm": round(sigma_height * 1000.0, 3),
+        "pixel_footprint_mm": round(pixel_m * 1000.0, 3),
+        "sides_with_visible_wall": int(walls_a + walls_b),
+        "not_included": ["partial visibility (flagged)", "calibration factor uncertainty",
+                         "non-cuboid shape", "systematic depth bias of the sensor"],
+    }
 
     confidence = 0.80
     confidence -= 0.25 * max(0.0, 0.90 - depth_valid_ratio)
@@ -1304,7 +1395,32 @@ def estimate_box_volume_cuboid(
         height_top_median_mm=height_m * 1000.0,
         mask_clipped=mask_clipped,
         flags=tuple(flags),
+        uncertainty_l=volume_l * relative,
+        uncertainty_components=components,
+        boundary_compensation_mm=max(added_a, added_b) * 1000.0,
     )
+
+
+def _min_area_axes(footprint: np.ndarray, trim_percentile: float) -> tuple[np.ndarray, np.ndarray]:
+    """Coordinates along the axes of the minimum-area trimmed bounding
+    rectangle: a coarse 1-degree sweep over a subsample, refined to 0.1 deg."""
+    sample = footprint[:: max(1, footprint.shape[0] // 4000)]
+
+    def areas(angles: np.ndarray) -> np.ndarray:
+        cos, sin = np.cos(angles), np.sin(angles)
+        first = sample[:, :1] * cos + sample[:, 1:] * sin
+        second = -sample[:, :1] * sin + sample[:, 1:] * cos
+        low1, high1 = np.percentile(first, (trim_percentile, 100 - trim_percentile), axis=0)
+        low2, high2 = np.percentile(second, (trim_percentile, 100 - trim_percentile), axis=0)
+        return (high1 - low1) * (high2 - low2)
+
+    coarse = np.radians(np.arange(0.0, 90.0, 1.0))
+    best = float(coarse[int(np.argmin(areas(coarse)))])
+    fine = best + np.radians(np.arange(-1.0, 1.05, 0.1))
+    angle = float(fine[int(np.argmin(areas(fine)))])
+    cos, sin = np.cos(angle), np.sin(angle)
+    return (footprint[:, 0] * cos + footprint[:, 1] * sin,
+            -footprint[:, 0] * sin + footprint[:, 1] * cos)
 
 
 _DIMENSION_INSTABILITY_FRACTION = 0.12
@@ -1386,6 +1502,22 @@ def aggregate_box_measurements(
 
     latest = measurements[-1]
     frames_accepted = len(measurements)
+    # Same method, same uncertainty definition: the per-frame propagated
+    # relative uncertainty (median over frames) combined with the observed
+    # frame-to-frame spread of each dimension.
+    per_frame = [m.uncertainty_l / m.volume_liters for m in measurements
+                 if m.uncertainty_l is not None and m.volume_liters > 0]
+    uncertainty_l = None
+    components = None
+    if per_frame:
+        relative = float(np.sqrt(float(np.median(per_frame)) ** 2 + sum(
+            spread ** 2 for spread in relative_spreads)))
+        uncertainty_l = volume_liters * relative
+        components = {
+            **(latest.uncertainty_components or {}),
+            "median_single_frame_relative": round(float(np.median(per_frame)), 5),
+            "frame_spread_relative_lwh": [round(float(v), 5) for v in relative_spreads],
+        }
 
     return BoxVolumeMeasurement(
         volume_liters=volume_liters,
@@ -1406,6 +1538,10 @@ def aggregate_box_measurements(
         frames_accepted=frames_accepted,
         dimension_std_mm=(round(length_std, 3), round(width_std, 3), round(height_std, 3)),
         mesh_used_for_final_volume=False,
+        uncertainty_l=uncertainty_l,
+        uncertainty_components=components,
+        footprint_method=latest.footprint_method,
+        boundary_compensation_mm=float(np.median([m.boundary_compensation_mm for m in measurements])),
     )
 
 

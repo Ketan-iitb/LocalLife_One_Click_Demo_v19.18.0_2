@@ -25,7 +25,9 @@ from .geometry import (
     fixed_bin_mask,
     fuse_scene_detections,
     intersection_over_union,
+    is_phantom_detection,
     is_phantom_source,
+    stamp_provenance,
     roi_mask,
 )
 from .inference import MetricDepthEstimator, create_segmenter
@@ -175,7 +177,7 @@ def _box_iou(a, b) -> float:
 
 
 def _is_phantom_detection(detection: Detection) -> bool:
-    return is_phantom_source(detection.source)
+    return is_phantom_detection(detection)
 
 
 def is_bag_detection(label: str) -> bool:
@@ -1359,38 +1361,76 @@ class VisionPipeline:
         template_match = match_box_template(
             cuboid.length_mm, cuboid.width_mm, cuboid.height_mm, self.box_templates,
         )
-        # A reported liters figure this round must still respect the same
-        # implausibility ceiling as every other measurement method -- the
-        # cuboid math is far more principled than the per-pixel sum it
-        # replaces here, but it is still a single-view estimate from real,
-        # noisy depth, and a badly leaking mask can still push it past
-        # what's physically possible for this bin.
+        # Policy (one for single-frame and track-aggregated results alike):
+        # dimensions are the measured ones and are never rescaled; the volume
+        # reported is their raw L*W*H product times this camera's known-volume
+        # calibration factor, and every term of that relationship is recorded.
+        # A matched template is metadata unless the operator opted in to
+        # replacing the volume with it (config.box_template_volume_override).
+        factor = float(self.config.volume_calibration_factor)
+        raw_l = float(cuboid.volume_liters)
+        detection.volume_raw_geometric_l = round(raw_l, 6)
+        detection.volume_calibration_factor = round(factor, 6)
+        detection.volume_calibration_source = (
+            "known-volume calibration (calibration/volume.json)" if factor != 1.0 else "none (factor 1.0)"
+        )
+        detection.depth_coverage_percent = round(float(cuboid.depth_valid_ratio) * 100.0, 1)
+        detection.box_template_id = None
+        detection.box_template_nominal_volume_liters = None
+        detection.box_template_match_error_mm = None
+        detection.box_template_volume_used = False
         if template_match is not None:
             detection.box_template_id = template_match.template.id
-            detection.box_template_nominal_volume_liters = (
-                template_match.template.nominal_volume_liters
+            detection.box_template_nominal_volume_liters = template_match.template.nominal_volume_liters
+            detection.box_template_match_error_mm = round(float(template_match.max_error_mm), 2)
+        use_template = template_match is not None and bool(self.config.box_template_volume_override)
+        if use_template:
+            reported = float(template_match.template.nominal_volume_liters)
+            detection.box_template_volume_used = True
+            detection.volume_relationship = (
+                f"TEMPLATE VALUE: nominal external L x W x H of template {template_match.template.id} "
+                f"({reported:.3f} L, matched within {template_match.max_error_mm:.1f} mm); measured raw "
+                f"{raw_l:.3f} L. Not a measurement; excluded from geometric-accuracy evaluation. "
+                "External box volume, not printed liquid capacity."
             )
-            if template_match.template.nominal_volume_liters <= self.config.realsense_max_item_volume_l:
-                detection.realsense_volume_l = round(
-                    template_match.template.nominal_volume_liters, 6
-                )
-                detection.measurement_method = "table-relative-cuboid-template"
-                detection.measurement_quality = "template-matched"
-                detection.height_above_baseline_cm = round(cuboid.height_mm / 10.0, 1)
-        elif cuboid.volume_liters <= self.config.realsense_max_item_volume_l:
-            detection.realsense_volume_l = round(cuboid.volume_liters, 6)
-            detection.measurement_method = cuboid.volume_method
-            detection.measurement_quality = (
+            detection.volume_uncertainty_l = None
+            detection.uncertainty_method = "unavailable: template-derived value"
+            method, quality = "table-relative-cuboid-template", "template-matched"
+        else:
+            reported = raw_l * factor
+            detection.volume_relationship = (
+                "reported = L x W x H of the reported dimensions" if factor == 1.0 else
+                f"reported = L x W x H ({raw_l:.3f} L) x known-volume factor {factor:.4f}; "
+                "dimensions are not scaled by the factor"
+            )
+            detection.volume_uncertainty_l = (
+                None if cuboid.uncertainty_l is None else round(float(cuboid.uncertainty_l) * factor, 6)
+            )
+            detection.uncertainty_method = (
+                "table_relative_cuboid: propagated L/W/H heuristic 1-sigma"
+                + (" (calibration-factor uncertainty not included)" if factor != 1.0 else "")
+                if cuboid.uncertainty_l is not None else "unavailable"
+            )
+            method = cuboid.volume_method
+            quality = (
                 "high" if cuboid.volume_confidence >= 0.65
                 else "moderate" if cuboid.volume_confidence >= 0.35
                 else "low"
             )
+            if cuboid.mask_clipped:
+                quality = "partial-view-lower-bound"
+        # A reported liters figure must still respect the same implausibility
+        # ceiling as every other measurement method.
+        if reported <= self.config.realsense_max_item_volume_l:
+            detection.realsense_volume_l = round(reported, 6)
+            detection.measurement_method = method
+            detection.measurement_quality = quality
             detection.height_above_baseline_cm = round(cuboid.height_mm / 10.0, 1)
         else:
             detection.measurement_quality = "rejected-implausible-volume"
             detection.realsense_volume_l = None
             warnings.append(
-                f"Rejected implausible RealSense box volume {cuboid.volume_liters:.1f} L "
+                f"Rejected implausible RealSense box volume {reported:.1f} L "
                 "from the table-relative cuboid measurement; the table-plane fit or object "
                 "mask is likely contaminated"
             )
@@ -1759,6 +1799,9 @@ class VisionPipeline:
         # overwritten -- this only fills in when none exists. Results
         # measured this way are flagged `live_fitted_support_plane` so the
         # diagnostics stay honest about where the reference came from.
+        # A live-fitted plane is per-frame only (`self.live_support_plane`):
+        # it is never stored as `self.reference_plane`, so it can neither be
+        # reused after the camera moves nor be reported as a captured baseline.
         captured_support_plane = self.reference_plane is not None and (
             self.reference_realsense is not None
             if self.camera_id != "logitech" else self.reference_monocular is not None
@@ -1784,7 +1827,7 @@ class VisionPipeline:
                 # old path kept the first live plane for height while creating
                 # later synthetic references from newly-fitted planes.
                 measurement_plane = live_plane
-                self.reference_plane = live_plane
+                self.live_support_plane = live_plane
                 self.support_plane_source = "live-frame-background"
                 if effective_reference is None:
                     synthetic = synthesize_plane_depth(
@@ -2167,6 +2210,22 @@ class VisionPipeline:
             if individual is not None:
                 detection.depth_coverage_percent = round(individual.coverage_ratio * 100, 1)
                 detection.volume_uncertainty_l = round(individual.uncertainty_l, 6)
+                detection.uncertainty_method = (
+                    f"{individual.geometry_mode}: sensor noise + missing depth + systematic budget "
+                    "(heuristic, not statistically calibrated)"
+                )
+                detection.volume_raw_geometric_l = round(float(individual.raw_liters), 6)
+                detection.volume_calibration_factor = round(float(individual.calibration_factor), 6)
+                detection.volume_calibration_source = (
+                    "known-volume calibration (calibration/volume.json)"
+                    if individual.calibration_factor != 1.0 else "none (factor 1.0)"
+                )
+                detection.volume_relationship = (
+                    f"reported = {individual.geometry_mode} integral"
+                    + ("" if individual.calibration_factor == 1.0
+                       else f" ({individual.raw_liters:.3f} L) x known-volume factor "
+                            f"{individual.calibration_factor:.4f}")
+                )
                 detection.measurement_method = individual.method
                 detection.measurement_quality = individual.quality
                 detection.calibration_mode = "factory-depth-plus-known-volume" if (
@@ -2341,6 +2400,7 @@ class VisionPipeline:
                     measurement_mask=bin_region,
                     min_height_m=minimum_height_m,
                     max_height_m=self.config.max_object_height_m,
+                    depth_noise_m=self.config.depth_noise_m,
                 )
                 if cuboid is not None:
                     extra_flags: tuple[str, ...] = ()
@@ -2781,6 +2841,10 @@ class VisionPipeline:
         # gated behind `_measurement_is_recordable`, exactly as the
         # LOCALLIFE_RECORD_ONLY_MEASURED docstring always promised ("shown live,
         # but never added to experiment databases").
+        processed_at = time.time()
+        for detection in detections:
+            stamp_provenance(detection, timestamp=timestamp, processed_at=processed_at,
+                             frame_id=self.frames_processed + 1)
         if self.camera_id == "logitech":
             detections = detections + self._hold_through_dropout(frame, detections)
         tracking_detections = detections
@@ -2792,7 +2856,7 @@ class VisionPipeline:
         for detection in detections:
             if detection.track_id is None or _is_phantom_detection(detection):
                 continue
-            if detection.source != "tracked-prediction":
+            if detection.observation_status == "fresh":
                 resolver.update(detection.track_id, detection.label_candidates
                                 or [(detection.label, float(detection.confidence))])
             detection.resolved_label, detection.resolved_share, _ = resolver.resolve(detection.track_id)
@@ -2887,7 +2951,7 @@ class VisionPipeline:
             # shadow excluded, with a cap or label reported as an accent
             # rather than replacing it. Geometry is not read or changed.
             colour_mask = measurement_masks.get(id(detection), detection.mask)
-            if colour_mask is not None and detection.source != "tracked-prediction":
+            if colour_mask is not None and detection.observation_status == "fresh":
                 # V49: sample by the RESOLVED class. A box the detector called a "bag" in this frame was
                 # sampled on the bag "skin band" at its edge -- i.e. on the white bags around it (grey).
                 # A flat-faced rigid object is sampled on its interior, away from its neighbours.
@@ -2909,7 +2973,7 @@ class VisionPipeline:
                 # impossible to correct after the detector recovered.
                 if (
                     detection.color not in {"unknown", ""}
-                    and detection.source != "tracked-prediction"
+                    and detection.observation_status == "fresh"
                     and not _is_phantom_detection(detection)
                 ):
                     colors.append(detection.color)
@@ -2943,7 +3007,8 @@ class VisionPipeline:
                         "source": "accepted_detector_class", "accepted_class": detection.accepted_class,
                         "confidence_meaning": "detector class confidence",
                     }
-                elif self.material_classifier is not None and self.material_classifier.enabled:
+                elif (self.material_classifier is not None and self.material_classifier.enabled
+                      and detection.observation_status == "fresh"):
                     materials = self._material_history[detection.track_id]
                     frame_count = self._material_frame_counts[detection.track_id]
                     due = frame_count % max(1, self.config.material_reclassify_frames) == 0
@@ -2963,8 +3028,15 @@ class VisionPipeline:
                             colour_state=(detection.color_evidence or {}).get("state"),
                             scores=list(self._material_scores[detection.track_id]),
                         )
+                        evidence = detection.material_evidence or {}
+                        detection.material_label_agreement = evidence.get("agreement")
+                        detection.material_model_score = evidence.get("median_classifier_score")
+                        detection.material_samples = len(materials)
             measured = self._detection_volume(detection)
-            if detection.track_id is not None and measured is not None:
+            # A held/predicted reading repeats an earlier measurement; it must not
+            # enter the stability window as if it were an independent sample.
+            if detection.track_id is not None and measured is not None \
+                    and detection.observation_status == "fresh":
                 history = self._volume_history[detection.track_id]
                 history.append(measured)
                 required = self.config.volume_stability_frames if self.config.record_only_measured_objects else 1
@@ -3273,7 +3345,11 @@ class VisionPipeline:
             if implied and (item.resolved_share or 0.0) >= 0.5:
                 item.material, item.material_confidence = implied, float(item.resolved_share)
                 item.material_evidence = {"source": "resolved object class", "class": resolved,
-                                          "share": item.resolved_share}
+                                          "share": item.resolved_share,
+                                          "confidence_meaning": "share of this track's class votes; "
+                                          "not a calibrated probability of the material"}
+                item.material_label_agreement = float(item.resolved_share)
+                item.material_model_score = None
             elif item.track_id is not None and resolver.rigid.get(item.track_id) \
                     and str(item.material).lower() in {"polythene bag", "plastic"}:
                 # The crop classifier saw the bags AROUND a rigid flat-topped object.
@@ -3636,7 +3712,7 @@ class VisionPipeline:
         held = self.__dict__.setdefault("_held_tracks", {})
         now = time.time()
         for item in detections:
-            if item.track_id is None or _is_phantom_detection(item) or item.source == "held-through-dropout":
+            if item.track_id is None or _is_phantom_detection(item) or item.observation_status != "fresh":
                 continue
             patch = self._patch(frame, item.box)
             if patch is not None:
@@ -3669,7 +3745,8 @@ class VisionPipeline:
                 continue
             ghost = copy.copy(item)
             ghost.track_id = None
-            ghost.source = "held-through-dropout"
+            ghost.source = "held-through-dropout"          # display; provenance below is kept
+            ghost.observation_status = "held"
             ghost.confidence = round(float(item.confidence) * 0.8, 3)
             kept.append(ghost)
         if kept:
@@ -4005,6 +4082,18 @@ class VisionPipeline:
         with self.lock:
             if not np.isfinite(known_liters) or known_liters <= 0:
                 raise ValueError("Known reference volume must be a finite positive number of liters")
+            if self.camera_id == "logitech":
+                # The Logitech's reported litres come from metric_object_volume()
+                # and its own known-object factor store, neither of which reads
+                # `volume_calibration_factor`. Saving one here changed nothing
+                # the operator could see while reporting success.
+                raise ValueError(
+                    "This calibration is not used by the Logitech measurement path. Use the Logitech "
+                    "known-object factor (wizard step 5: at least 3 known objects, then freeze) instead"
+                )
+            if self.__dict__.get("_evaluation_frozen"):
+                raise ValueError("An evaluation run is active; configuration and calibration are frozen")
+            raw_observed: float | None = None
             if observed_liters is None:
                 if self.latest_analysis is None:
                     raise ValueError("Measure a reference object before calibrating its volume")
@@ -4044,14 +4133,22 @@ class VisionPipeline:
                         "More than one measured object is currently in view; remove everything except "
                         "the single known-volume reference object, then calibrate"
                     )
-                observed_liters = (
-                    candidates[0].monocular_volume_l if self.camera_id == "logitech"
-                    else candidates[0].realsense_volume_l
-                )
+                chosen = candidates[0]
+                if chosen.box_template_volume_used:
+                    raise ValueError("The shown volume is a template value, not a measurement; it cannot calibrate")
+                if chosen.observation_status != "fresh":
+                    raise ValueError("The shown volume is held from an earlier frame; wait for a fresh measurement")
+                observed_liters = chosen.realsense_volume_l
+                raw_observed = chosen.volume_raw_geometric_l
             if not np.isfinite(observed_liters) or observed_liters <= 0:
                 raise ValueError("Observed reference volume must be a finite positive number of liters")
             previous = self.config.volume_calibration_factor
-            factor = previous * known_liters / observed_liters
+            # The factor multiplies the RAW geometric volume on every RealSense
+            # path (per-pixel/grid integration and the table-relative cuboid).
+            # Fit it against that raw value when known; an explicitly supplied
+            # observed value is the reported (already factored) number.
+            factor = (known_liters / raw_observed if raw_observed and raw_observed > 0
+                      else previous * known_liters / observed_liters)
             if not 0.10 <= factor <= 10.0:
                 raise ValueError("Calibration factor is implausible; verify the reference volume and camera geometry")
             self.config.volume_calibration_factor = float(factor)
@@ -4061,7 +4158,11 @@ class VisionPipeline:
                 "observed_liters": float(observed_liters),
                 "previous_factor": float(previous),
                 "factor": float(factor),
+                "raw_observed_liters": None if raw_observed is None else float(raw_observed),
                 "calibrated_at": time.time(),
+                "applies_to": ["realsense per-pixel / height-map integration", "realsense table-relative cuboid"],
+                "not_applied_to": ["template-derived volumes", "support-surface estimate (support_volume_l)",
+                                   "measured dimensions (never scaled)"],
                 "warning": "Validate accuracy using separate objects not used to fit this factor.",
             }
             self.store.save_json("calibration/volume.json", record)

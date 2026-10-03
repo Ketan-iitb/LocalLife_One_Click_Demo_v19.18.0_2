@@ -19,7 +19,7 @@ from . import __version__
 
 from .accuracy import fuse_pair_volume
 from .config import AppConfig
-from .geometry import fixed_bin_mask, is_phantom_source
+from .geometry import fixed_bin_mask, is_phantom_detection
 from .inference import MetricDepthEstimator, create_segmenter
 from .ledger import waste_object_type
 from .session_deposits import SessionDeposits
@@ -686,18 +686,40 @@ class DualCameraCoordinator:
         excluded entirely.
         """
         candidates: dict[str, dict[str, Any]] = {}
+        object_counts: dict[str, int] = {}
+        reading_age_s: dict[str, float | None] = {}
+        capture_time: dict[str, float] = {}
+        stale: list[str] = []
+        now = time.time()
+        max_age = float(getattr(self.config, "fused_max_age_s", 2.0))
         for camera_id in CAMERA_IDS:
-            analysis = self.camera(camera_id).latest_analysis
+            station = self.camera(camera_id)
+            analysis = station.latest_analysis
             if analysis is None:
                 continue
+            processed_at = getattr(station, "last_frame_processed_at", None)
+            age = None if not processed_at else max(0.0, now - float(processed_at))
+            reading_age_s[camera_id] = None if age is None else round(age, 3)
+            # Expiry policy: a camera whose newest processed frame is older than
+            # `fused_max_age_s` contributes nothing; its last values are not
+            # carried forward as if they were current.
+            if age is None or age > max_age:
+                stale.append(camera_id)
+                continue
+            # Fresh observations only: a tracker prediction or a dropout hold
+            # repeats an older measurement, and a depth silhouette was never
+            # semantically confirmed -- even after its display source changed.
             confirmed = [
                 item for item in analysis.detections
                 if item.tracking_status in {"confirmed", "predicted"}
-                and not is_phantom_source(item.source)
+                and item.observation_status == "fresh"
+                and not is_phantom_detection(item)
                 and item.accepted_class is not None
             ]
+            object_counts[camera_id] = len(confirmed)
             if not confirmed:
                 continue
+            capture_time[camera_id] = float(analysis.timestamp)
             best = max(confirmed, key=lambda item: item.area_pixels)
             volume = best.realsense_volume_l if camera_id == "realsense" else best.monocular_volume_l
             candidates[camera_id] = {
@@ -707,7 +729,26 @@ class DualCameraCoordinator:
                 "material": best.material if best.material not in {"", "unknown"} else None,
                 "material_confidence": float(best.material_confidence or 0.0),
                 "label": best.label,
+                "track_id": best.track_id,
+                "measured_at": best.measured_at,
+                "template_volume_used": bool(best.box_template_volume_used),
             }
+
+        # Association. The two cameras are not spatially registered (no
+        # validated extrinsic calibration is used here), so "the same object"
+        # is an assumption that only holds when each camera sees exactly one
+        # confirmed object at nearly the same capture time. Anything else is
+        # reported as ambiguous and nothing is combined across cameras.
+        association = "single-camera"
+        if len(candidates) == 2:
+            gap = abs(capture_time["realsense"] - capture_time["logitech"])
+            if object_counts.get("realsense", 0) > 1 or object_counts.get("logitech", 0) > 1:
+                association = "ambiguous-multiple-objects"
+            elif gap > max_age:
+                association = "not-associated-capture-time-gap"
+            else:
+                association = "assumed-same-object-single-object-per-camera"
+        combine = association in {"single-camera", "assumed-same-object-single-object-per-camera"}
 
         if not candidates:
             return {
@@ -720,11 +761,14 @@ class DualCameraCoordinator:
                 "per_camera": {},
                 "agreement_l": None,
                 "agreement_percent": None,
+                "association": "none",
+                "stale_cameras": stale,
+                "reading_age_s": reading_age_s,
                 "message": (
                     "Waiting for a confirmed test object on either camera"
                     if self.config.operating_mode == "geometry_validation"
                     else "Waiting for a confirmed bag or box on either camera"
-                ),
+                ) + (f" (stale: {', '.join(stale)})" if stale else ""),
             }
 
         volumes = {
@@ -740,21 +784,27 @@ class DualCameraCoordinator:
             # and an optional comparison reading, but must never move the
             # number presented as the fused/final volume.
             fused_volume = volumes.get("realsense")
-            if len(volumes) == 2:
+            if len(volumes) == 2 and combine:
                 difference = abs(volumes["realsense"] - volumes["logitech"])
                 reference = max(volumes.values()) or 1.0
                 agreement_l = round(difference, 3)
                 agreement_percent = round(max(0.0, 1.0 - difference / reference) * 100.0, 1)
 
-        colors = [item["color"] for item in candidates.values() if item["color"]]
+        appearance = candidates.values() if combine else [candidates.get("realsense") or next(iter(candidates.values()))]
+        colors = [item["color"] for item in appearance if item["color"]]
         fused_color = Counter(colors).most_common(1)[0][0] if colors else "unknown"
         materials = [
-            (item["material"], item["material_confidence"]) for item in candidates.values() if item["material"]
+            (item["material"], item["material_confidence"]) for item in appearance if item["material"]
         ]
         fused_material = max(materials, key=lambda item: item[1])[0] if materials else "unknown"
 
         sources = sorted(candidates.keys())
-        if len(sources) == 2:
+        if len(sources) == 2 and not combine:
+            message = (
+                f"Both cameras see objects but they cannot be associated ({association.replace('-', ' ')}); "
+                "per-camera readings shown separately, nothing combined"
+            )
+        elif len(sources) == 2:
             message = (
                 "RealSense supplies final volume; both cameras contribute visual classification"
                 if agreement_percent is None or agreement_percent >= 70.0
@@ -781,11 +831,20 @@ class DualCameraCoordinator:
                     "color": item["color"] or "unknown",
                     "material": item["material"] or "unknown",
                     "label": item["label"],
+                    "track_id": item["track_id"],
+                    "measured_at": item["measured_at"],
+                    "age_s": reading_age_s.get(camera_id),
                 }
                 for camera_id, item in candidates.items()
             },
             "agreement_l": agreement_l,
             "agreement_percent": agreement_percent,
+            "agreement_meaning": "difference between the two cameras' readings; not accuracy",
+            "association": association,
+            "stale_cameras": stale,
+            "reading_age_s": reading_age_s,
+            "object_counts": object_counts,
+            "volume_is_template_value": bool((candidates.get("realsense") or {}).get("template_volume_used")),
             "message": message,
         }
 
@@ -906,4 +965,37 @@ class DualCameraCoordinator:
                 "operating_mode": self.config.operating_mode,
                 "build_version": __version__,
                 "frames_processed": self.frames_processed, "cameras": states, "comparison": self.comparison(),
-                "fused": self.fused_result(), "recipe_result": self.recipe_result()}
+                "fused": self.fused_result(), "recipe_result": self.recipe_result(),
+                "counting": self.counting_summary()}
+
+    def counting_summary(self) -> dict[str, Any]:
+        """Four different counts that must not be read as one another."""
+        events = [event for event in getattr(self.deposits, "events", []) or []]
+        cameras: dict[str, Any] = {}
+        for camera_id, station in self.pipelines.items():
+            analysis = station.latest_analysis
+            observed = 0 if analysis is None else sum(
+                1 for item in analysis.detections
+                if item.observation_status == "fresh" and not is_phantom_detection(item))
+            ledger = station.ledger.summary()
+            cameras[camera_id] = {
+                "objects_observed_now": observed,
+                "unique_tracked_objects": int(station.tracker.total_count),
+                "stable_measurement_records": int(ledger.get("deposited_count", 0)),
+                "deposit_events": sum(1 for event in events if event.get("camera") == camera_id),
+            }
+        return {
+            "cameras": cameras,
+            "definitions": {
+                "objects_observed_now": "fresh, semantically confirmed detections in the newest processed frame",
+                "unique_tracked_objects": "tracks confirmed this run (one per object while it stays tracked; "
+                                          "a track lost and re-found can count again)",
+                "stable_measurement_records": "ledger rows whose volume held still for the settle window "
+                                              "(historically called 'deposited'); a still object on a table "
+                                              "also becomes one",
+                "deposit_events": "session deposit counter: a settled scene change compared with the last "
+                                  "committed view (camera evidence only)",
+            },
+            "physical_sensors": "none integrated (no PIR, ToF or load cell); no count here is a physically "
+                                "confirmed drop",
+        }

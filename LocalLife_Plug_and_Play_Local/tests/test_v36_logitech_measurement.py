@@ -181,12 +181,15 @@ class OptionalReferencesNeverBreakAnythingTests(unittest.TestCase):
             _volume_history={}, _box_measurement_history={}, _box_frames_considered={},
             _geometry_lock=GeometryLock(), _track_signatures={"sentinel": 1},
         )
-        station.calibrate_known_volume(10.0, observed_liters=9.0)
-        # The factor applies to litres; an object's metres do not depend on it,
-        # so its shape lock and identity survive. Clearing them sent every
-        # object on screen back to "not settled" with no dimensions.
+        # The Logitech's litres come from metric_object_volume() and its own
+        # known-object factor store; `volume_calibration_factor` never reached
+        # them, so "calibrating" here reported success and changed nothing.
+        # It is now refused with the path that does apply, and nothing on the
+        # station (shape lock, identity, factor) is touched.
+        with self.assertRaisesRegex(ValueError, "not used by the Logitech"):
+            station.calibrate_known_volume(10.0, observed_liters=9.0)
         self.assertEqual(station._track_signatures, {"sentinel": 1})
-        self.assertAlmostEqual(config.volume_calibration_factor, 10.0 / 9.0)
+        self.assertAlmostEqual(config.volume_calibration_factor, 1.0)
 
 
 class BaselineIsLearnedTests(unittest.TestCase):

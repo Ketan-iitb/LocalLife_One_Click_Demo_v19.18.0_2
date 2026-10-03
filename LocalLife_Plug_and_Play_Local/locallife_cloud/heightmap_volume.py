@@ -60,6 +60,11 @@ class HeightMapSettings:
     fill_hole_cells: bool = True
     max_fill_fraction: float = 0.25
     min_cells: int = 4
+    # Boundary cells (an occupied cell with an unoccupied 4-neighbour) count
+    # only the floor area their own elevated samples cover, instead of a full
+    # cell. Without it a 7 x 7 cm carton on 10 mm cells occupies 8 x 8 cells
+    # and reads ~30 % high (see `_sample_floor_area`).
+    fractional_boundary_cells: bool = True
 
     def __post_init__(self) -> None:
         if not 0.002 <= self.grid_size_m <= 0.20:
@@ -340,6 +345,28 @@ def _fill_interior_cells(grid: np.ndarray) -> tuple[np.ndarray, int]:
     return filled, int(np.count_nonzero(fillable))
 
 
+def _sample_floor_area(
+    x: np.ndarray, y: np.ndarray, z: np.ndarray, intrinsics: CameraIntrinsics,
+    normal: np.ndarray | None,
+) -> np.ndarray:
+    """Floor-plane area each depth sample stands for, assuming the sampled
+    surface patch is parallel to the floor (a top face).
+
+    A pixel at camera depth z covers z^2/(fx*fy) on a plane perpendicular to
+    the optical axis. Carried along its ray onto a plane with unit normal n,
+    that patch becomes z^3 / (fx*fy*|n . p|), p = (x, y, z) the sample point.
+    With n = optical axis (no plane, or an overhead camera) this is z^2/(fx*fy).
+    Wall samples get a non-zero area from this horizontal-patch assumption, so
+    it is only used to judge how much of a *boundary* cell the object covers,
+    capped at one cell.
+    """
+    base = z * z / max(intrinsics.fx * intrinsics.fy, 1e-12)
+    if normal is None:
+        return base
+    projection = np.abs(normal[0] * x + normal[1] * y + normal[2] * z)
+    return base * z / np.maximum(projection, 1e-9)
+
+
 def integrate_height_map(
     depth_m: np.ndarray | None,
     intrinsics: CameraIntrinsics | None,
@@ -413,6 +440,7 @@ def integrate_height_map(
         # distance is positive exactly there.
         heights = (a * x + b * y + c - z) / scale
         normal = np.array([a, b, -1.0]) / scale
+        sample_area = _sample_floor_area(x, y, z, intrinsics, normal)
         first_axis, second_axis = _plane_basis(normal)
         points = np.stack([x, y, z], axis=1)
         grid_u = points @ first_axis
@@ -420,6 +448,7 @@ def integrate_height_map(
     else:
         assert reference is not None
         heights = reference[rows, columns] - z
+        sample_area = _sample_floor_area(x, y, z, intrinsics, None)
         flags.append("method-b-depth-difference")
         grid_u = x
         grid_v = y
@@ -428,6 +457,7 @@ def integrate_height_map(
     if not np.any(plausible):
         return None
     heights = np.clip(heights[plausible], 0.0, None)
+    sample_area = sample_area[plausible]
     grid_u = grid_u[plausible]
     grid_v = grid_v[plausible]
 
@@ -484,7 +514,20 @@ def integrate_height_map(
 
     occupied_heights = height_grid[occupied]
     cell_area_m2 = cell * cell
-    volume_m3 = float(np.sum(occupied_heights) * cell_area_m2)
+    cell_fraction = np.ones(height_grid.shape)
+    if settings.fractional_boundary_cells:
+        covered = np.zeros(height_grid.size)
+        elevated = heights >= settings.min_height_m
+        np.add.at(covered, cell_ids[elevated], sample_area[elevated])
+        covered = covered.reshape(height_grid.shape) / cell_area_m2
+        padded = np.pad(occupied, 1, constant_values=False)
+        interior = (padded[:-2, 1:-1] & padded[2:, 1:-1] & padded[1:-1, :-2] & padded[1:-1, 2:])
+        boundary = occupied & ~interior
+        cell_fraction[boundary] = np.clip(covered[boundary], 0.0, 1.0)
+        if np.any(boundary):
+            flags.append("fractional-boundary-cells")
+    occupied_fraction = cell_fraction[occupied]
+    volume_m3 = float(np.sum(occupied_heights * occupied_fraction) * cell_area_m2)
     fill_fraction = filled_cells / max(1, int(np.count_nonzero(measured)))
 
     quality = "valid"
@@ -509,7 +552,7 @@ def integrate_height_map(
         grid_size_m=cell,
         cell_count=cell_count,
         filled_cells=filled_cells,
-        occupied_area_m2=cell_count * cell_area_m2,
+        occupied_area_m2=float(np.sum(occupied_fraction) * cell_area_m2),
         mean_height_m=float(np.mean(occupied_heights)),
         max_height_m=float(np.max(occupied_heights)),
         height_p90_m=float(np.percentile(occupied_heights, 90)),

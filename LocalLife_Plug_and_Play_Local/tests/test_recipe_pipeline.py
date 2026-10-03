@@ -665,6 +665,7 @@ class RecipePipelineTests(unittest.TestCase):
     _SCHEMA_KEYS = {
         "volume_liters", "volume_tolerance_liters", "volume_confidence", "color", "color_confidence",
         "material", "material_confidence", "material_model", "object_type", "views_used", "timestamp", "flags",
+        "volume_raw_liters", "volume_snapped_to_class",       # additive: raw litres + snapping disclosure
     }
 
     def test_end_to_end_returns_exact_v3_schema(self) -> None:

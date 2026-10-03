@@ -176,6 +176,30 @@ class Detection:
     # object's points support, its dimensions and bounding-box / shape /
     # mesh volumes. Frozen once the track's method is accepted.
     shape_geometry: Any = None
+    # Provenance that survives cloning, tracking, dropout holds, smoothing,
+    # fusion and export. `source` may be rewritten for display
+    # ("tracked-prediction", "held-through-dropout"); these never are.
+    origin_source: str | None = None        # source of the detection that first produced it
+    semantic_confirmed: bool | None = None  # a neural label vouched for it (not a depth silhouette)
+    observation_status: str = "fresh"       # fresh | predicted | held
+    measured_at: float | None = None        # capture timestamp of the frame its pixels came from
+    processed_at: float | None = None       # wall clock when that frame was processed
+    frame_id: int | None = None             # per-camera processed-frame counter
+    # Volume provenance: reported volume = raw geometric volume x calibration
+    # factor, unless a labelled template value replaced it.
+    volume_raw_geometric_l: float | None = None
+    volume_calibration_factor: float | None = None
+    volume_calibration_source: str | None = None
+    volume_relationship: str | None = None
+    uncertainty_method: str | None = None   # which method `volume_uncertainty_l` describes
+    box_template_volume_used: bool = False
+    box_template_match_error_mm: float | None = None
+    # Material evidence kept apart: the classifier's own score, how often the
+    # repeated classifications agreed, and how many there were. None of them is
+    # a calibrated probability of being correct.
+    material_model_score: float | None = None
+    material_label_agreement: float | None = None
+    material_samples: int = 0
 
     @property
     def area_pixels(self) -> int:
@@ -266,6 +290,31 @@ class Detection:
             "uncalibrated_volume_l": self.uncalibrated_volume_l,
             "calibration_version": self.calibration_version,
             "shape_geometry": None if self.shape_geometry is None else self.shape_geometry.to_dict(),
+            "provenance": {
+                "origin_source": self.origin_source or self.source,
+                "semantic_confirmed": self.semantic_confirmed,
+                "observation_status": self.observation_status,
+                "measured_at": self.measured_at,
+                "processed_at": self.processed_at,
+                "frame_id": self.frame_id,
+                "age_s": (None if self.measured_at is None or self.processed_at is None
+                          else round(max(0.0, self.processed_at - self.measured_at), 3)),
+            },
+            "volume_provenance": {
+                "raw_geometric_volume_l": self.volume_raw_geometric_l,
+                "calibration_factor": self.volume_calibration_factor,
+                "calibration_source": self.volume_calibration_source,
+                "relationship": self.volume_relationship,
+                "uncertainty_method": self.uncertainty_method,
+                "template_volume_used": bool(self.box_template_volume_used),
+                "template_match_error_mm": self.box_template_match_error_mm,
+            },
+            "material_scores": {
+                "model_score": self.material_model_score,
+                "label_agreement": self.material_label_agreement,
+                "samples": int(self.material_samples),
+                "meaning": "model ranking score and repeat-label agreement; not a calibrated probability",
+            },
         }
 
 
@@ -388,10 +437,25 @@ class BoxVolumeMeasurement:
     frames_accepted: int = 1
     dimension_std_mm: tuple[float, float, float] = (0.0, 0.0, 0.0)
     mesh_used_for_final_volume: bool = False
+    # Method-matched uncertainty of THIS cuboid (propagated from its own L, W, H
+    # error terms; a heuristic 1-sigma, not a statistically calibrated
+    # interval) and the terms behind it. `volume_liters` is always the raw
+    # L*W*H product of the reported dimensions; any calibration factor is
+    # applied by the caller and recorded on the Detection, never here.
+    uncertainty_l: float | None = None
+    uncertainty_components: dict | None = None
+    footprint_method: str = "trimmed-extent-min-area-orientation"
+    boundary_compensation_mm: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "volume_liters": round(float(self.volume_liters), 6),
+            "raw_geometric_volume_liters": round(float(self.volume_liters), 6),
+            "uncertainty_l": None if self.uncertainty_l is None else round(float(self.uncertainty_l), 6),
+            "uncertainty_kind": "heuristic propagated 1-sigma (not statistically calibrated)",
+            "uncertainty_components": self.uncertainty_components,
+            "footprint_method": self.footprint_method,
+            "boundary_compensation_mm": round(float(self.boundary_compensation_mm), 3),
             "volume_confidence": round(float(self.volume_confidence), 4),
             "volume_method": self.volume_method,
             "dimensions_mm": {

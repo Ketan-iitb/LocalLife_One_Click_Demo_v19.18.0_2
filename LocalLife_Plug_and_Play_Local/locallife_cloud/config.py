@@ -488,6 +488,19 @@ class AppConfig:
     # pre-existing behaviour), so early frames are never hidden.
     box_aggregation_min_frames: int = 3
     box_aggregation_window_frames: int = 20
+    # Known-box templates (box_templates.yaml). Matching is always recorded as
+    # metadata; replacing the measured volume with the template's nominal
+    # external L*W*H is opt-in, labelled, and excluded from geometric-accuracy
+    # evaluation. Off by default: a template value is not a measurement.
+    box_template_volume_override: bool = False
+    # Live "fused" result: a camera's latest analysis older than this (s) is
+    # stale and is not combined; the two cameras' readings must also be within
+    # this many seconds of each other to be shown side by side.
+    fused_max_age_s: float = 2.0
+    # Experiment attempt log (experiment_log.py): optional RGB/depth evidence
+    # per attempt, bounded so it can never fill the disk.
+    experiment_evidence: bool = False
+    experiment_evidence_max_files: int = 200
     history_limit: int = 100
     min_object_height_m: float = 0.025
     # The annotated laptop sleeve is 20 mm thick, below the production
@@ -782,6 +795,11 @@ class AppConfig:
             box_aggregation_window_frames=int(os.environ.get(
                 "LOCALLIFE_BOX_AGGREGATION_WINDOW_FRAMES", defaults.box_aggregation_window_frames,
             )),
+            box_template_volume_override=_bool_env("LOCALLIFE_BOX_TEMPLATE_VOLUME_OVERRIDE", False),
+            fused_max_age_s=float(os.environ.get("LOCALLIFE_FUSED_MAX_AGE_S", defaults.fused_max_age_s)),
+            experiment_evidence=_bool_env("LOCALLIFE_EXPERIMENT_EVIDENCE", False),
+            experiment_evidence_max_files=int(os.environ.get(
+                "LOCALLIFE_EXPERIMENT_EVIDENCE_MAX_FILES", defaults.experiment_evidence_max_files)),
             history_limit=int(os.environ.get("LOCALLIFE_HISTORY_LIMIT", defaults.history_limit)),
             min_object_height_m=float(os.environ.get("LOCALLIFE_MIN_HEIGHT_M", defaults.min_object_height_m)),
             geometry_validation_min_object_height_m=float(os.environ.get(

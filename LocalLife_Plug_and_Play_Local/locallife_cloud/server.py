@@ -13,6 +13,7 @@ import time
 from functools import wraps
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 import numpy as np
 from flask import Flask, Response, jsonify, render_template_string, request
@@ -24,6 +25,8 @@ from .dashboard import DUAL_DASHBOARD
 from .measurement_zone import quadrilateral_is_sane
 from .operator_dashboard import OPERATOR_DASHBOARD
 from .pipeline import VisionPipeline
+from .experiment_log import ExperimentLog, collect_attempt
+from .experiment_log import evaluate as evaluate_experiments
 from .storage import BucketSync
 from .streaming import LatestFrameProcessor
 from .telemetry import TELEMETRY_COLUMNS, TelemetryRecorder, export_json, gpu_resources, host_resources
@@ -87,7 +90,7 @@ def _annotate_frame(frame: np.ndarray, pipeline: VisionPipeline) -> np.ndarray:
     placed: list[tuple[int, int, int, int]] = []
     for detection in latest.detections:
         track = pipeline.tracker.tracks.get(detection.track_id) if detection.track_id is not None else None
-        if detection.source != "tracked-prediction" and track is not None and not track.counted:
+        if detection.observation_status == "fresh" and track is not None and not track.counted:
             # Tentative one-frame text-prompt hits must not flicker as if they
             # were confirmed waste objects.
             continue
@@ -116,7 +119,7 @@ def _annotate_frame(frame: np.ndarray, pipeline: VisionPipeline) -> np.ndarray:
         )
         volume = f" | {active_volume:.2f} L" if active_volume is not None else ""
         visible_color = f" [{detection.color}]" if detection.color not in {"unknown", ""} else ""
-        continuity = " (tracked)" if detection.source == "tracked-prediction" else ""
+        continuity = f" ({detection.observation_status})" if detection.observation_status != "fresh" else ""
         # The canonical name, not the detector's phrasing of the moment: one
         # frame of the real bin showed identical bags captioned "filled plastic
         # waste bag", "plastic garbage bag" and "plastic trash bag". The raw
@@ -250,6 +253,18 @@ def create_app(
 
         return wrapper
 
+    def unless_evaluation_frozen(function: Callable[..., Any]) -> Callable[..., Any]:
+        """Calibration-changing actions are refused while an evaluation run is active."""
+        @wraps(function)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            log = app.extensions.get("locallife_experiment_log")
+            if log is not None and log.active_run is not None:
+                return jsonify(error=f"evaluation run {log.active_run['run_id']} is active; configuration "
+                                     "and calibration are frozen until it is stopped"), 409
+            return function(*args, **kwargs)
+
+        return wrapper
+
     @app.errorhandler(413)
     def payload_too_large(_: Any) -> Any:
         return jsonify(error=f"Upload exceeds {settings.max_upload_mb} MB"), 413
@@ -374,6 +389,108 @@ def create_app(
 
     ca_trials_path = settings.results_dir / "cost_accuracy" / "trials.jsonl"
 
+    # ------------------------------------------------ experiment attempt log
+    experiments = ExperimentLog(settings.results_dir, evidence=settings.experiment_evidence,
+                                max_evidence_files=settings.experiment_evidence_max_files)
+    app.extensions["locallife_experiment_log"] = experiments
+
+    def _freeze(frozen: bool) -> None:
+        for station in manager.pipelines.values():
+            station._evaluation_frozen = frozen
+
+    _freeze(experiments.active_run is not None)
+
+    def _calibration_objects() -> list[str]:
+        try:
+            return [sample.object_name for sample in manager.camera("logitech").support_volume_factors.samples]
+        except Exception:  # noqa: BLE001 - optional store
+            return []
+
+    @app.post("/api/experiment/run/start")
+    @protected
+    def experiment_run_start() -> Any:
+        payload = request.get_json(silent=True) or {}
+        try:
+            run = experiments.start_run(str(payload.get("name") or ""), settings, str(payload.get("notes") or ""))
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 409
+        _freeze(True)
+        return jsonify(ok=True, run={k: v for k, v in run.items() if k != "config"})
+
+    @app.post("/api/experiment/run/stop")
+    @protected
+    def experiment_run_stop() -> Any:
+        try:
+            run = experiments.stop_run()
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 409
+        _freeze(False)
+        return jsonify(ok=True, run={k: v for k, v in run.items() if k != "config"},
+                       evaluation=evaluate_experiments(experiments.attempts(run["run_id"]),
+                                                       extra_calibration_objects=_calibration_objects()))
+
+    @app.get("/api/experiment/runs")
+    def experiment_runs() -> Any:
+        return jsonify(runs=experiments.runs(), active=None if experiments.active_run is None
+                       else experiments.active_run["run_id"])
+
+    @app.post("/api/experiment/attempt")
+    @protected
+    def experiment_attempt() -> Any:
+        """One trial: the operator states what the object really is; each selected camera's
+        result within the time limit is recorded -- a measurement or the reason there is none."""
+        payload = request.get_json(silent=True) or {}
+        requested_at = time.time()
+        cameras = ["realsense", "logitech"] if payload.get("camera") in (None, "", "both") else [str(payload["camera"])]
+        if any(camera not in manager.pipelines for camera in cameras):
+            return jsonify(error="camera must be realsense, logitech or both"), 400
+        role = str(payload.get("role") or "validation")
+        dims = payload.get("reference_dims_mm") or {}
+        try:
+            timeout_s = min(30.0, max(0.5, float(payload.get("timeout_s", 5.0))))
+            reference = None if payload.get("reference_volume_l") in (None, "") else float(payload["reference_volume_l"])
+            expected = None if payload.get("expected_count") in (None, "") else int(payload["expected_count"])
+        except (TypeError, ValueError):
+            return jsonify(error="reference_volume_l, expected_count and timeout_s must be numbers"), 400
+        attempt_id = uuid4().hex[:12]
+        rows = []
+        for camera in cameras:
+            result = collect_attempt(manager.camera(camera), camera, requested_at=requested_at, timeout_s=timeout_s)
+            frame, depth = result.pop("_frame", None), result.pop("_depth", None)
+            row = {
+                **result, "attempt_id": f"{attempt_id}-{camera}", "role": role,
+                "object_id": str(payload.get("object_id") or "")[:80],
+                "object_type": str(payload.get("object_type") or "")[:80],
+                "reference_length_mm": dims.get("length"), "reference_width_mm": dims.get("width"),
+                "reference_height_mm": dims.get("height"), "reference_volume_l": reference,
+                "reference_volume_definition": str(payload.get("reference_volume_definition") or "")[:120],
+                "reference_source": str(payload.get("reference_source") or "")[:120],
+                "actual_colour": payload.get("actual_colour"), "actual_material": payload.get("actual_material"),
+                "expected_count": expected, "notes": str(payload.get("notes") or "")[:500],
+                "counted_objects": manager.counting_summary()["cameras"].get(camera),
+            }
+            row["evidence_files"] = experiments.save_evidence(row["attempt_id"], camera, frame, depth)
+            try:
+                rows.append(experiments.record(row, settings))
+            except ValueError as exc:
+                return jsonify(error=str(exc)), 400
+        return jsonify(ok=True, attempts=rows)
+
+    @app.get("/api/experiment/attempts")
+    def experiment_attempts() -> Any:
+        return jsonify(attempts=experiments.attempts(request.args.get("run_id") or None))
+
+    @app.get("/api/experiment/attempts.csv")
+    def experiment_attempts_csv() -> Any:
+        return Response(experiments.csv(request.args.get("run_id") or None), mimetype="text/csv",
+                        headers={"Content-Disposition": "attachment; filename=experiment_attempts.csv"})
+
+    @app.get("/api/experiment/evaluation")
+    def experiment_evaluation() -> Any:
+        run_id = request.args.get("run_id") or None
+        return jsonify(evaluate_experiments(experiments.attempts(run_id),
+                                            extra_calibration_objects=_calibration_objects()))
+
     @app.post("/api/cost-accuracy/trial")
     @protected
     def cost_accuracy_trial() -> Any:
@@ -387,21 +504,27 @@ def create_app(
                 raise ValueError("camera and a positive known volume (L) are required")
             analysis = manager.camera(camera).latest_analysis
             items = [] if analysis is None else [
-                d for d in analysis.detections if d.track_id is not None and d.source != "tracked-prediction"]
+                d for d in analysis.detections if d.track_id is not None and d.observation_status == "fresh"]
             measured = []
             for d in items:
                 value = next((v for v in (d.support_volume_l, getattr(d, "stable_volume_l", None),
                                           d.realsense_volume_l if camera == "realsense" else d.monocular_volume_l)
                               if v is not None), None)
                 if value is not None:
-                    measured.append((d.area_pixels, float(value), d.support_method or d.measurement_method or "", d.track_id))
+                    measured.append((d.area_pixels, float(value), d.support_method or d.measurement_method or "",
+                                     d.track_id, d.measured_at))
             if not measured:
                 raise ValueError(f"no measured object volume on the {camera} view right now")
-            _, value, method, track = max(measured)
+            _, value, method, track, frame_at = max(measured, key=lambda item: item[0])
+            if frame_at is not None and any(
+                    t.get("camera") == camera and t.get("mode") == settings.processing_mode
+                    and t.get("frame_timestamp") == frame_at for t in ca.load_trials(ca_trials_path)):
+                return jsonify(error="this processed frame is already recorded; a repeated poll of an "
+                                     "unchanged frame is not a new measurement"), 409
         except (KeyError, TypeError, ValueError) as exc:
             return jsonify(error=str(exc)), 400
         trial = ca.make_trial(settings.processing_mode, lc_store.host, camera, str(payload.get("object_name") or ""),
-                              reference, value, method, track, time.time())
+                              reference, value, method, track, time.time(), frame_timestamp=frame_at)
         ca.append_trials(ca_trials_path, [trial])
         return jsonify(ok=True, trial=trial)
 
@@ -1083,24 +1206,34 @@ def create_app(
 
     @app.post("/api/logitech/support-factor/sample")
     @protected
+    @unless_evaluation_frozen
     def logitech_support_factor_sample() -> Any:
         """A KNOWN object (measured by hand) against Logitech's own raw object volume right now."""
         payload = request.get_json(silent=True) or {}
         station = manager.camera("logitech")
         track = payload.get("track_id")
         raw, name = station.latest_support_raw(int(track) if track not in (None, "") else None)
+        analysis = station.latest_analysis
+        frame_key = None if analysis is None else round(float(analysis.timestamp), 6)
+        used = station.__dict__.setdefault("_factor_sample_frames", set())
         try:
             if raw is None:
                 raise ValueError("no Logitech object volume on screen: place the object and wait for a reading")
+            if frame_key is not None and frame_key in used:
+                return jsonify(error="this processed frame was already sampled; wait for a new frame "
+                                     "(and preferably re-place the object)"), 409
             status = station.support_volume_factors.add_sample(
                 str(payload.get("object_name") or name or "object"), "irregular",
                 float(payload["reference_litres"]), raw, reference_source=str(payload.get("reference_source", "manual")))
+            if frame_key is not None:
+                used.add(frame_key)
         except (KeyError, TypeError, ValueError) as exc:
             return jsonify(error=str(exc)), 400
         return jsonify(ok=True, raw_litres=raw, **status)
 
     @app.post("/api/logitech/support-factor/freeze")
     @protected
+    @unless_evaluation_frozen
     def logitech_support_factor_freeze() -> Any:
         try:
             return jsonify(ok=True, **manager.camera("logitech").support_volume_factors.freeze())
@@ -1109,11 +1242,13 @@ def create_app(
 
     @app.post("/api/logitech/support-factor/unfreeze")
     @protected
+    @unless_evaluation_frozen
     def logitech_support_factor_unfreeze() -> Any:
         return jsonify(ok=True, **manager.camera("logitech").support_volume_factors.unfreeze())
 
     @app.post("/api/logitech/calibrate-empty")
     @protected
+    @unless_evaluation_frozen
     def logitech_calibrate_empty() -> Any:
         """Calibrate Empty Logitech Scene: camera height + empty-plane reference."""
         payload = request.get_json(silent=True) or {}
@@ -1125,6 +1260,7 @@ def create_app(
 
     @app.post("/api/logitech/calibration/sample")
     @protected
+    @unless_evaluation_frozen
     def logitech_calibration_sample() -> Any:
         payload = request.get_json(silent=True) or {}
         try:
@@ -1304,6 +1440,7 @@ def create_app(
 
     @app.post("/api/cameras/<camera_id>/calibrate-volume")
     @protected
+    @unless_evaluation_frozen
     def calibrate_volume(camera_id: str) -> Any:
         payload = request.get_json(silent=True) or {}
         try:

@@ -128,8 +128,12 @@ def process_object(
             depth_m_view2=realsense_depth_m_view2,
             intrinsics_view2=realsense_intrinsics_view2,
             mask_view2=realsense_best.mask if realsense_depth_m_view2 is not None else None,
+            bag_class_sizes_l=config.volume.bag_class_sizes_l if config.volume.bag_snap_to_class else (),
+            bag_discretize_window=config.volume.bag_discretize_window,
         )
         volume_liters = volume_result.liters
+        volume_raw_liters = volume_result.raw_liters
+        volume_snapped = volume_result.snapped_to_class
         volume_tolerance_liters = volume_result.tolerance_liters
         volume_confidence = volume_result.confidence
         views_used = volume_result.views_used
@@ -149,6 +153,8 @@ def process_object(
         volume_liters = 0.0
         volume_tolerance_liters = 0.0
         volume_confidence = 0.0
+        volume_raw_liters = None
+        volume_snapped = False
         views_used = 1
         flags.add("no_realsense_detection")
 
@@ -211,6 +217,10 @@ def process_object(
         "views_used": int(views_used),
         "timestamp": _timestamp(),
         "flags": sorted(flags),
+        # Additive to the v3 schema: the continuous measured litres and whether
+        # `volume_liters` was snapped to a bag size class (opt-in only).
+        "volume_raw_liters": None if volume_raw_liters is None else round(float(volume_raw_liters), 2),
+        "volume_snapped_to_class": bool(volume_snapped),
     }
 
 
@@ -228,6 +238,8 @@ def _empty_result() -> dict[str, Any]:
         "views_used": 1,
         "timestamp": _timestamp(),
         "flags": ["no_object_found"],
+        "volume_raw_liters": None,
+        "volume_snapped_to_class": False,
     }
 
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from math import hypot
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 import numpy as np
 
@@ -437,6 +437,29 @@ PHANTOM_DETECTION_SOURCES = frozenset(
 
 def is_phantom_source(source: str) -> bool:
     return source in PHANTOM_DETECTION_SOURCES
+
+
+def is_phantom_detection(detection: Any) -> bool:
+    """A depth-silhouette detection stays one after its display `source` is
+    rewritten (tracked prediction, dropout hold): judged on its durable
+    `origin_source` / `semantic_confirmed` provenance too."""
+    if is_phantom_source(getattr(detection, "source", "") or ""):
+        return True
+    if is_phantom_source(getattr(detection, "origin_source", None) or ""):
+        return True
+    return getattr(detection, "semantic_confirmed", None) is False
+
+
+def stamp_provenance(detection: Any, *, timestamp: float, processed_at: float, frame_id: int) -> None:
+    """First-sighting provenance; never overwrites what an earlier stage set."""
+    if getattr(detection, "origin_source", None) is None:
+        detection.origin_source = detection.source
+    if getattr(detection, "semantic_confirmed", None) is None:
+        detection.semantic_confirmed = not is_phantom_source(detection.origin_source or "")
+    if getattr(detection, "measured_at", None) is None:
+        detection.measured_at = float(timestamp)
+        detection.processed_at = float(processed_at)
+        detection.frame_id = int(frame_id)
 
 
 # How `fuse_scene_detections` decides an unmatched region is "close enough"

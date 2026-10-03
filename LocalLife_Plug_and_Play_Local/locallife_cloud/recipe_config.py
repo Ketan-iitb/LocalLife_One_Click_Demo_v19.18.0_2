@@ -97,6 +97,9 @@ class VolumeConfig:
     bag_class_sizes_l: tuple[float, ...] = (5.0, 10.0)
     bag_tolerance_frac: float = 0.15
     bag_discretize_window: float = 0.30
+    # Snapping a bag's measured litres to the nearest class size is a
+    # classification, not a measurement: opt-in, flagged, raw value kept.
+    bag_snap_to_class: bool = False
 
 
 @dataclass(slots=True)

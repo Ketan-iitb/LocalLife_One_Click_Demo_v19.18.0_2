@@ -13,6 +13,24 @@ from .types import Detection
 LEDGER_NAME = "waste_plant_ledger.jsonl"
 
 
+def _evidence_fields(detection: Detection) -> dict[str, Any]:
+    """Provenance carried into every ledger record (and its CSV/Excel export)."""
+    return {
+        "material_model_score": detection.material_model_score,
+        "material_label_agreement": detection.material_label_agreement,
+        "material_samples": int(detection.material_samples or 0),
+        "volume_raw_geometric_l": detection.volume_raw_geometric_l,
+        "volume_calibration_factor": detection.volume_calibration_factor,
+        "volume_relationship": detection.volume_relationship,
+        "uncertainty_method": detection.uncertainty_method,
+        "template_volume_used": bool(detection.box_template_volume_used),
+        "box_template_id": detection.box_template_id,
+        "observation_status": detection.observation_status,
+        "origin_source": detection.origin_source or detection.source,
+        "measured_at": detection.measured_at,
+    }
+
+
 def waste_object_type(label: str) -> str:
     words = set(label.lower().replace("_", " ").replace("-", " ").split())
     if words & {"bag", "bags", "sack", "sacks", "tote"}:
@@ -83,6 +101,7 @@ class WastePlantLedger:
             "observed_at": float(time.time() if timestamp is None else timestamp),
             "deposited_at": None,
             "status": "observed",
+            **_evidence_fields(detection),
         }
         self.records[entry_id] = record
         self.track_entries[detection.track_id] = entry_id
@@ -120,6 +139,7 @@ class WastePlantLedger:
             dimension_confidence=detection.dimension_confidence,
             dimension_flags=list(detection.dimension_flags),
             dimension_method=detection.dimension_method,
+            **_evidence_fields(detection),
         )
 
     def deposit(self, detection: Detection, *, timestamp: float | None = None) -> dict[str, Any]:
@@ -129,6 +149,14 @@ class WastePlantLedger:
         self.refresh(detection)
         record["status"] = "deposited"
         record["deposited_at"] = float(time.time() if timestamp is None else timestamp)
+        # "deposited" is this ledger's historical name for a SETTLED
+        # MEASUREMENT RECORD: a tracked object whose volume held still for the
+        # settle window. Nothing here observed it falling into the bin, and no
+        # PIR / ToF / load-cell sensor is integrated.
+        record["record_kind"] = "stable_measurement_record"
+        record["physical_deposit_evidence"] = (
+            "none: camera-only settled measurement (no PIR/ToF/load cell); see the session deposit "
+            "counter for change-based deposit events")
         self._persist("deposited", record)
         return record
 
