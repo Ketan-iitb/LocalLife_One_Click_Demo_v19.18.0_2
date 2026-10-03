@@ -319,6 +319,17 @@ class FillEstimator:
         reading.update(profile_status=self.profile.status, profile_source=self.profile.source,
                        assumptions=self.profile.assumptions(), last_processed_at=self.last_processed_at,
                        last_valid_at=self.last_valid_at)
+        # V50 scene gate (the formula is unchanged): with no bin region configured AND an unmeasured bin
+        # profile, the "bin" is whatever the camera sees -- in a room, the floor, a bed and a chair were
+        # reported as 22 % of a 660 L bin. The numbers stay in the reading; consumers see the gate.
+        whole_view = bool(getattr(self, "_region_is_whole_view", False))
+        verified = not (whole_view and self.profile.status != "measured")
+        reading["scene_check"] = {
+            "verified": verified,
+            "reason": None if verified else (
+                "no bin region configured and the bin profile is not measured: this view may be a room, "
+                "not a bin, so these heights are not bin occupancy. Draw the bin region or measure the bin."),
+        }
         return reading
 
     def _na(self, reason: str) -> dict[str, Any]:
@@ -342,6 +353,7 @@ class FillEstimator:
                floor_plane=None, depth_label: str = "hardware depth",
                objects: np.ndarray | None = None) -> dict[str, Any]:
         self.last_processed_at = timestamp
+        self._region_is_whole_view = region is None or bool(np.all(region))
         problems = self.profile.blocking()
         if problems:
             return self._hold("fill profile incomplete: " + "; ".join(problems))
@@ -553,7 +565,7 @@ class FillEstimator:
                 x.astype(np.float32), y.astype(np.float32))
 
     def object_volume(self, box, mask: np.ndarray | None, now: float,
-                      rigid_hint: bool = False) -> tuple[float, float] | None:
+                      rigid_hint: bool = False, deformable_hint: bool = False) -> tuple[float, float] | None:
         """(litres, height m) of one detection above the surface AROUND it, from this camera's own map.
 
         Volume = sum over the object's pixels of (height - local support) x pixel floor area. The local
@@ -561,6 +573,7 @@ class FillEstimator:
         measured from the pile, not from the bin floor. None when the map is stale or support unclear.
         """
         self.last_object = {}                            # never a previous object's geometry
+        rigid_candidate = None                           # (geometry, litres, height) awaiting a check
         surface = getattr(self, "last_surface", None)
         if not surface or now - surface["at"] > 10.0:      # the pile changes slowly; settled maps stay valid
             return None
@@ -603,7 +616,15 @@ class FillEstimator:
         # face and an OBSERVED thickness (side face / support at its low edge), not as the volume
         # above a ring median -- on uneven bags that support cut the box's low end off (45 cm box
         # read 27 cm long, 17 cm "tall", 2.4 L).
-        face = _box_face(surface, top, valid, height, support, float(np.percentile(support_px, 25)))
+        # Shape dispatch (V50). Rigid-box geometry needs rigid evidence: a flat-faced class, or -- for
+        # an unresolved class -- one flat face covering most of the object. A deformable class (bag,
+        # backpack, sack, textile) never gets it: a smooth patch of a backpack (monocular depth is
+        # smooth everywhere) was measured as a 14.8 x 13.3 x 6.1 cm "box" = 1.2 L.
+        face = None
+        if not deformable_hint:
+            face = _box_face(surface, top, valid, height, support, float(np.percentile(support_px, 25)))
+            if face is not None and not rigid_hint and face["share"] < RIGID_FACE_SHARE_UNRESOLVED:
+                face = None
         if face is not None:
             self.last_object = {"length_m": face["length"], "width_m": face["width"],
                                 "height_m": face.get("thickness"), "method": face["method"], "planar": True,
@@ -611,16 +632,27 @@ class FillEstimator:
                                 "tilt_deg": face["tilt_deg"], "face_share": face["share"],
                                 "thickness_source": face.get("thickness_source"), "reason": face.get("reason")}
             if face.get("litres") is not None:
-                return round(face["litres"], 2), face["thickness"]
-        box3d = _oriented_box(surface, top, support)
+                if rigid_hint:
+                    return round(face["litres"], 2), face["thickness"]
+                tilt = math.radians(float(face.get("tilt_deg") or 0.0))
+                low = min(face["length"], face["width"]) * math.sin(tilt) + face["thickness"] * math.cos(tilt)
+                high = max(face["length"], face["width"]) * math.sin(tilt) + face["thickness"] * math.cos(tilt)
+                rigid_candidate = (dict(self.last_object), face["litres"], face["thickness"], low, high)
+        box3d = _oriented_box(surface, top, support) if (rigid_hint or (face is None and not deformable_hint)) \
+            else None
+        if box3d is not None and not rigid_hint and box3d.get("coverage", 1.0) < RIGID_FACE_SHARE_UNRESOLVED:
+            box3d = None
         if box3d is not None:
             # Two or three faces of a box seen from the side (upright carton): each face spans two box
             # axes, so the visible faces give all three dimensions without any support assumption.
             self.last_object = {"length_m": box3d["length"], "width_m": box3d["width"],
                                 "height_m": box3d["height"], "method": box3d["method"], "planar": True,
                                 "litres": round(box3d["litres"], 2), "faces": box3d["faces"]}
-            return round(box3d["litres"], 2), box3d["height"]
-        if face is not None:
+            if rigid_hint:
+                return round(box3d["litres"], 2), box3d["height"]
+            rigid_candidate = (dict(self.last_object), box3d["litres"], box3d["height"],
+                               box3d["height"], box3d["height"])
+        if face is not None and rigid_hint and face.get("litres") is None:
             return None                                  # L x W seen, thickness not observable: no number
         rise_map = np.where(top, height - support, 0.0)
         risen = top & (rise_map > 0.02)
@@ -648,6 +680,7 @@ class FillEstimator:
         if missing:
             litres *= 1.0 + missing / max(1, int(np.count_nonzero(risen)))
         tall = float(np.percentile(rise_map[risen], 90))
+        observed_tall = tall
         if litres > 250.0 or tall > self.profile.usable_height_m + RIM_TOLERANCE_M:
             return None                                  # implausible: unavailable, never clamped
         length = width = None
@@ -659,7 +692,8 @@ class FillEstimator:
             pts = np.c_[surface["x"][risen], surface["y"][risen]].astype(np.float32)
             (_, _), (w1, w2), _ = cv2.minAreaRect(pts)     # oriented: a diagonal parcel stays long/thin
             length, width = float(max(w1, w2)), float(min(w1, w2))
-        slab = _tilted_slab(surface, risen, rise_map, min_share=0.4 if rigid_hint else 0.7)
+        slab = None if deformable_hint else _tilted_slab(surface, risen, rise_map,
+                                                          min_share=0.4 if rigid_hint else 0.7)
         planar = bool(slab and slab.get("planar") and slab.get("share", 0) >= 0.7)
         if slab is not None and slab.get("litres") is not None and slab["litres"] < litres:
             # A rigid flat-topped object (box, book) propped on the pile at an angle: integrating
@@ -668,8 +702,29 @@ class FillEstimator:
             litres, tall = slab["litres"], slab["thickness"]
             length, width = slab["length"], slab["width"]
             method = "tilted rigid slab: top-face L x W x thickness"
+        if rigid_candidate is not None and observed_tall <= 1.5 * rigid_candidate[4]:
+            # Unresolved class: the cuboid is rejected when the object stands much higher than the
+            # cuboid can reach (L sin(tilt) + T cos(tilt) for a face; H for a box from faces). A soft
+            # pack's flat top patch x a 3.7 cm "side face" explains 3.7 cm of a 14 cm-tall object
+            # (2.5 L read for 11.5 L). A box partly sunk among neighbours shows LESS rise than its
+            # cuboid predicts, which is consistent and is kept.
+            self.last_object = {**rigid_candidate[0], "consistency_litres": round(litres, 2)}
+            return round(rigid_candidate[1], 2), rigid_candidate[2]
+        if deformable_hint and raster is not None:
+            # A deformable object's L x W is its BODY: low loose parts (straps, handles, a flattened
+            # corner) rise a few cm and stretched the footprint (a backpack read 45 x 36 cm). The
+            # volume still integrates every risen cell; the dimensions are its body's enclosing box.
+            body = risen & (rise_map >= max(0.02, 0.30 * tall))
+            if np.count_nonzero(body) >= 10:
+                body_raster = _floor_raster(surface, body, rise_map)
+                if body_raster is not None:
+                    length, width = body_raster["length"], body_raster["width"]
+            method = ("deformable object: visible surface integrated above its support "
+                      "(not L x W x H; L x W x H is the body's enclosing box)")
         self.last_object = {"length_m": length, "width_m": width, "height_m": tall, "litres": round(litres, 2),
-                            "method": method, "planar": planar}
+                            "method": method, "planar": planar,
+                            "quantity": "visible-surface volume above the local support",
+                            "shape_model": "deformable" if deformable_hint else ("rigid" if rigid_hint else "unresolved")}
         return round(litres, 2), tall
 
     def _object_patch(self, surface: dict[str, Any], box, mask):
@@ -837,7 +892,24 @@ def surface_maps(depth_m: np.ndarray, intrinsics: Any, profile: FillProfile, pla
     return np.nan_to_num(height, nan=-9.0), flat, valid & np.isfinite(height)
 
 
+DEFORMABLE_WORDS = frozenset({
+    "bag", "bags", "backpack", "backpacks", "rucksack", "sack", "sacks", "pillow", "cushion", "textile",
+    "fabric", "clothing", "clothes", "blanket", "garbage", "trash", "rubbish", "refuse", "liner", "polythene",
+    "duffel", "handbag", "pouch", "towel", "jacket", "shirt",
+})
+
+
+def deformable_label(label: str | None) -> bool:
+    """A soft object by name (bag, backpack, sack, textile...): never measured as a rigid box."""
+    words = set(str(label or "").lower().replace("-", " ").replace("_", " ").replace("[", " ")
+                .replace("]", " ").split())
+    return bool(words & DEFORMABLE_WORDS) and not (words & {"box", "carton", "crate"})
+
+
 BOX_FACE_MIN_SHARE = 0.35       # of the object's valid mask cells on one flat face
+# Unresolved class: rigid-box geometry only when one face (or the box faces) cover this share of the
+# object -- a box is mostly its faces; a soft object with one smooth patch is not.
+RIGID_FACE_SHARE_UNRESOLVED = 0.70
 BOX_FACE_MAX_RMS_M = 0.012
 BOX_FACE_MIN_RECT = 0.82        # face hull / its min-area rectangle (an ellipse is 0.785)
 BOX_FACE_MIN_SIDE_M = 0.05
@@ -1109,6 +1181,7 @@ def _oriented_box(surface: dict[str, Any], cells: np.ndarray, support: float | N
     flat = sorted((e for i, e in enumerate(ext) if i != vertical), reverse=True)
     return {"length": flat[0], "width": flat[1], "height": ext[vertical],
             "litres": ext[0] * ext[1] * ext[2] * 1000.0, "faces": len(normals),
+            "coverage": float(len(on_faces)) / max(1, len(pts)),
             "method": f"box from {len(normals)} visible faces: extents along the faces' own axes (L x W x H)"}
 
 

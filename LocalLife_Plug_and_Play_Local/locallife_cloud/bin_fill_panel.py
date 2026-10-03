@@ -36,11 +36,12 @@ const sortTag=x=>x.sorting_status==='mis_sort'?'<span class="bf-mis">MIS-SORT</s
 const name=id=>id==='realsense'?'RealSense D435':'Logitech C920';
 const STATE={initialising:'Initialising baseline…',watching:'Watching for deposits',candidate:'Candidate: something entering',settling:'Settling…'};
 function card(id,r,w){w=w||{};const cam=id==='realsense'?'RealSense':'Logitech';let h='<b>'+name(id)+'</b><div class="bf-kpis">';
- const ok=r.status==='ok';
+ const gate=r.scene_check||{};const ok=r.status==='ok'&&gate.verified!==false;
  h+='<div><div class="bf-muted">'+cam+' bin fill (%)</div><div class="bf-big">'+(ok?r.height_fill_pct+'%':'—')+'</div>'+(ok&&r.stale?'<div class="bf-warn">stale · '+age(r.last_valid_at)+'</div>':'')+'</div>';
  h+='<div><div class="bf-muted">New bags this session</div><div class="bf-big">'+(w.new_bags||0)+'</div></div></div>';
- h+='<div class="'+(w.state==='watching'?'bf-ok':'bf-warn')+'">'+esc(STATE[w.state]||(w.state?w.state:'no frames yet'))+'</div>';
+ h+='<div class="'+(w.state==='watching'?'bf-ok':'bf-warn')+'">'+esc(STATE[w.state]||(w.state?w.state:'no frames yet'))+((w.state==='candidate'||w.state==='settling')?' · still '+v(w.still_for_s)+' / '+v(w.settle_needed_s)+' s · motion '+v(w.motion)+' (limit '+v(w.still_limit)+', '+esc(w.motion_scope||'region')+') · candidate '+v(w.candidate_age_s)+' / '+v(w.timeout_s)+' s':'')+'</div>';
  if(ok)h+='<div class="bf-muted">Bin occupancy (approx., height-based): average surface '+r.max_fill_height_cm+' cm of '+r.usable_height_cm+' cm · ≈ '+r.rough_litres+' L filled / '+r.rough_remaining_litres+' L remaining of 660 L · tallest '+r.tallest_cm+' cm</div>';
+ else if(r.status==='ok')h+='<div class="bf-warn">Bin fill not shown: '+esc(gate.reason)+'</div>';
  else{const g=r.diagnostics||{};h+='<div class="bf-muted">Bin fill unavailable: '+esc(r.reason)+(g.floor_source?' · floor: '+esc(g.floor_source)+(g.floor_distance_cm!=null?' '+g.floor_distance_cm+' cm':'')+' · valid depth '+v(g.valid_depth_pct)+'% · below floor '+v(g.below_floor_pct)+'% · above rim '+v(g.above_rim_pct)+'% · scale drift '+v(g.scale_drift):'')+'</div>';}
  const e=(w.events||[])[(w.events||[]).length-1];
  if(e)h+='<div style="margin-top:6px"><b>Latest new bag</b> ('+esc(e.event_id)+', '+t(e.deposit_time)+'): '+esc(e.object_type||e.detector_label)+' · '+(e.length_cm==null?'L×W N/A':e.length_cm+'×'+e.width_cm)+'×'+v(e.height_cm)+' cm · <b>'+cam+' object volume (L): '+v(e.envelope_l)+'</b> · colour '+esc(e.colour)+' · material '+esc(e.material)+' · '+esc(e.measurement_status)+(e.reason?' – '+esc(e.reason):'')+' · '+sortTag(e)+'</div>';

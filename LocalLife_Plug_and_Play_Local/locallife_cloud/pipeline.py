@@ -100,7 +100,7 @@ from .logitech_metric import (CALIBRATION_SET, EVALUATION_SET, RECOMMENDED_SAMPL
                               integrate_volume_l, robust_height_cm, stable_statistics,
                               zone_signature)
 from .measurement_zone import MeasurementZone, MeasurementZoneStore
-from .bin_fill import FillEstimator, default_profile, height_map
+from .bin_fill import FillEstimator, default_profile, deformable_label, height_map
 from .mask_leak import trim_mask_leak
 from .session_deposits import FrameEvidence, TrackInfo
 from .readiness import MeasurementReadiness
@@ -3224,8 +3224,10 @@ class VisionPipeline:
                 continue
             resolved = item.resolved_label
             try:
-                estimate = self.fill.object_volume(item.box, item.mask, time.time(),
-                                                   rigid_hint=resolved in FLAT_FACED)
+                rigid = resolved in FLAT_FACED
+                estimate = self.fill.object_volume(
+                    item.box, item.mask, time.time(), rigid_hint=rigid,
+                    deformable_hint=not rigid and deformable_label(resolved or item.label))
                 dims = dict(self.fill.last_object) if estimate is not None else None
             except Exception:  # noqa: BLE001 - display-only estimate
                 estimate, dims = None, None
@@ -3256,7 +3258,7 @@ class VisionPipeline:
                     item.support_width_cm = round(float(width_m) * 100, 1)
                 if item.track_id is not None:
                     resolver.set_size(item.track_id, item.support_length_cm, item.support_height_cm)
-                item.support_method = method if method.startswith("box ") or "slab" in method else \
+                item.support_method = method if method.startswith(("box ", "deformable")) or "slab" in method else \
                     "volume integrated above the local surface (not L x W x H; L x W x H is its enclosing box)"
                 if self.camera_id == "logitech" and self.support_volume_factors is not None:
                     # Monocular depth flattens relief. A factor frozen from >= 3 KNOWN objects (never

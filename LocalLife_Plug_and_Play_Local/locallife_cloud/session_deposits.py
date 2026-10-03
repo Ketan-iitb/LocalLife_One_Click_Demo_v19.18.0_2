@@ -59,6 +59,12 @@ MIN_CHANGE = 0.006             # persistent changed fraction of the region worth
 MIN_RISE_M = 0.03              # local depth rise counted as new material
 ID_SWITCH_IOU = 0.3            # an unknown id overlapping a committed box this much is a known bag
 GROWTH = 1.35                  # a known box grown this much can hold a touching new bag
+# Stereo depth error grows with distance squared (D435 RMS roughly 2-3 mm x z^2 per metre^2); a
+# per-frame comparison at 3 m is otherwise dominated by noise. Depth changes are judged against
+# max(MIN_RISE_M, DEPTH_NOISE_K x z^2) -- about 3 sigma of that engineering model, not a fitted value.
+DEPTH_NOISE_K = 0.0075
+LOCAL_MARGIN_PX = 6            # settling is judged in the changed area grown by this many SMALL pixels
+MIN_LOCAL_SHARE = 0.01         # ...when that area is at least this share of the region
 
 BAG_WORDS = {"bag", "sack", "pillow", "cushion", "textile", "fabric", "garbage", "waste", "trash", "refuse",
              "rubbish", "liner", "parcel", "package", "packet", "box", "carton", "blanket", "clothing", "bin"}
@@ -136,6 +142,19 @@ def _changed(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return (diff.max(axis=-1) if diff.ndim == 3 else diff) > PIXEL_DIFF
 
 
+def _depth_threshold(depth: np.ndarray) -> np.ndarray:
+    return np.maximum(MIN_RISE_M, DEPTH_NOISE_K * depth.astype(np.float64) ** 2)
+
+
+def _grow(mask: np.ndarray, pixels: int) -> np.ndarray:
+    try:
+        import cv2
+    except ImportError:  # pragma: no cover
+        return mask
+    size = 2 * pixels + 1
+    return cv2.dilate(mask.astype(np.uint8), np.ones((size, size), np.uint8)).astype(bool)
+
+
 def _iou(a, b) -> float:
     x1, y1, x2, y2 = max(a[0], b[0]), max(a[1], b[1]), min(a[2], b[2]), min(a[3], b[3])
     inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
@@ -171,6 +190,8 @@ class CameraWatcher:
         self.last_candidate_since: float | None = None
         self.candidate_trigger: str | None = None
         self.motion = 0.0
+        self.motion_scope = "region"
+        self.still_limit = MOTION_STILL
         self.last_frame_at: float | None = None
         self.resync = False
         self.resync_since: float | None = None
@@ -220,12 +241,31 @@ class CameraWatcher:
         if self.prev_grey is not None and self.prev_grey.shape == ev.grey.shape:
             diff = _changed(ev.grey, self.prev_grey)
             self.motion = float(np.count_nonzero(diff & region)) / max(1, int(np.count_nonzero(region)))
+            self.motion_scope = "region"
+            if self.state in ("candidate", "settling") and self.committed is not None \
+                    and self.committed.grey.shape == ev.grey.shape:
+                # Settling is about the candidate and the scene around it, not the whole view: in a
+                # room, someone moving at the far wall kept a placed bag "unsettled" for 30 s.
+                # Persistent change only (present in every recent frame): a placed object stays, a
+                # person walking through does not, so the walker is not part of the candidate area.
+                local = region.copy()
+                for view in [*self.views[-3:], ev.grey]:
+                    if view.shape == self.committed.grey.shape:
+                        local &= _changed(view, self.committed.grey)
+                for t in ev.tracks:
+                    if bag_like(t.label) and not self._known(t):
+                        local |= _box_mask(t.box, region.shape) & region
+                local = _grow(local, LOCAL_MARGIN_PX) & region
+                if np.count_nonzero(local) >= MIN_LOCAL_SHARE * np.count_nonzero(region):
+                    self.motion = float(np.count_nonzero(diff & local)) / int(np.count_nonzero(local))
+                    self.motion_scope = "candidate area"
         self.prev_grey = ev.grey
         self.views = (self.views + [ev.grey])[-4:]
         # Thresholds follow this camera's own noise floor, so a noisy dark view still settles.
         if self.motion < max(MOTION_ENTER, 4 * self.noise):
             self.noise = 0.9 * self.noise + 0.1 * self.motion
         still_limit = max(MOTION_STILL, 2.5 * self.noise)
+        self.still_limit = still_limit
         enter_limit = max(MOTION_ENTER, 4 * self.noise)
         still = self.motion < still_limit
         if still:
@@ -314,8 +354,19 @@ class CameraWatcher:
             return False
         if ev.depth is not None and before.depth is not None and ev.depth.shape == before.depth.shape:
             valid = (ev.depth > 0.05) & (before.depth > 0.05)
-            dropped = valid & (ev.depth - before.depth >= MIN_RISE_M) & region
-            return int(np.count_nonzero(dropped)) >= 0.5 * size
+            # A vacated spot is ONE coherent area whose surface fell by more than the depth noise at
+            # that range, away from the new object. Counting every pixel that fell >= 3 cm anywhere
+            # in the view let far-wall stereo noise (several cm at 3 m) "vacate" a bag that was
+            # simply placed, rejecting the deposit.
+            dropped = valid & (ev.depth - before.depth >= _depth_threshold(before.depth)) & region
+            dropped &= ~_grow(added, 2)
+            try:
+                import cv2
+                count, _, stats, _ = cv2.connectedComponentsWithStats(dropped.astype(np.uint8), 8)
+                largest = int(stats[1:, cv2.CC_STAT_AREA].max()) if count > 1 else 0
+            except ImportError:  # pragma: no cover
+                largest = int(np.count_nonzero(dropped))
+            return largest >= 0.5 * size
         try:
             import cv2
         except ImportError:  # pragma: no cover
@@ -368,7 +419,7 @@ class CameraWatcher:
         if ev.depth is not None and before.depth is not None and ev.depth.shape == before.depth.shape:
             valid = (ev.depth > 0.05) & (before.depth > 0.05)
             rise = np.where(valid, before.depth - ev.depth, 0.0)
-            change |= (rise >= MIN_RISE_M) & region
+            change |= (rise >= _depth_threshold(before.depth)) & region
         changed = float(np.count_nonzero(change)) / total
         details: dict[str, Any] = {"changed_fraction": round(changed, 4), "trigger": self.candidate_trigger}
         old = {t.track_id: t for t in before.tracks}
@@ -405,7 +456,7 @@ class CameraWatcher:
         if rise is not None:
             valid = (ev.depth > 0.05) & (before.depth > 0.05) & rest
             if np.count_nonzero(valid) >= 0.3 * np.count_nonzero(rest):
-                risen = valid & (rise >= MIN_RISE_M)
+                risen = valid & (rise >= _depth_threshold(before.depth))
                 if np.count_nonzero(risen) < 0.35 * np.count_nonzero(valid):
                     return "rejected", {**details, "reason": "change without a local surface rise where depth "
                                                              "is valid (lighting, shadow or an item shifted)"}
@@ -834,6 +885,9 @@ class SessionDeposits:
         with self._lock:
             now = self.clock()
             cams = {c: {"state": w.state, "reason": w.reason, "motion": round(w.motion, 4),
+                        "motion_scope": w.motion_scope, "still_limit": round(w.still_limit, 4),
+                        "still_for_s": None if w.still_since is None else round(max(0.0, now - w.still_since), 1),
+                        "settle_needed_s": SETTLE_S, "timeout_s": CANDIDATE_TIMEOUT_S,
                         "baseline_tracks": len(w.baseline_ids), "last_frame_at": w.last_frame_at,
                         "candidate_age_s": None if w.candidate_since is None else round(now - w.candidate_since, 1)}
                     for c, w in self.watchers.items()}
