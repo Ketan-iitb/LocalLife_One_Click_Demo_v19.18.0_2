@@ -856,7 +856,8 @@ def create_app(
         writer.writerow(["Camera", "Bag no.", "Bag ID", "Dropped at", "Colour", "Material", "Object",
                          "Detector label (raw)", "Length cm", "Width cm", "Height cm", "Bag volume L", "Bag volume method",
                          "Bin volume before L", "Bin volume after L", "Bin fill before %", "Bin fill after %",
-                         "Counted from", "Status", "Reason", "Sorting", "Sorting reason", "Session"])
+                         "Counted from", "Status", "Reason", "Sorting", "Sorting reason", "Session",
+                         "Object name", "Visible material", "Visible material source", "Secondary colours"])
         for e in sorted(snap["events"], key=lambda item: item["deposit_time"]):
             writer.writerow([e.get("camera"), e.get("count_after"), e.get("event_id"), stamp(e.get("deposit_time")),
                              e.get("colour"), e.get("material"),
@@ -867,7 +868,9 @@ def create_app(
                              cell(e.get("bin_fill_pct_before")), cell(e.get("bin_fill_pct_after")),
                              "detected object" if e.get("track_id") is not None else "image change (no detection)",
                              e.get("measurement_status"), cell(e.get("reason")), cell(e.get("sorting")),
-                             cell(e.get("sorting_reason")), snap["session_id"]])
+                             cell(e.get("sorting_reason")), snap["session_id"],
+                             cell(e.get("object_name")), cell(e.get("visible_material")),
+                             cell(e.get("visible_material_source")), cell(e.get("colour_secondary"))])
         return Response(buffer.getvalue(), mimetype="text/csv", headers={
             "Content-Disposition": f"attachment; filename=bag_ledger_{snap['session_id']}.csv",
             "Cache-Control": "no-store"})

@@ -101,6 +101,7 @@ from .logitech_metric import (CALIBRATION_SET, EVALUATION_SET, RECOMMENDED_SAMPL
                               zone_signature)
 from .measurement_zone import MeasurementZone, MeasurementZoneStore
 from .bin_fill import FillEstimator, default_profile, deformable_label, height_map
+from .recognition import object_name, visible_material
 from .mask_leak import trim_mask_leak
 from .session_deposits import FrameEvidence, TrackInfo
 from .readiness import MeasurementReadiness
@@ -1153,6 +1154,7 @@ class VisionPipeline:
             self._logitech_geometry.clear()
             self._track_signatures.clear()
             self._color_history.clear()
+            self.__dict__.get("_secondary_history", {}).clear()
             self._material_history.clear()
             self._material_scores.clear()
             self._material_frame_counts.clear()
@@ -2907,14 +2909,23 @@ class VisionPipeline:
                 # A tracked prediction repeats the previous frame's colour;
                 # counting it as a new vote made one early brown/black error
                 # impossible to correct after the detector recovered.
+                # V51: only a confident single-colour frame votes ("mixed"/"unknown" frames found no
+                # dominant colour and are no evidence for one); held copies repeat old pixels.
+                state = (detection.color_evidence or {}).get("state")
                 if (
-                    detection.color not in {"unknown", ""}
-                    and detection.source != "tracked-prediction"
+                    detection.color not in {"unknown", "", "mixed"}
+                    and state in (None, "solid", "see_through_or_background_coloured")
+                    and detection.source not in {"tracked-prediction", "held-through-dropout"}
                     and not _is_phantom_detection(detection)
                 ):
                     colors.append(detection.color)
                 if colors:
-                    detection.color = Counter(colors).most_common(1)[0][0]
+                    winner, votes = Counter(colors).most_common(1)[0]
+                    detection.color = winner
+                    detection.color_evidence = {
+                        **(detection.color_evidence or {}),
+                        "temporal_votes": len(colors), "temporal_agreement": round(votes / len(colors), 4),
+                    }
             # Playbook section 12. Applied to every detection, tracked or not,
             # so a mis-sorted object that never earns a track is still called
             # out rather than silently dropping off the event record.
@@ -2926,43 +2937,46 @@ class VisionPipeline:
             detection.sorting_status = verdict.status
             detection.sorting_reason = verdict.reason
             if detection.track_id is not None:
+                # V51: the visual classifier votes on EVERY fresh tracked object, including the accepted
+                # bag/box classes it used to skip -- so the visible material of a "garbage bag" that is
+                # really a textile bag can be observed. Same throttle; the object's own measurement mask
+                # (not the loose detector box) is classified. Votes feed the descriptive
+                # `visible_material`; the legacy `material` below is assigned exactly as before.
+                materials = self._material_history[detection.track_id]
+                if (self.material_classifier is not None and self.material_classifier.enabled
+                        and detection.source not in {"tracked-prediction", "held-through-dropout"}):
+                    frame_count = self._material_frame_counts[detection.track_id]
+                    due = frame_count % max(1, self.config.material_reclassify_frames) == 0
+                    self._material_frame_counts[detection.track_id] = frame_count + 1
+                    if due or not materials:
+                        label, score = self.material_classifier.classify(
+                            frame, measurement_masks.get(id(detection), detection.mask), detection.box)
+                        if label != "unknown" and score >= self.config.material_confidence_threshold:
+                            materials.append(label)
+                            self._material_scores[detection.track_id].append((label, float(score)))
                 canonical_material = {
                     "plastic_bag": "polythene bag",
                     "paper_bag": "paper bag",
                     "cardboard_box": "cardboard",
                 }.get(detection.accepted_class)
                 if canonical_material is not None:
-                    # The accepted class is stronger material evidence than
-                    # a generic crop classifier. This prevents a confirmed
-                    # cardboard box being reported as plastic (image2_1).
+                    # Legacy contract (sorting/ledger): the accepted class sets `material`.
                     detection.material = canonical_material
-                    # Derived from the detector's class, so it is only as
-                    # certain as that class -- not 100 %.
                     detection.material_confidence = round(float(detection.confidence), 4)
                     detection.material_evidence = {
                         "source": "accepted_detector_class", "accepted_class": detection.accepted_class,
                         "confidence_meaning": "detector class confidence",
                     }
-                elif self.material_classifier is not None and self.material_classifier.enabled:
-                    materials = self._material_history[detection.track_id]
-                    frame_count = self._material_frame_counts[detection.track_id]
-                    due = frame_count % max(1, self.config.material_reclassify_frames) == 0
-                    self._material_frame_counts[detection.track_id] = frame_count + 1
-                    if due or not materials:
-                        label, score = self.material_classifier.classify(frame, detection.mask, detection.box)
-                        if label != "unknown" and score >= self.config.material_confidence_threshold:
-                            materials.append(label)
-                            self._material_scores[detection.track_id].append((label, float(score)))
-                    if materials:
-                        # Identity, exterior material and contents kept apart,
-                        # and a split vote published as unknown
-                        # (material_evidence.py).
-                        (detection.material, detection.material_confidence,
-                         detection.material_evidence) = reconcile_material(
-                            detection.label, list(materials),
-                            colour_state=(detection.color_evidence or {}).get("state"),
-                            scores=list(self._material_scores[detection.track_id]),
-                        )
+                elif materials:
+                    # Identity, exterior material and contents kept apart,
+                    # and a split vote published as unknown
+                    # (material_evidence.py).
+                    (detection.material, detection.material_confidence,
+                     detection.material_evidence) = reconcile_material(
+                        detection.label, list(materials),
+                        colour_state=(detection.color_evidence or {}).get("state"),
+                        scores=list(self._material_scores[detection.track_id]),
+                    )
             measured = self._detection_volume(detection)
             if detection.track_id is not None and measured is not None:
                 history = self._volume_history[detection.track_id]
@@ -3290,6 +3304,7 @@ class VisionPipeline:
                                         "material": item.material or "unknown"}
             except Exception:  # noqa: BLE001 - display only
                 item.bin_verdict = None
+            self._describe(item)
         # The counter sees the SAME depth the fill uses (Logitech: model depth when no calibrated
         # depth exists -- before, it got none and every Logitech event had N/A size) and each
         # track's local-surface size computed just above.
@@ -3326,6 +3341,7 @@ class VisionPipeline:
             self._logitech_geometry.clear()
             self._track_signatures.clear()
             self._color_history.clear()
+            self.__dict__.get("_secondary_history", {}).clear()
             self._material_history.clear()
             self._material_scores.clear()
             self._material_frame_counts.clear()
@@ -3382,6 +3398,7 @@ class VisionPipeline:
             self._logitech_geometry.clear()
             self._track_signatures.clear()
             self._color_history.clear()
+            self.__dict__.get("_secondary_history", {}).clear()
             self._material_history.clear()
             self._material_scores.clear()
             self._material_frame_counts.clear()
@@ -3419,6 +3436,7 @@ class VisionPipeline:
             self._logitech_geometry.clear()
             self._track_signatures.clear()
             self._color_history.clear()
+            self.__dict__.get("_secondary_history", {}).clear()
             self._material_history.clear()
             self._material_scores.clear()
             self._material_frame_counts.clear()
@@ -3713,7 +3731,10 @@ class VisionPipeline:
                     height_mm=item.physical_height_mm, rejection=item.volume_rejection_reason,
                     support_volume_l=item.support_volume_l, support_height_cm=item.support_height_cm,
                     support_length_cm=item.support_length_cm, support_width_cm=item.support_width_cm,
-                    support_method=item.support_method, object_class=item.resolved_label))
+                    support_method=item.support_method, object_class=item.resolved_label,
+                    object_name=item.object_name, visible_material=item.visible_material,
+                    visible_material_source=item.visible_material_source,
+                    colour_secondary=tuple(item.colour_secondary or ())))
             depth = heights = area = xs = ys = None
             status = None
             # RealSense: aligned hardware depth (also used for the rise check). Logitech: its own
@@ -5886,6 +5907,30 @@ class VisionPipeline:
             self._release_expired_track_state([track_id])
         self._track_signatures[track_id] = signature
 
+    def _describe(self, item: Detection) -> None:
+        """V51 descriptive attributes (recognition.py): object name, visible material, colours.
+        Read-only with respect to geometry, tracking, counting and the legacy `material`."""
+        name, basis = object_name(item.label, item.resolved_label, item.resolved_share)
+        item.object_name, item.object_name_basis = name, basis
+        scores = list(self._material_scores.get(item.track_id, ())) if item.track_id is not None else []
+        material = visible_material(scores, name)
+        item.visible_material = material["visible_material"]
+        item.visible_material_source = material["source"]
+        item.visible_material_agreement = material["agreement"]
+        item.visible_material_samples = material["samples"]
+        secondary = list((item.color_evidence or {}).get("secondary") or [])
+        if item.track_id is None:
+            item.colour_secondary = secondary
+            return
+        # Secondary colours over the track's own fresh frames: shown when they recur, so one
+        # frame's shadow or neighbour does not flicker in and out.
+        history = self.__dict__.setdefault("_secondary_history", {}).setdefault(item.track_id, deque(maxlen=30))
+        if item.source not in {"tracked-prediction", "held-through-dropout"} and item.color_evidence:
+            history.append(tuple(secondary))
+        counts = Counter(colour for frame in history for colour in frame)
+        item.colour_secondary = [colour for colour, n in counts.most_common(2)
+                                 if colour != item.color and n >= 0.4 * len(history)]
+
     def _release_expired_track_state(self, expired_ids: list[int]) -> None:
         """Drop every per-track buffer belonging to a track the tracker closed.
 
@@ -5920,6 +5965,7 @@ class VisionPipeline:
             self._color_history.pop(track_id, None)
             self._material_history.pop(track_id, None)
             self._material_scores.pop(track_id, None)
+            self.__dict__.get("_secondary_history", {}).pop(track_id, None)
             self._material_frame_counts.pop(track_id, None)
             self._bin_total_before_track.pop(track_id, None)
             self._track_signatures.pop(track_id, None)

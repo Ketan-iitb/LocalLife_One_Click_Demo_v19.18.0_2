@@ -22,7 +22,18 @@ import logging
 
 import numpy as np
 
+from . import material as _material
 from .material import MaterialClassifier, _crop_object, _feature_tensor
+
+# V51: the visible-material vocabulary needs GLASS (a bottle may be plastic or glass). Registered
+# here, through material.py's own label/prompt tables, so material.py itself is unchanged; every
+# classifier built afterwards (CLIP and SigLIP, which falls back to this one) scores it.
+_material.DEFAULT_MATERIAL_PROMPTS.setdefault("glass", (
+    "a photo of a glass bottle", "a clear glass jar", "a green or brown glass bottle",
+    "transparent glass container",
+))
+if "glass" not in _material.DEFAULT_MATERIAL_LABELS:
+    _material.DEFAULT_MATERIAL_LABELS = (*_material.DEFAULT_MATERIAL_LABELS, "glass")
 
 LOGGER = logging.getLogger(__name__)
 

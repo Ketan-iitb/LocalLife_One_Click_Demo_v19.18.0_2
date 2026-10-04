@@ -80,6 +80,7 @@ CSV_FIELDS = (
     "height_source", "envelope_l", "delta_occupancy_l", "measurement_status", "reason",
     "volume_method", "units", "bin_fill_pct_after", "bin_fill_litres_after",
     "bin_fill_pct_before", "bin_fill_litres_before", "sorting", "sorting_reason", "object_class",
+    "object_name", "visible_material", "visible_material_source", "colour_secondary",
 )
 
 
@@ -112,6 +113,10 @@ class TrackInfo:
     support_width_cm: float | None = None
     support_method: str | None = None               # how the support L/W/H/volume set was measured
     object_class: str | None = None                 # class resolved over the track; `label` stays raw
+    object_name: str | None = None                  # V51 descriptive name (recognition.py)
+    visible_material: str | None = None             # V51 visible exterior material vocabulary
+    visible_material_source: str | None = None
+    colour_secondary: tuple = ()
 
 
 @dataclass
@@ -527,7 +532,8 @@ class SessionDeposits:
                 record.setdefault("camera", cameras[0])
                 for key in ("colour", "object_type", "detector_label", "material", "confidence",
                             "measurement_status", "association", "reason", "length_cm", "width_cm",
-                            "height_cm", "height_source", "envelope_l", "delta_occupancy_l", "track_id"):
+                            "height_cm", "height_source", "envelope_l", "delta_occupancy_l", "track_id",
+                            "object_name", "visible_material", "visible_material_source", "colour_secondary"):
                     record.setdefault(key, None)
                 record.setdefault("evidence", {})
             self.written = set(data.get("written", []))
@@ -808,6 +814,7 @@ class SessionDeposits:
             "colour": track.colour if track is not None and track.colour not in (None, "", "unknown")
             else watcher.consensus(track_id, "colour", "unknown"),
             "object_class": None if track is None else track.object_class,
+            **_descriptive(track),
             "object_type": ("unclassified (image change only)" if track is None
                             else track.object_class or f"unresolved (detector: {label})"),
             "detector_label": label, "material": material.upper() if material != "UNKNOWN" else material,
@@ -944,6 +951,16 @@ def _coherent_support(track: "TrackInfo | None"):
             track.support_method or "volume above the local surface around the object")
 
 
+def _descriptive(track: "TrackInfo | None") -> dict[str, Any]:
+    """V51 descriptive attributes of the SAME track; metadata only, never a count."""
+    if track is None:
+        return {"object_name": None, "visible_material": "unknown",
+                "visible_material_source": "no detection (image change only)", "colour_secondary": ""}
+    return {"object_name": track.object_name, "visible_material": track.visible_material or "unknown",
+            "visible_material_source": track.visible_material_source,
+            "colour_secondary": "/".join(track.colour_secondary or ())}
+
+
 def _track_material(track: "TrackInfo | None") -> str | None:
     if track is None or not track.material or str(track.material).lower() == "unknown" \
             or float(track.material_confidence or 0.0) < 0.5:
@@ -962,6 +979,8 @@ def _refresh_from_track(record: dict[str, Any], track: "TrackInfo") -> bool:
         record["material"] = material
     if track.colour and track.colour != "unknown":
         record["colour"] = track.colour
+    record.update({key: value for key, value in _descriptive(track).items()
+                   if value not in (None, "", "unknown", "unknown object") or key not in record})
     coherent = _coherent_support(track)
     if coherent is not None:
         length, width, height, litres, method = coherent

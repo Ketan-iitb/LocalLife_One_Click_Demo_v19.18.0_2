@@ -176,6 +176,15 @@ class Detection:
     # object's points support, its dimensions and bounding-box / shape /
     # mesh volumes. Frozen once the track's method is accepted.
     shape_geometry: Any = None
+    # V51 descriptive attributes (recognition.py). Separate on purpose: a backpack is an object,
+    # textile its visible material, black its colour. Internal fields above are unchanged.
+    object_name: str | None = None
+    object_name_basis: str | None = None
+    visible_material: str | None = None             # plastic | paper/cardboard | metal | textile | glass | mixed | unknown
+    visible_material_source: str | None = None
+    visible_material_agreement: float | None = None
+    visible_material_samples: int = 0
+    colour_secondary: list = field(default_factory=list)
 
     @property
     def area_pixels(self) -> int:
@@ -266,6 +275,14 @@ class Detection:
             "uncalibrated_volume_l": self.uncalibrated_volume_l,
             "calibration_version": self.calibration_version,
             "shape_geometry": None if self.shape_geometry is None else self.shape_geometry.to_dict(),
+            "object_name": self.object_name,
+            "object_name_basis": self.object_name_basis,
+            "visible_material": self.visible_material,
+            "visible_material_source": self.visible_material_source,
+            "visible_material_agreement": self.visible_material_agreement,
+            "visible_material_samples": int(self.visible_material_samples),
+            "colour_dominant": self.color,
+            "colour_secondary": list(self.colour_secondary or []),
         }
 
 

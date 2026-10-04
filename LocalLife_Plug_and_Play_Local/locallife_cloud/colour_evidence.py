@@ -54,6 +54,7 @@ ACCENT_MIN_SHARE, ACCENT_MIN_PIXELS, ACCENT_MIN_SATURATION = 0.04, 15, 0.35
 SEE_THROUGH_DIFFERENCE = 20.0 / 255.0
 SEE_THROUGH_SHARE = 0.50
 NEUTRAL = frozenset({"white", "grey", "black"})
+SECONDARY_MIN_SHARE = 0.20
 BAG_WORDS = frozenset({"bag", "bags", "sack", "sacks", "liner", "binbag", "polythene", "pouch"})
 
 
@@ -69,6 +70,13 @@ class ColourEvidence:
     shadow_pixels: int = 0
     sampled_region: str = "surface"
     shares: dict | None = None
+    # Per-channel (B, G, R) chroma gains applied for lighting drift since the
+    # empty reference was captured; None when not applied.
+    illumination_gains: list | None = None
+    # Other colours that each cover a real part of the surface (a black-and-white shoe, a printed
+    # box); never more than two, never the dominant one again.
+    secondary: list | None = None
+    secondary_note: str | None = None
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -87,6 +95,80 @@ def _erode(mask: np.ndarray, iterations: int) -> np.ndarray:
             out = (padded[1:-1, 1:-1] & padded[:-2, 1:-1] & padded[2:, 1:-1]
                    & padded[1:-1, :-2] & padded[1:-1, 2:])
         return out
+
+
+def _illumination_gains(frame_bgr: np.ndarray, background_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray | None:
+    """Chroma-only correction for a lighting/white-balance change since the
+    empty reference: compare the floor just around the object now with the
+    same floor in the reference. Brightness is left alone (normalised gains),
+    so a shadow cast by the object does not brighten it; only a colour cast
+    (warm lamp, auto white balance) is undone. Returns None when the evidence
+    is too thin or the correction would be negligible."""
+    try:
+        import cv2
+    except ImportError:  # pragma: no cover
+        return None
+    m = mask.astype(np.uint8)
+    ring = (cv2.dilate(m, np.ones((3, 3), np.uint8), iterations=12) > 0) & \
+        ~(cv2.dilate(m, np.ones((3, 3), np.uint8), iterations=4) > 0)
+    if int(np.count_nonzero(ring)) < 200:
+        return None
+    live = frame_bgr[ring].astype(np.float64)
+    reference = background_bgr[ring].astype(np.float64)
+    usable = (live.max(axis=1) < 250) & (reference.max(axis=1) < 250) & (live.min(axis=1) > 8) \
+        & (reference.min(axis=1) > 8)
+    if int(np.count_nonzero(usable)) < 200:
+        return None
+    gains = np.median(reference[usable], axis=0) / np.maximum(np.median(live[usable], axis=0), 1e-6)
+    gains = gains / float(np.mean(gains))
+    if float(np.max(np.abs(gains - 1.0))) < 0.02:
+        return None
+    return np.clip(gains, 0.8, 1.25)
+
+
+# Brown is dark or desaturated orange/yellow (ISCC-NBS); HSV brightness alone called lit cardboard
+# "orange". Constants are colour-naming definitions, not fitted to any test image.
+BROWN_MAX_SATURATION = 0.60
+BROWN_MAX_VALUE = 0.55
+
+
+WHITE_REFERENCE_MIN = 0.60       # a credible white surface must be at least this bright ...
+WHITE_REFERENCE_MAX_SAT = 0.15   # ... and near-neutral
+WHITE_REFERENCE_MIN_PIXELS = 50
+
+
+def _white_reference(frame_bgr: np.ndarray, mask: np.ndarray | None = None) -> float:
+    """White-patch exposure reference from bright, near-neutral surfaces OUTSIDE the object. Indoors
+    a white object is often at V~0.7, which absolute cuts call grey. With no such surface in view
+    (or the object itself the brightest thing) there is no reference and nothing is rescaled: a mid
+    grey object in a dark scene stays grey."""
+    step = 4
+    sample = frame_bgr[::step, ::step].astype(np.float32) / 255.0
+    outside = np.ones(sample.shape[:2], bool) if mask is None else ~mask[::step, ::step]
+    pixels = sample[outside]
+    if pixels.size == 0:
+        return 1.0
+    value = pixels.max(axis=1)
+    saturation = (value - pixels.min(axis=1)) / np.maximum(value, 1e-8)
+    neutral_bright = value[(saturation <= WHITE_REFERENCE_MAX_SAT) & (value >= WHITE_REFERENCE_MIN)]
+    if neutral_bright.size < WHITE_REFERENCE_MIN_PIXELS:
+        return 1.0
+    return float(np.clip(np.percentile(neutral_bright, 90), WHITE_REFERENCE_MIN, 1.0))
+
+
+def _categorise_object(pixels: np.ndarray, frame_bgr: np.ndarray,
+                       mask: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Per-pixel colour classes after exposure normalisation (one gain for all channels, so hue and
+    saturation are unchanged), with dark/desaturated orange-yellow named brown."""
+    relative = np.clip(pixels / _white_reference(frame_bgr, mask), 0.0, 1.0)
+    codes = _categorise(relative)
+    value = relative.max(axis=1)
+    saturation = (value - relative.min(axis=1)) / np.maximum(value, 1e-8)
+    orange, yellow, brown = (_CATEGORIES.index(name) for name in ("orange", "yellow", "brown"))
+    to_brown = ((codes == orange) & ((saturation < BROWN_MAX_SATURATION) | (value < BROWN_MAX_VALUE))) \
+        | ((codes == yellow) & (value < BROWN_MAX_VALUE))
+    codes = np.where(to_brown, brown, codes)
+    return codes, value
 
 
 def _is_bag(label: str | None) -> bool:
@@ -135,10 +217,15 @@ def describe_colour(
     if usable.sum() < max(MIN_USABLE_PIXELS, MIN_USABLE_FRACTION * pixels.shape[0]):
         return evidence
     pixels, saturation = pixels[usable], saturation[usable]
+    raw_pixels = pixels
 
     if background_bgr is not None and background_bgr.shape == frame_bgr.shape:
+        gains = _illumination_gains(frame_bgr, background_bgr, mask)
+        if gains is not None:
+            pixels = np.clip(pixels * gains.astype(np.float32), 0.0, 1.0)
+            evidence.illumination_gains = [round(float(g), 4) for g in gains]
         behind = background_bgr[surface][usable].astype(np.float32) / 255.0
-        see_through = float(np.mean(np.abs(pixels - behind).max(axis=1) <= SEE_THROUGH_DIFFERENCE))
+        see_through = float(np.mean(np.abs(raw_pixels - behind).max(axis=1) <= SEE_THROUGH_DIFFERENCE))
         if see_through >= SEE_THROUGH_SHARE:
             # Mostly the floor, seen through it -- or an object the colour of
             # the floor. A bag is called transparent; anything else uncertain.
@@ -147,7 +234,7 @@ def describe_colour(
             evidence.state = "see_through_or_background_coloured"
             return evidence
 
-    codes = _categorise(pixels)
+    codes, _ = _categorise_object(pixels, frame_bgr, mask)
     counts = np.bincount(codes, minlength=len(_CATEGORIES)).astype(np.float64)
     shares = counts / counts.sum()
     evidence.shares = {_CATEGORIES[i]: round(float(s), 4) for i, s in enumerate(shares) if s >= 0.01}
@@ -168,6 +255,15 @@ def describe_colour(
         evidence.state = "no_dominant_colour"
         return evidence
     evidence.colour, evidence.state = _CATEGORIES[winner], "solid"
+    evidence.secondary = [_CATEGORIES[int(i)] for i in order[:3]
+                          if int(i) != winner and shares[int(i)] >= SECONDARY_MIN_SHARE][:2] or None
+    # Very dark pixels are kept out of the DOMINANT colour (they may be shadow), but a large dark
+    # region is real information -- the black panels of a striped hamper -- so it is reported as a
+    # secondary colour, with the caveat recorded.
+    if _CATEGORIES[winner] != "black" and evidence.shadow_pixels >= SECONDARY_MIN_SHARE * (
+            evidence.usable_pixels + evidence.shadow_pixels) and "black" not in (evidence.secondary or []):
+        evidence.secondary = ((evidence.secondary or []) + ["black"])[:2]
+        evidence.secondary_note = "black: a large very dark region (black part, or deep shadow)"
 
     for index in order:
         name = _CATEGORIES[int(index)]
