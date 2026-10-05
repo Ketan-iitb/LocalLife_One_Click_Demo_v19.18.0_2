@@ -387,7 +387,14 @@ class FillEstimator:
         if region is not None:
             valid &= region
         flat_share = float(np.count_nonzero(flat & valid)) / max(1, int(np.count_nonzero(valid)))
-        if flat_share < 0.30:
+        assumed_up = plane is None and self.profile.tilt_from_vertical_deg is None
+        if assumed_up:
+            # V52: with no fitted floor and no measured tilt, "up" is only the camera axis. On a tilted
+            # mount the wall test then rejects most of a crumpled pile (a full bin read "waiting for a
+            # clear view" with 100 % valid depth). The test needs a real up direction; without one it
+            # is skipped and the reading stays labelled as an assumed floor.
+            flat = np.ones_like(flat)
+        elif flat_share < 0.30:
             # Real stereo noise can tilt most normals past the wall test; then the test is not
             # informative, and blocking the whole fill on it was wrong (fill stayed "unavailable").
             flat = np.ones_like(flat)
@@ -412,7 +419,8 @@ class FillEstimator:
             "statistic": "mean over 5 cm floor cells of the surface top (p90 per cell), gaps < 15 cm closed; < 3 cm = floor",
             "usable_height_cm": round(self.profile.usable_height_m * 100, 1), "frame_at": timestamp,
             "upward_surface_pct": round(100 * flat_share, 1),
-            "wall_filter": "on" if flat_share >= 0.30 else "off (normals too noisy)",
+            "wall_filter": ("off (floor direction not measured)" if assumed_up
+                            else "on" if flat_share >= 0.30 else "off (normals too noisy)"),
         }
         if moving:
             return self._hold("scene moving", stale_only=True)

@@ -115,6 +115,14 @@ def _illumination_gains(frame_bgr: np.ndarray, background_bgr: np.ndarray, mask:
         return None
     live = frame_bgr[ring].astype(np.float64)
     reference = background_bgr[ring].astype(np.float64)
+    # V52: the surround must be the SAME surface as in the reference. In a bin that fills up, the
+    # pixels around a bag are other bags that were not there when the reference was taken; gains from
+    # them are not a lighting change (a white bag on a green pile read "purple").
+    live_grey, reference_grey = live.mean(axis=1), reference.mean(axis=1)
+    if live_grey.std() < 1.0 or reference_grey.std() < 1.0:
+        return None
+    if float(np.corrcoef(live_grey, reference_grey)[0, 1]) < SAME_SURFACE_MIN_CORRELATION:
+        return None
     usable = (live.max(axis=1) < 250) & (reference.max(axis=1) < 250) & (live.min(axis=1) > 8) \
         & (reference.min(axis=1) > 8)
     if int(np.count_nonzero(usable)) < 200:
@@ -132,6 +140,7 @@ BROWN_MAX_SATURATION = 0.60
 BROWN_MAX_VALUE = 0.55
 
 
+SAME_SURFACE_MIN_CORRELATION = 0.80
 WHITE_REFERENCE_MIN = 0.60       # a credible white surface must be at least this bright ...
 WHITE_REFERENCE_MAX_SAT = 0.15   # ... and near-neutral
 WHITE_REFERENCE_MIN_PIXELS = 50
