@@ -200,3 +200,17 @@ class Phase2ScreenshotTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BagOnTopTests(unittest.TestCase):
+    def test_bag_dropped_on_an_old_bag_counts(self) -> None:
+        for camera, depth in (("realsense", True), ("logitech", False)):
+            with self.subTest(camera=camera), TemporaryDirectory() as d:
+                counter, scene = sd.SessionDeposits(Path(d), clock=lambda: 0.0), RoomScene(camera=camera, depth=depth, seed=7)
+                scene.add(9, (50, 70, 110, 115), label="garbage bag", shade=40)        # pile at baseline
+                t = run(counter, scene, 0.0, 6.0)[1]
+                scene.bags.pop(9)
+                scene.add(9, (50, 70, 110, 115), height=0.25, label="garbage bag", shade=40)
+                scene.add(5, (55, 72, 105, 112), height=0.40, label="plastic waste bag", shade=200)  # on top
+                run(counter, scene, t, t + 8.0)
+                self.assertEqual(counter.count_for(camera), 1)

@@ -58,6 +58,7 @@ MOTION_STILL = 0.008           # below this the frame is still
 MIN_CHANGE = 0.006             # persistent changed fraction of the region worth evaluating
 MIN_RISE_M = 0.03              # local depth rise counted as new material
 ID_SWITCH_IOU = 0.3            # an unknown id overlapping a committed box this much is a known bag
+COVER_CHANGE_SHARE = 0.35     # an overlapping box whose pixels changed this much is a bag on top
 GROWTH = 1.35                  # a known box grown this much can hold a touching new bag
 # Stereo depth error grows with distance squared (D435 RMS roughly 2-3 mm x z^2 per metre^2); a
 # per-frame comparison at 3 m is otherwise dominated by noise. Depth changes are judged against
@@ -228,11 +229,15 @@ class CameraWatcher:
         value, n = votes.most_common(1)[0]
         return value if n >= (3 if kind == "material" else 1) and n >= 0.6 * sum(votes.values()) else fallback
 
-    def _known(self, track: TrackInfo) -> bool:
+    def _known(self, track: TrackInfo, changed_share: float | None = None) -> bool:
         if track.track_id in self.known_ids:
             return True
         boxes = [] if self.committed is None else [t.box for t in self.committed.tracks]
         if any(_iou(track.box, b) >= ID_SWITCH_IOU for b in boxes):
+            if changed_share is not None and changed_share >= COVER_CHANGE_SHARE:
+                # V53: in a bin a new bag lands ON an old one, so its box overlaps the old box. An ID
+                # switch leaves the pixels unchanged; a bag on top changes most of them. Not marked known.
+                return False
             self.known_ids.add(track.track_id)           # ID switch / re-detection of a known bag
             return True
         return False
@@ -437,7 +442,7 @@ class CameraWatcher:
             m = _box_mask(box, change.shape) & region
             return float(np.count_nonzero(change & m)) / max(1, int(np.count_nonzero(m)))
 
-        new_tracks = [t for t in ev.tracks if bag_like(t.label) and not self._known(t)]
+        new_tracks = [t for t in ev.tracks if bag_like(t.label) and not self._known(t, changed_share(t.box))]
         for t in sorted(new_tracks, key=lambda t: -changed_share(t.box)):
             if changed_share(t.box) >= 0.10:
                 added = _box_mask(t.box, change.shape) & change
