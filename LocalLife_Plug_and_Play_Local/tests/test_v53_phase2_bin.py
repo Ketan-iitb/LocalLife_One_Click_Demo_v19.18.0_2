@@ -149,5 +149,54 @@ class SessionGuardTests(unittest.TestCase):
             self.assertTrue(json.loads(first.state_path.read_text(encoding="utf-8")).get("saved_at"))
 
 
+class Phase2ScreenshotTests(unittest.TestCase):
+    """Second Phase 2 run: RealSense fill 45 % / Logitech 76 % for a ~20 % bin; bag #5 (3-5 L) read 5.8 L
+    (RealSense) and 0.5 L (Logitech); a pink bag read grey / white + yellow."""
+
+    def test_unspecified_distance_on_a_tilted_mount_is_along_the_view(self) -> None:
+        tilted = _profile(camera_to_empty_floor_m=1.10, distance_kind="unknown", tilt_from_vertical_deg=43.7)
+        self.assertAlmostEqual(tilted.vertical_height_m(), 1.10 * math.cos(math.radians(43.7)), places=6)
+        level = _profile(camera_to_empty_floor_m=1.10, distance_kind="unknown", tilt_from_vertical_deg=5.0)
+        self.assertEqual(level.vertical_height_m(), 1.10)
+        stated = _profile(camera_to_empty_floor_m=1.10, distance_kind="vertical", tilt_from_vertical_deg=43.7)
+        self.assertEqual(stated.vertical_height_m(), 1.10)
+
+    def test_logitech_volume_and_fill_are_referenced_to_realsense(self) -> None:
+        from locallife_cloud.cross_camera import CrossCameraReference
+        with TemporaryDirectory() as d:
+            ref = CrossCameraReference(Path(d))
+            events = [{"camera": "realsense", "envelope_l": 5.8, "deposit_time": 100.0}]
+            row = {"camera": "logitech", "envelope_l": 0.5, "deposit_time": 104.0, "volume_method": "deformable"}
+            ref.on_logitech_event(row, events)
+            self.assertAlmostEqual(row["envelope_l"], 5.8, places=2)
+            self.assertEqual(row["logitech_monocular_envelope_l"], 0.5)
+            later = {"camera": "logitech", "envelope_l": 0.3, "deposit_time": 500.0}     # Logitech only
+            ref.on_logitech_event(later, events)
+            self.assertAlmostEqual(later["envelope_l"], 0.3 * 11.6, places=2)
+            rs = {"status": "ok", "max_fill_height_cm": 20.0}
+            lg = {"status": "ok", "max_fill_height_cm": 76.4, "usable_height_cm": 100.0, "capacity_l": 660.0,
+                  "height_fill_pct": 76.4, "tallest_cm": 82.7}
+            for t in range(3):
+                out = ref.reference_fill(rs, lg, now=100.0 + 20 * t)
+            self.assertAlmostEqual(out["height_fill_pct"], 20.0, places=1)
+            self.assertEqual(out["monocular_raw"]["height_fill_pct"], 76.4)
+            self.assertEqual(CrossCameraReference(Path(d)).volume, ref.volume)          # persisted
+
+    def test_pink_bag_is_pink_not_grey_red_or_white(self) -> None:
+        from locallife_cloud.colour_evidence import describe_colour
+        for name, bgr, expected in (("realsense pink bag", (75, 82, 112), "pink"),
+                                    ("logitech pink knot", (94, 114, 177), "pink"),
+                                    ("pale pink", (200, 190, 240), "pink"),
+                                    ("orange", (0, 120, 245), "orange"), ("red", (30, 30, 200), "red"),
+                                    ("purple", (150, 60, 130), "purple"), ("cardboard", (105, 150, 190), "brown")):
+            frame = np.full((120, 160, 3), 110, np.uint8)
+            frame[0:6, 0:6] = 235
+            mask = np.zeros((120, 160), bool)
+            mask[30:90, 40:120] = True
+            frame[mask] = bgr
+            with self.subTest(name=name):
+                self.assertEqual(describe_colour(frame, mask).colour, expected)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -138,6 +138,9 @@ def _illumination_gains(frame_bgr: np.ndarray, background_bgr: np.ndarray, mask:
 # "orange". Constants are colour-naming definitions, not fitted to any test image.
 BROWN_MAX_SATURATION = 0.60
 BROWN_MAX_VALUE = 0.55
+PINK_FROM = ("red", "orange", "brown", "white", "grey", "yellow")
+PINK_MIN_A, PINK_A_OVER_B, PINK_MIN_B = 8.0, 0.8, -6.0   # Lab a* (red-green) vs b* (yellow-blue); purple is b* < 0
+PINK_MAX_SATURATION, PINK_MIN_VALUE = 0.62, 0.30   # saturated red stays red; very dark stays dark
 
 
 SAME_SURFACE_MIN_CORRELATION = 0.80
@@ -177,6 +180,20 @@ def _categorise_object(pixels: np.ndarray, frame_bgr: np.ndarray,
     to_brown = ((codes == orange) & ((saturation < BROWN_MAX_SATURATION) | (value < BROWN_MAX_VALUE))) \
         | ((codes == yellow) & (value < BROWN_MAX_VALUE))
     codes = np.where(to_brown, brown, codes)
+    # V53: pink is a light, desaturated red -- in Lab, red-green a* at least comparable to yellow-blue b*.
+    # Hue bands alone called pale pink bags red/orange (warm light), or white/yellow once desaturated.
+    if relative.size:
+        try:
+            import cv2
+            lab = cv2.cvtColor(np.clip(relative * 255.0, 0, 255).astype(np.uint8).reshape(-1, 1, 3),
+                               cv2.COLOR_BGR2LAB)[:, 0, :].astype(np.float32) - np.float32([0, 128, 128])
+            a_star, b_star = lab[:, 1], lab[:, 2]
+            candidates = np.isin(codes, [_CATEGORIES.index(n) for n in PINK_FROM])
+            pink = candidates & (a_star >= PINK_MIN_A) & (a_star >= PINK_A_OVER_B * b_star) & (b_star >= PINK_MIN_B) \
+                & (saturation < PINK_MAX_SATURATION) & (value >= PINK_MIN_VALUE)
+            codes = np.where(pink, _CATEGORIES.index("pink"), codes)
+        except ImportError:  # pragma: no cover
+            pass
     return codes, value
 
 

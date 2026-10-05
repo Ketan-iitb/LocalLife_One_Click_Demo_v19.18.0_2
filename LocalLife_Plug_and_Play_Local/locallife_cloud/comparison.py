@@ -22,6 +22,7 @@ from .config import AppConfig
 from .geometry import fixed_bin_mask, is_phantom_source
 from .inference import MetricDepthEstimator, create_segmenter
 from .ledger import waste_object_type
+from .cross_camera import CrossCameraReference, enabled as cross_enabled
 from .session_deposits import SessionDeposits
 from .paired_events import PairedComparisonLog
 from .pipeline import VisionPipeline, filter_waste_detections
@@ -197,7 +198,10 @@ class DualCameraCoordinator:
         # v45: one session-wide count of NEW bags, shared by both cameras so a
         # bag seen by both counts once.
         self.deposits = SessionDeposits(config.results_dir / "session")
-        self.deposits.fill_lookup = lambda camera: dict(self.pipelines[camera].fill.reading)
+        # V53 Phase 2: Logitech monocular readings referenced to the RealSense on the same bin.
+        self.cross_reference = CrossCameraReference(config.results_dir / "session") if cross_enabled() else None
+        self.deposits.cross_reference = self.cross_reference
+        self.deposits.fill_lookup = self._fill_reading
         self.attach_deposit_listeners()
         # Each station knows the other's geometry only so it can refuse to
         # measure with it (coordinates.frame_consistency).
@@ -259,8 +263,14 @@ class DualCameraCoordinator:
             pipeline.deposit_listener = self.deposits.attach_occupancy
             pipeline.frame_listener = self.deposits.observe
 
+    def _fill_reading(self, camera: str) -> dict[str, Any]:
+        reading = dict(self.pipelines[camera].fill.reading)
+        if camera == "logitech" and self.cross_reference is not None and "realsense" in self.pipelines:
+            reading = self.cross_reference.reference_fill(dict(self.pipelines["realsense"].fill.reading), reading)
+        return reading
+
     def bin_fill(self) -> dict[str, Any]:
-        return {"cameras": {camera: {**pipeline.fill.reading,
+        return {"cameras": {camera: {**self._fill_reading(camera),
                                      "profile": {k: v for k, v in vars(pipeline.fill.profile).items()
                                                  if k != "pose_edges"},
                                      "profile_blocking": pipeline.fill.profile.blocking(),

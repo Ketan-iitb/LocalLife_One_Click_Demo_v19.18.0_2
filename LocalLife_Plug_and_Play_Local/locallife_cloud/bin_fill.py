@@ -57,6 +57,8 @@ DEFAULT_USABLE_HEIGHT_M = 1.00
 DEFAULT_ABOVE_RIM_M = 0.10
 
 
+ASSUME_AXIS_TILT_DEG = 10.0     # below this the two readings differ by < 1.5 %
+
 @dataclass
 class FillProfile:
     camera_id: str
@@ -85,7 +87,9 @@ class FillProfile:
         if self.tilt_from_vertical_deg is None:
             items.append("tilt not measured: camera assumed to look straight down")
         if self.distance_kind not in ("vertical", "optical_axis"):
-            items.append("floor distance assumed vertical (not stated whether vertical or along the line of sight)")
+            tilted = (self.tilt_from_vertical_deg or 0.0) >= ASSUME_AXIS_TILT_DEG
+            items.append(f"floor distance assumed {'along the camera view (tilted mount)' if tilted else 'vertical'}"
+                         " (not stated whether vertical or along the line of sight)")
         if not self.capacity_verified:
             items.append("capacity: nominal 660 L, not checked on the bin label")
         return items
@@ -114,7 +118,13 @@ class FillProfile:
         """Vertical optical-centre height; unknown tilt/kind -> the approximate straight-down reading."""
         if self.camera_to_empty_floor_m is None:
             return None
-        if self.distance_kind == "optical_axis" and self.tilt_from_vertical_deg is not None:
+        if self.tilt_from_vertical_deg is not None and (
+                self.distance_kind == "optical_axis"
+                or (self.distance_kind not in ("vertical", "optical_axis")
+                    and self.tilt_from_vertical_deg >= ASSUME_AXIS_TILT_DEG)):
+            # V53: on a TILTED mount an unspecified distance is taken along the camera's view (the
+            # distance a tape from the camera to the floor actually measures). Reading it as vertical put
+            # the Phase 2 floor 30 cm too deep (110 cm at 43.7 deg; fill 45 % for a ~20 % bin).
             return self.camera_to_empty_floor_m * math.cos(math.radians(self.tilt_from_vertical_deg))
         return self.camera_to_empty_floor_m
 

@@ -505,6 +505,7 @@ class SessionDeposits:
         self.state_path = self.directory / "session_state.json"
         self._lock = threading.RLock()
         self.watchers: dict[str, CameraWatcher] = {}
+        self.cross_reference: Any = None    # V53 Phase 2: cross_camera.CrossCameraReference
         self.fill_lookup: Callable[[str], dict[str, Any]] | None = None   # camera -> its current fill reading
         self.fill_history: dict[str, list[tuple[float, float, float]]] = {}  # camera -> (valid at, litres, %)
         self._awaiting_after: list[dict[str, Any]] = []
@@ -914,6 +915,11 @@ class SessionDeposits:
     def _write_csv(self, record: dict[str, Any]) -> None:
         if record["event_id"] in self.written:
             return
+        if record.get("counted") and record.get("camera") == "logitech" and self.cross_reference is not None:
+            try:
+                self.cross_reference.on_logitech_event(record, self.events)
+            except Exception:  # noqa: BLE001 - a reference is advisory; the raw row is still written
+                LOGGER.exception("cross-camera reference failed")
         if record.get("counted"):
             apply_to_event(record)
         try:
