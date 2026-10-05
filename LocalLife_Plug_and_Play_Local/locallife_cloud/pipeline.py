@@ -100,7 +100,7 @@ from .logitech_metric import (CALIBRATION_SET, EVALUATION_SET, RECOMMENDED_SAMPL
                               integrate_volume_l, robust_height_cm, stable_statistics,
                               zone_signature)
 from .measurement_zone import MeasurementZone, MeasurementZoneStore
-from .bin_fill import FillEstimator, default_profile, deformable_label, height_map
+from .bin_fill import FillEstimator, default_profile, deformable_label, height_map, phase_suffix, setup_phase
 from .recognition import object_name, visible_material
 from .mask_leak import trim_mask_leak
 from .session_deposits import FrameEvidence, TrackInfo
@@ -615,6 +615,11 @@ def _zone_limits_m(zone: Any) -> tuple[float, float] | None:
         return (float(width), float(depth))
     return None
 
+
+# V53: a live-fitted support plane further than this from the camera's measured tilt (or, without a
+# measured tilt, steeper than the max) is a wall/slope, not the floor an object stands on.
+SUPPORT_PLANE_TILT_TOLERANCE_DEG = 25.0
+SUPPORT_PLANE_MAX_TILT_DEG = 75.0
 
 class VisionPipeline:
     def __init__(
@@ -1334,6 +1339,33 @@ class VisionPipeline:
                 peer_box_present,
             )
 
+    def _bin_floor_plane(self):
+        """The fill estimator's fitted empty-bin floor as a ReferencePlane (RealSense metres only)."""
+        profile = getattr(getattr(self, "fill", None), "profile", None)
+        coeffs = getattr(profile, "floor_plane", None)
+        if coeffs is None or abs(float(getattr(profile, "floor_scale", 1.0) or 1.0) - 1.0) > 1e-6:
+            return None
+        a, b, c = (float(v) for v in coeffs)
+        norm = math.sqrt(a * a + b * b + 1.0)
+        return ReferencePlane(tilt_degrees=math.degrees(math.atan(math.hypot(a, b))), residual_rmse_m=0.0,
+                              inlier_pixels=0, normal=(a / norm, b / norm, -1.0 / norm), coefficients=(a, b, c))
+
+    def _implausible_support_plane(self, plane) -> str | None:
+        """V53: a plane fitted to the live background is the support only if it faces the camera like a
+        floor. In a full bin the largest flat background is the bin WALL: on the real Phase 2 rig it
+        fitted at 82 deg to the optical axis and every object then 'stood' 30-55 cm tall (a can 31.8 cm,
+        a bag 70 L). Judged against the measured camera tilt when the bin profile has one."""
+        if plane is None or plane.coefficients is None:
+            return None
+        tilt = float(plane.tilt_degrees)
+        profile_tilt = getattr(getattr(getattr(self, "fill", None), "profile", None), "tilt_from_vertical_deg", None)
+        if profile_tilt is not None and abs(tilt - float(profile_tilt)) > SUPPORT_PLANE_TILT_TOLERANCE_DEG:
+            return (f"it is {tilt:.0f} deg from the optical axis but the camera tilt is {float(profile_tilt):.0f} deg "
+                    "(a wall or a slope, not the floor)")
+        if profile_tilt is None and tilt > SUPPORT_PLANE_MAX_TILT_DEG:
+            return f"it is {tilt:.0f} deg from the optical axis (a wall, not a floor)"
+        return None
+
     def _apply_box_cuboid(self, detection: Detection, cuboid: BoxVolumeMeasurement, warnings: list[str]) -> None:
         """Write one `BoxVolumeMeasurement` (single-frame or track-aggregated
         -- see `aggregate_box_measurements`) onto `detection`, including
@@ -1780,7 +1812,15 @@ class VisionPipeline:
                 object_mask=object_mask,
                 region_mask=bin_region,
             )
-            if reference_plane_is_usable(live_plane):
+            if self.reference_realsense is None:
+                # A live plane is valid for THIS frame only: never measure against one fitted earlier.
+                measurement_plane = None
+            wall_reason = self._implausible_support_plane(live_plane)
+            if live_plane is not None and wall_reason:
+                warnings.append(f"Rejected the live support plane: {wall_reason}; capture an empty-bin "
+                                "baseline or enter the camera tilt (Phase 2 bin profile)")
+                self.stage_counters["live_plane_rejected_as_wall"] += 1
+            elif reference_plane_is_usable(live_plane):
                 # Use this one plane consistently for height, footprint and
                 # synthetic reference depth in the current measurement.  The
                 # old path kept the first live plane for height while creating
@@ -1805,6 +1845,16 @@ class VisionPipeline:
                     f"({live_plane.residual_rmse_m * 1000.0:.1f} mm RMSE); "
                     "capture a genuinely empty-scene baseline before trusting dimensions"
                 )
+            floor = self._bin_floor_plane() if self.reference_realsense is None else None
+            if floor is not None and (measurement_plane is None
+                                      or self.support_plane_source == "live-frame-background"):
+                # Phase 2: heights above the fitted bin floor, never the wall or the top of the bag pile.
+                measurement_plane = floor
+                self.support_plane_source = "phase2-bin-floor"
+                synthetic = synthesize_plane_depth(depth_m.shape, intrinsics, floor.coefficients)
+                if synthetic is not None:
+                    effective_reference = synthetic
+                    warnings.append("Measured against the fitted bin floor (no empty-bin baseline captured)")
         # `hardware_total`/`monocular_total` (the per-camera aggregate liters
         # figure rendered as the dashboard's "CURRENT VOLUME" metric, and --
         # before the fix above -- also `calibrate_known_volume()`'s implicit
@@ -4013,7 +4063,7 @@ class VisionPipeline:
                     self.config.logitech_reference_distance_m = distance
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 LOGGER.warning("Could not restore Logitech reference-distance calibration: %s", exc)
-        location = self.config.results_dir / "calibration" / "volume.json"
+        location = self.config.results_dir / "calibration" / f"volume{phase_suffix()}.json"
         if not location.is_file():
             return
         try:
@@ -4087,7 +4137,8 @@ class VisionPipeline:
                 "calibrated_at": time.time(),
                 "warning": "Validate accuracy using separate objects not used to fit this factor.",
             }
-            self.store.save_json("calibration/volume.json", record)
+            record["setup_phase"] = setup_phase() or "phase1 (default files)"
+            self.store.save_json(f"calibration/volume{phase_suffix()}.json", record)
             # The factor changed, so litres measured under the old one are
             # stale and their history goes.
             self._volume_history.clear()

@@ -70,6 +70,9 @@ BAG_WORDS = {"bag", "sack", "pillow", "cushion", "textile", "fabric", "garbage",
              "rubbish", "liner", "parcel", "package", "packet", "box", "carton", "blanket", "clothing", "bin"}
 NOT_BAG_WORDS = {"person", "hand", "arm", "finger", "human", "head", "face", "leg", "foot"}
 
+MAX_RISE_MARGIN_CM = 20.0
+RESUME_MAX_GAP_S = float(os.environ.get("LOCALLIFE_SESSION_RESUME_MAX_GAP_S", "7200"))
+MAX_DELTA_OCCUPANCY_L = 120.0     # larger than any single bag deposit into a 660 L bin
 ENVELOPE_LABEL = "new-bag outer envelope (visible L x W x added height box)"
 DELTA_LABEL = "net before/after change in bin occupancy (whole-bin surface, separate method)"
 
@@ -184,6 +187,7 @@ class CameraWatcher:
     def __init__(self, camera: str, started_at: float) -> None:
         self.camera = camera
         self.started_at = started_at
+        self.max_rise_m: float | None = None      # set by SessionDeposits from the bin's usable height
         self.state = "initialising"
         self.reason: str | None = "waiting for a stable start-up view"
         self.prev_grey: np.ndarray | None = None
@@ -466,6 +470,12 @@ class CameraWatcher:
                     return "rejected", {**details, "reason": "change without a local surface rise where depth "
                                                              "is valid (lighting, shadow or an item shifted)"}
                 rest = risen
+                # V53: a "rise" taller than the bin is something between camera and bin (lid, hand,
+                # person), not a deposit; such events counted as bags and read 219-355 cm tall.
+                if (self.max_rise_m is not None and np.count_nonzero(risen)
+                        and float(np.median(rise[risen])) > self.max_rise_m):
+                    return "rejected", {**details, "reason": "occlusion: the depth rise is taller than the bin "
+                                                             "(lid, hand or person in the line of sight)"}
             else:
                 depth_note = ", depth too sparse there to check the rise"
         try:
@@ -523,6 +533,14 @@ class SessionDeposits:
     def _resume(self) -> bool:
         try:
             data = json.loads(self.state_path.read_text(encoding="utf-8"))
+            # V53: resume a session only after a short interruption (a restart). A session saved many
+            # hours ago belongs to another test: on the bin rig, yesterday's room tests (backpack,
+            # headphones) were still counted as "new bags" the next day.
+            last_activity = float(data.get("saved_at") or 0.0) or self.state_path.stat().st_mtime
+            if self.clock() - last_activity > RESUME_MAX_GAP_S:
+                LOGGER.info("deposit session %s not resumed: last activity %.1f h ago", data.get("session_id"),
+                            (self.clock() - last_activity) / 3600.0)
+                return False
             self.session_id, self.session_started_at = data["session_id"], float(data["session_started_at"])
             self.events, self.rejected = list(data["events"]), list(data.get("rejected", []))
             # Records saved by an earlier version lack newer fields: fill them, never crash the panel.
@@ -560,7 +578,8 @@ class SessionDeposits:
             tmp.write_text(json.dumps({
                 "session_id": self.session_id, "session_started_at": self.session_started_at,
                 "events": self.events, "rejected": self.rejected[-200:], "written": sorted(self.written),
-                "last_confirmed_at": self.last_confirmed_at}, default=str), encoding="utf-8")
+                "last_confirmed_at": self.last_confirmed_at, "saved_at": self.clock()}, default=str),
+                encoding="utf-8")
             os.replace(tmp, self.state_path)
         except OSError:
             LOGGER.exception("could not persist the deposit session")
@@ -583,6 +602,7 @@ class SessionDeposits:
                 # The warm-up starts at this camera's first frame (cameras may connect late,
                 # and a resumed session re-takes its baseline: track ids do not survive a restart).
                 watcher = self.watchers[ev.camera] = CameraWatcher(ev.camera, ev.timestamp)
+            watcher.max_rise_m = self._max_rise_cm(ev.camera) / 100.0
             outcome = watcher.observe(ev)
             if watcher.pending:
                 self._late_sizes(ev, watcher)
@@ -791,6 +811,16 @@ class SessionDeposits:
             reasons.append("no reliable before/after surface under the bag (hidden, occluded or no depth)")
         if volume is None and track is not None and track.support_volume_l:
             volume = float(track.support_volume_l)          # surface-map integral, median over the track
+        # V53 plausibility: nothing deposited can stand higher than the bin's usable height (+ rim).
+        # A depth "rise" along the line of sight of 2-3.5 m came from a hand, a person or the lid
+        # between camera and bin (live Phase 2 ledger: 219.8, 316.6, 355.4 cm). Reported, not clipped.
+        limit_cm = self._max_rise_cm(ev.camera)
+        if height is not None and height > limit_cm:
+            reasons.append(f"implausible {height:.0f} cm rise (> {limit_cm:.0f} cm bin height): an occlusion "
+                           "between camera and bin, not waste")
+            height, source = None, None
+            if volume is not None and coherent is None:
+                volume = None
         envelope = volume if volume is not None else (
             round(length * width * height / 1000.0, 1) if length and width and height else None)
         if envelope is None:
@@ -833,6 +863,16 @@ class SessionDeposits:
                                      "changed_fraction": details.get("changed_fraction")}},
         }
 
+    def _max_rise_cm(self, camera: str) -> float:
+        reading = {}
+        if self.fill_lookup is not None:
+            try:
+                reading = self.fill_lookup(camera) or {}
+            except Exception:  # noqa: BLE001 - lookup is advisory
+                reading = {}
+        usable = reading.get("usable_height_cm") or 100.0
+        return float(usable) + MAX_RISE_MARGIN_CM
+
     def attach_occupancy(self, camera: str, event: Any, extra: dict[str, Any] | None = None) -> None:
         """A whole-bin before/after occupancy event is EVIDENCE only; it never counts on its own."""
         with self._lock:
@@ -841,7 +881,19 @@ class SessionDeposits:
             if event.started_at < self.session_started_at:
                 return                                   # an occupancy event from before the reset
             if near and event.delta_occupancy_l is not None:
-                near[-1]["delta_occupancy_l"] = event.delta_occupancy_l
+                delta = float(event.delta_occupancy_l)
+                record = near[-1]
+                # V53: a deposit cannot change the bin by more than a large item; Logitech before/after
+                # frames with a different monocular scale gave -542 L and +440 L. A decrease is existing
+                # waste moving, compressing or leaving -- never a negative bag volume.
+                if abs(delta) > MAX_DELTA_OCCUPANCY_L:
+                    record["delta_occupancy_note"] = (f"rejected {delta:+.0f} L: before/after surfaces inconsistent "
+                                                      "(depth scale changed or the view was blocked)")
+                else:
+                    record["delta_occupancy_l"] = round(delta, 3)
+                    if delta < 0:
+                        record["delta_occupancy_note"] = ("occupancy decreased: existing waste moved, compressed or "
+                                                          "was removed; not a bag volume")
                 self._save()
 
     # ----------------------------------------------------------------- csv

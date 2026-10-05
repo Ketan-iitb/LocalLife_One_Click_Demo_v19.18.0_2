@@ -266,7 +266,7 @@ class FillEstimator:
 
     def __init__(self, camera_id: str, directory: Path, default: FillProfile | None = None) -> None:
         self.camera_id = camera_id
-        self.path = Path(directory) / f"fill_{camera_id}.json"
+        self.path = Path(directory) / f"fill_{camera_id}{phase_suffix()}.json"
         self.last_processed_at: float | None = None
         self.last_valid_at: float | None = None
         self.default = default or FillProfile(camera_id=camera_id)
@@ -316,6 +316,7 @@ class FillEstimator:
 
     def _decorate(self, reading: dict[str, Any]) -> dict[str, Any]:
         reading["diagnostics"] = dict(getattr(self, "last_diag", {}) or {})
+        reading["setup_phase"] = setup_phase() or "phase1 (default files)"
         reading.update(profile_status=self.profile.status, profile_source=self.profile.source,
                        assumptions=self.profile.assumptions(), last_processed_at=self.last_processed_at,
                        last_valid_at=self.last_valid_at)
@@ -501,18 +502,37 @@ class FillEstimator:
         if automatic and known and distance < 0.97 * known:
             # Waste is always closer than the floor: a shallower "floor" is the top of the pile.
             return {"ok": False, "reason": "a deeper floor is already known (pile top is not the floor)"}
+        a_fit, b_fit, _ = plane
+        cos_tilt = 1.0 / math.sqrt(1.0 + a_fit * a_fit + b_fit * b_fit)
         if self.camera_id == "logitech":
             if automatic and share < (0.35 if self.profile.floor_plane is not None else 0.20):
                 return {"ok": False, "reason": "floor not clearly visible yet (automatic fit needs an open floor)"}
-            scale = reference / distance
+            # V53: the reference is a camera-to-floor distance; the plane distance is PERPENDICULAR. Measured
+            # along the camera's line of sight on a tilted mount, the perpendicular distance is r cos(tilt);
+            # scaling the model so the perpendicular distance equals r inflated every height by 1/cos(tilt).
+            target = reference * cos_tilt if self.profile.distance_kind == "optical_axis" else reference
+            scale = target / distance
         else:
-            if automatic and abs(distance - reference) > 0.12:
-                # A waste layer is flat too: unattended, only a surface at the floor reference is the floor.
-                return {"ok": False, "reason": f"deepest flat surface at {distance * 100:.0f} cm, not the "
+            # V53: RealSense depth is metric, so the fitted plane MEASURES the floor. Accept it when it agrees
+            # with the reference either as a vertical distance or as a distance along the optical axis
+            # (perpendicular = r cos(tilt)). Requiring only the first rejected the real floor of a tilted
+            # bin rig forever (perpendicular ~80-95 cm vs 110 cm) and the fill fell back to "110 cm straight
+            # down", reading every surface 15-30 cm too high.
+            vertical_ok = abs(distance - reference) <= 0.12
+            axis_ok = abs(distance / cos_tilt - reference) <= 0.12
+            if automatic and not (vertical_ok or axis_ok):
+                return {"ok": False, "reason": f"deepest flat surface at {distance * 100:.0f} cm "
+                                               f"({distance / cos_tilt * 100:.0f} cm along the view), not the "
                                                f"{reference * 100:.0f} cm floor"}
-            if not 0.80 <= distance <= 1.40:
+            near = min(abs(distance - reference), abs(distance / cos_tilt - reference))
+            if not 0.50 <= distance <= 1.60 or near > 0.30:
                 return {"ok": False, "reason": f"deepest flat surface is {distance * 100:.0f} cm away, not near the "
                                                f"{reference * 100:.0f} cm floor -- floor hidden by waste?"}
+            if self.profile.distance_kind not in ("vertical", "optical_axis"):
+                if axis_ok and not vertical_ok:
+                    self.profile.distance_kind = "optical_axis"
+                elif vertical_ok and not axis_ok:
+                    self.profile.distance_kind = "vertical"
             scale = 1.0
         self.profile.floor_plane = [float(v) for v in plane]
         self.profile.floor_scale = float(scale)
@@ -867,6 +887,18 @@ def fit_floor_plane(depth_m: np.ndarray, intrinsics: Any, region: np.ndarray | N
     coef, *_ = np.linalg.lstsq(np.c_[x[inliers], y[inliers], np.ones(int(inliers.sum()))], z[inliers], rcond=None)
     a, b, c = (float(v) for v in coef)
     return (a, b, c), abs(c) / math.sqrt(a * a + b * b + 1.0), share
+
+
+def setup_phase() -> str:
+    """V53: which installation the calibration belongs to. Unset = the original (Phase 1) files,
+    unchanged. LOCALLIFE_SETUP_PHASE=phase2 keeps a separate bin profile and volume factor for the
+    bin rig, so neither setup's calibration leaks into the other."""
+    return "".join(c for c in os.environ.get("LOCALLIFE_SETUP_PHASE", "").strip().lower() if c.isalnum())
+
+
+def phase_suffix() -> str:
+    phase = setup_phase()
+    return f"_{phase}" if phase else ""
 
 
 def surface_maps(depth_m: np.ndarray, intrinsics: Any, profile: FillProfile, plane, scale: float = 1.0):
