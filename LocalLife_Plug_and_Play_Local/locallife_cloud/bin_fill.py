@@ -1171,11 +1171,31 @@ def _oriented_box(surface: dict[str, Any], cells: np.ndarray, support: float | N
     a2 /= np.linalg.norm(a2)
     a3 = np.cross(a1, a2)
     face_pts = pts[on_faces]
-    ext = [float(np.percentile(face_pts @ ax, 99.5) - np.percentile(face_pts @ ax, 0.5)) for ax in (a1, a2, a3)]
+    axes3 = (a1, a2, a3)
+
+    def extent(ax) -> float:
+        # Along `ax`: the faces that RUN along it give its span; a face whose normal IS `ax` is the box's
+        # boundary there, located by its plane's median position. Its points' percentile spread is only
+        # depth noise: with 3 mm stereo noise that pushed every extent outward (+6-8 % volume on a
+        # synthetic 10 x 12.5 x 25 cm box seen at 45 deg).
+        span = [m for n, m in zip(normals, members) if abs(float(n @ ax)) < 0.5]
+        values = (pts[np.concatenate(span)] if span else face_pts) @ ax
+        lo, hi = float(np.percentile(values, 0.5)), float(np.percentile(values, 99.5))
+        for n, m in zip(normals, members):
+            if abs(float(n @ ax)) > 0.9:
+                plane = float(np.median(pts[m] @ ax))
+                lo, hi = min(lo, plane), max(hi, plane)
+        return hi - lo
+
+    ext = [extent(ax) for ax in axes3]
     up = np.asarray(surface.get("up", a3), dtype=np.float64)
-    vertical = int(np.argmax([abs(float(ax @ up)) for ax in (a1, a2, a3)]))
-    if abs(float((a1, a2, a3)[vertical] @ up)) > 0.9:
-        ext[vertical] = float(np.percentile(rise[on_faces], 99.5))   # stands on the support: top above it
+    vertical = int(np.argmax([abs(float(ax @ up)) for ax in axes3]))
+    if abs(float(axes3[vertical] @ up)) > 0.9:
+        # Stands on the support: H = its top above it. The top face's MEDIAN rise, when the top face is
+        # seen; the 99.5th percentile of all rises otherwise (noise on the top only adds to that one).
+        top = [m for n, m in zip(normals, members) if abs(float(n @ up)) > 0.9]
+        top_rise = rise[np.concatenate(top)] if top else np.empty(0)
+        ext[vertical] = float(np.median(top_rise)) if top_rise.size >= 25 else float(np.percentile(rise[on_faces], 99.5))
     if min(ext) < 0.02 or max(ext) > 1.5:
         return None
     flat = sorted((e for i, e in enumerate(ext) if i != vertical), reverse=True)

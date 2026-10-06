@@ -616,6 +616,28 @@ def _zone_limits_m(zone: Any) -> tuple[float, float] | None:
     return None
 
 
+GEOMETRY_CHANGE_RATIO = 0.25    # a sorted dimension or the height changing this much is a new geometry
+
+
+def _same_geometry(previous: tuple, current: tuple) -> bool:
+    """Whether two support samples (t, litres, height_m, length_m, width_m, method) describe the same
+    pose of the same object: same method family, height and sorted dimensions within 25 %."""
+    def family(method: str) -> str:
+        return "cuboid" if str(method).startswith("box ") else "surface"
+
+    def close(a, b) -> bool:
+        if a is None or b is None:
+            return a is None and b is None
+        a, b = float(a), float(b)
+        return abs(a - b) <= GEOMETRY_CHANGE_RATIO * max(abs(a), abs(b), 1e-6)
+
+    if family(previous[5]) != family(current[5]) or not close(previous[2], current[2]):
+        return False
+    dims_prev = sorted(float(v) for v in (previous[2], previous[3], previous[4]) if v is not None)
+    dims_now = sorted(float(v) for v in (current[2], current[3], current[4]) if v is not None)
+    return len(dims_prev) == len(dims_now) and all(close(a, b) for a, b in zip(dims_prev, dims_now))
+
+
 class VisionPipeline:
     def __init__(
         self,
@@ -3258,6 +3280,11 @@ class VisionPipeline:
                     # median-volume frame): separate medians of L, W, H and V do not belong together.
                     history = self.__dict__.setdefault("_provisional_history", {})
                     samples = [v for v in history.get(item.track_id, []) if sample[0] - v[0] <= 15.0][-7:]
+                    if samples and not _same_geometry(samples[-1], sample):
+                        # The object was turned or replaced (an upright box laid on its side): the
+                        # earlier geometry no longer describes it, so it must not win the median.
+                        samples = []
+                        self.stage_counters["support_history_reset_on_geometry_change"] += 1
                     samples.append(sample)
                     history[item.track_id] = samples
                     if len(history) > 300:
@@ -3274,7 +3301,17 @@ class VisionPipeline:
                     resolver.set_size(item.track_id, item.support_length_cm, item.support_height_cm)
                 item.support_method = method if method.startswith(("box ", "deformable")) or "slab" in method else \
                     "volume integrated above the local surface (not L x W x H; L x W x H is its enclosing box)"
-                if self.camera_id == "logitech" and self.support_volume_factors is not None:
+                cuboid = method.startswith("box ")
+                if self.camera_id == "logitech" and cuboid and self.logitech_depth_gain()[0] is None and (
+                        self.support_volume_factors is None or self.support_volume_factors.frozen_at is None):
+                    # Monocular depth: every face extent and the thickness come from the model's depth at
+                    # one floor scale; nothing measured has validated that scale for object sizes.
+                    item.support_method += "; LOW CONFIDENCE: monocular depth, scale not validated with known objects"
+                if self.camera_id == "logitech" and self.support_volume_factors is not None and cuboid:
+                    if self.support_volume_factors.frozen_at is not None:
+                        item.support_method += "; Logitech known-object factor not applied (cuboid: V = L x W x H)"
+                    # A volume-only factor would leave the displayed L x W x H describing another volume.
+                elif self.camera_id == "logitech" and self.support_volume_factors is not None:
                     # Monocular depth flattens relief. A factor frozen from >= 3 KNOWN objects (never
                     # RealSense values) rescales the volume; the raw value is kept beside it.
                     item.support_raw_volume_l = item.support_volume_l
