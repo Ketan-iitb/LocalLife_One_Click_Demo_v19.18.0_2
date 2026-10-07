@@ -1022,6 +1022,42 @@ def create_app(
         """
         return jsonify(ok=True, session=manager.reset_counting())
 
+    # ---- V54 volume experiment: session, empty-bin baseline, trials (raw data under results/experiment)
+    def _experiment() -> Any:
+        recorder = getattr(manager, "experiment", None)
+        if recorder is None:
+            raise RuntimeError("the volume experiment needs the dual-camera coordinator")
+        return recorder
+
+    @app.get("/api/experiment/status")
+    def experiment_status() -> Any:
+        try:
+            return jsonify(_experiment().status())
+        except RuntimeError as exc:
+            return jsonify(error=str(exc)), 409
+
+    @app.post("/api/experiment/<action>")
+    @protected
+    def experiment_action(action: str) -> Any:
+        body = request.get_json(silent=True) or {}
+        try:
+            recorder = _experiment()
+            if action == "session":
+                return jsonify(recorder.start_session(str(body.get("note", ""))))
+            if action == "baseline":
+                return jsonify(recorder.capture_baseline(tuple(body.get("cameras") or ("realsense", "logitech"))))
+            if action == "trial-start":
+                return jsonify(recorder.start_trial(
+                    object_id=str(body["object_id"]), designation=str(body["designation"]),
+                    placement=str(body.get("placement", "")), condition=str(body.get("condition", "isolated")),
+                    motion=str(body.get("motion", "settled"))))
+            if action == "trial-stop":
+                record = recorder.stop_trial()
+                return jsonify({"stopped": record is not None})
+            return jsonify(error=f"unknown experiment action {action!r}"), 404
+        except (KeyError, ValueError, RuntimeError) as exc:
+            return jsonify(error=str(exc)), 400
+
     @app.get("/api/cameras/<camera_id>/stages")
     def camera_stages(camera_id: str) -> Any:
         """Production-path counters for one camera: frames -> detections -> tracks -> history."""

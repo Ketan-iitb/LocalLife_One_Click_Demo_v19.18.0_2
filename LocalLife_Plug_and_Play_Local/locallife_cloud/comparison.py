@@ -22,6 +22,7 @@ from .config import AppConfig
 from .geometry import fixed_bin_mask, is_phantom_source
 from .inference import MetricDepthEstimator, create_segmenter
 from .ledger import waste_object_type
+from .volume_experiment import ExperimentRecorder
 from .session_deposits import SessionDeposits
 from .paired_events import PairedComparisonLog
 from .pipeline import VisionPipeline, filter_waste_detections
@@ -199,6 +200,10 @@ class DualCameraCoordinator:
         self.deposits = SessionDeposits(config.results_dir / "session")
         self.deposits.fill_lookup = lambda camera: dict(self.pipelines[camera].fill.reading)
         self.attach_deposit_listeners()
+        # V54 volume experiment: raw trial recording for both cameras (inactive until a session starts).
+        self.experiment = ExperimentRecorder(config.results_dir / "experiment")
+        for pipeline in self.pipelines.values():
+            pipeline.experiment_listener = self.experiment.observe
         # Each station knows the other's geometry only so it can refuse to
         # measure with it (coordinates.frame_consistency).
         self.pipelines["logitech"].peer_intrinsics = self.pipelines["realsense"].latest_intrinsics

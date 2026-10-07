@@ -939,6 +939,8 @@ class VisionPipeline:
         # frame_listener receives every processed frame's deposit evidence.
         self.deposit_listener: Callable[[str, Any, dict[str, Any]], None] | None = None
         self.frame_listener: Callable[[FrameEvidence], Any] | None = None
+        # V54 volume experiment (volume_experiment.ExperimentRecorder.observe), set by the coordinator.
+        self.experiment_listener: Callable[[Any], None] | None = None
         self.fill = FillEstimator(camera_id, config.results_dir / "bin_profile", default_profile(camera_id, config))
         self._last_motion: float | None = None
         # Logitech metric-depth calibration samples and fit, kept apart from
@@ -3347,6 +3349,8 @@ class VisionPipeline:
         # track's local-surface size computed just above.
         self._emit_deposit_evidence(frame, detections, depth_m, intrinsics, bin_region,
                                     fill_monocular, measure_intrinsics)
+        self._emit_experiment_frame(frame, detections, depth_m, intrinsics, predicted_depth,
+                                    measure_intrinsics, bin_region, timestamp)
         if persist:
             self.store.append_jsonl("frames.jsonl", analysis.to_dict())
             self._finalise_settled_measurements(detections, timestamp)
@@ -3732,6 +3736,40 @@ class VisionPipeline:
         if kept:
             self.stage_counters["logitech_held_through_dropout"] += len(kept)
         return kept
+
+    def _emit_experiment_frame(self, frame, detections, depth_m, intrinsics, predicted_depth,
+                               measure_intrinsics, bin_region, timestamp) -> None:
+        """V54: hand the RAW per-frame inputs of the volume experiment to its recorder. RealSense: aligned
+        hardware depth (metres). Logitech: the model's own output BEFORE any per-frame floor rescaling,
+        so the experiment's frozen calibration is the only scale applied. Masks: non-phantom detections
+        overlapping the ROI. Never raises into the pipeline."""
+        listener = self.experiment_listener
+        wants = getattr(getattr(listener, "__self__", None), "wants_frames", None)
+        if listener is None or (wants is not None and not wants()):
+            return                                   # idle recorder: no per-frame copies
+        try:
+            from .volume_experiment import FramePayload, intrinsics_dict
+            logitech = self.camera_id == "logitech"
+            depth = predicted_depth if logitech else depth_m
+            k = measure_intrinsics if logitech else intrinsics
+            if logitech and k is None:
+                k = self._field_of_view_intrinsics(frame.shape)
+            kept = [d for d in detections if d.mask is not None and not _is_phantom_detection(d)
+                    and (bin_region is None or (d.mask & bin_region).any())]
+            listener(FramePayload(
+                camera=self.camera_id, timestamp=float(timestamp), rgb=frame,
+                depth=None if depth is None else np.asarray(depth, dtype=np.float32),
+                intrinsics=intrinsics_dict(k), masks=[d.mask.astype(bool) for d in kept],
+                track_ids=[d.track_id for d in kept], labels=[d.label for d in kept], roi=bin_region,
+                meta={"depth_model": self.config.depth_model if logitech else "realsense-d435-aligned-hardware-depth",
+                      "output_kind": depth_output_kind(self.config.depth_model) if logitech else "metric",
+                      "intrinsics_source": ("provided" if intrinsics is not None else "field-of-view estimate")
+                      if logitech else "realsense-factory",
+                      "depth_units": "model output (metric checkpoint: metres)" if logitech
+                      else "metres (device depth scale applied at capture)",
+                      "distortion": "not modelled"}))
+        except Exception:  # noqa: BLE001 - the experiment recorder must never stop the pipeline
+            LOGGER.exception("%s experiment frame failed", self.camera_id)
 
     def _emit_deposit_evidence(self, frame, detections, depth_m, intrinsics, bin_region,
                                monocular=None, monocular_intrinsics=None) -> None:
