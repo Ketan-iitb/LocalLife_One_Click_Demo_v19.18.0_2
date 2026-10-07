@@ -268,6 +268,10 @@ def measure_frame(depth: np.ndarray, intrinsics: Any, mask: np.ndarray, baseline
             reasons.append("too little ROI background to align this frame to the baseline")
             return out
         ratio = float(np.median(base[background] / depth[background]))
+        if not 0.7 <= ratio <= 1.4:
+            reasons.append(f"background alignment ratio {ratio:.3f} is implausible (scene or model changed)")
+            out["background_ratio"] = round(ratio, 6)
+            return out
         depth = depth * ratio
         out["background_ratio"] = round(ratio, 6)
     P, B = deproject(depth, k), deproject(base, k)

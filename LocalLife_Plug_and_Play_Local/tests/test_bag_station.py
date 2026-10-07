@@ -392,9 +392,23 @@ class TiltCorrectedVolumeTests(unittest.TestCase):
         # own centre distance) is an accurate independent reference --
         # deliberately not derived from any of `estimate_volume()`'s own
         # formulas, so it cannot be circular.
-        pixel_count = int(np.count_nonzero(mask))
-        true_footprint_m2 = pixel_count * (1.0 ** 2) / (600.0 * 600.0)
-        true_liters = true_footprint_m2 * 0.10 * 1000.0
+        # V54: the earlier reference here was pixel_count x (1.0 m / 600)^2 -- a pixel footprint at the
+        # FLOOR's distance, i.e. the reference-plane formula's own bias (the top face is at 0.88 m and
+        # tilted 30 deg to the rays), so it was ~11 % too large. The exact reference: each mask pixel's
+        # corners intersected with the top-face plane Z = b*Y + c_top (closed form, as the fixture
+        # renders it); the slab's footprint equals its top-face area (the faces are parallel).
+        theta = np.radians(30.0)
+        b, c_top = -np.tan(theta), 1.0 - 0.10 / np.cos(theta)
+        rows, cols = np.nonzero(mask)
+        area = 0.0
+        for r, c in zip(rows, cols):
+            corners = []
+            for dr, dc in ((-0.5, -0.5), (-0.5, 0.5), (0.5, 0.5), (0.5, -0.5)):
+                xr, yr = (c + dc - 100.0) / 600.0, (r + dr - 100.0) / 600.0
+                z = c_top / (1.0 + b * yr)                # exactly as the fixture renders it
+                corners.append(np.array([xr * z, yr * z, z]))
+            area += 0.5 * np.linalg.norm(np.cross(corners[2] - corners[0], corners[3] - corners[1]))
+        true_liters = area * 0.10 * 1000.0
         naive = estimate_volume(
             depth, baseline, intrinsics, object_mask=mask, min_pixels=25,
             geometry_mode="surface-columns", fill_small_holes=False,
@@ -419,9 +433,12 @@ class TiltCorrectedVolumeTests(unittest.TestCase):
         # that `corrected` (plane-corrected height + the exact ray-frustum
         # integral) is a clear, large improvement over it, not the naive
         # error's exact sign.
-        self.assertGreater(naive_relative_error, 0.08)
-        self.assertLess(corrected_relative_error, 0.05)
-        self.assertLess(corrected_relative_error, naive_relative_error / 2)
+        # V54: both modes now integrate each pixel's own surface patch (support-plane Jacobian). The
+        # VOLUME between two surfaces does not depend on the direction heights are taken along
+        # (Cavalieri), so the plane-less reading is right too; only its reported HEIGHT is inflated
+        # by the tilt (test_naive_height_is_inflated_... covers that).
+        self.assertLess(naive_relative_error, 0.02)
+        self.assertLess(corrected_relative_error, 0.02)
 
     def test_estimate_volume_without_a_reference_plane_is_unchanged(self) -> None:
         """Backward compatibility: omitting `reference_plane` (every caller
@@ -483,7 +500,11 @@ class TiltCorrectedVolumeTests(unittest.TestCase):
         # is a constant the depth of the surface above it cannot distort.
         # Locking this in as a regression guard -- reverting the default would
         # resurrect both accuracy bugs this test class exists to catch.
-        self.assertEqual(AppConfig().volume_geometry, "height-map-grid")
+        #
+        # V54: the grid itself added whole 1 cm cells at the footprint's edge (+12 % on a 1 L box seen at
+        # 15 deg, +9.6 % on a 2 L box on end at 30 deg). Every per-pixel mode now integrates with the
+        # support-plane Jacobian (each pixel's own surface patch projected onto the floor plane).
+        self.assertEqual(AppConfig().volume_geometry, "support-plane-jacobian")
 
 
 if __name__ == "__main__":

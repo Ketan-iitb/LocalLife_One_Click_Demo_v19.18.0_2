@@ -85,6 +85,14 @@ def cmd_calibrate(args) -> int:
         v = r["cameras"][args.camera]["volume_l"]
         check.append(None if v is None else round(100 * (v - s["reference_l"]) / s["reference_l"], 3))
     calibration["fit_quality"]["replayed_residual_pct"] = check
+    if args.perpendicular_floor_distance_m:
+        # Independent check, NOT used in the fit: the baseline plane's perpendicular camera distance at the
+        # fitted scale vs a tape measurement of the same quantity (perpendicular, not along the view axis).
+        fitted = calibration["depth_scale"] * float(first["plane"]["d"])
+        calibration["fit_quality"]["floor_distance_check"] = {
+            "measured_perpendicular_m": args.perpendicular_floor_distance_m, "fitted_m": round(fitted, 4),
+            "residual_pct": round(100 * (fitted - args.perpendicular_floor_distance_m)
+                                  / args.perpendicular_floor_distance_m, 3)}
     path = root / "calibration" / f"{args.camera}.json"
     if path.exists() and not args.replace:
         print(f"{path} exists: pass --replace to supersede it (the old one is kept as history)")
@@ -191,6 +199,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--session", action="append", default=[])
     p.add_argument("--align-background", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--replace", action="store_true")
+    p.add_argument("--perpendicular-floor-distance-m", type=float,
+                   help="tape-measured PERPENDICULAR camera-to-bin-floor distance: an independent check only")
     p = sub.add_parser("evaluate")
     p.add_argument("--session", action="append", default=[])
     p.add_argument("--replay", action="store_true", help="recompute with the current frozen calibrations")

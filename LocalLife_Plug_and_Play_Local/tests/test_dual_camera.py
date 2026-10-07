@@ -76,18 +76,20 @@ class PrecisionVolumeTests(unittest.TestCase):
     def test_surface_columns_preserve_original_calibrated_geometry(self) -> None:
         result = estimate_volume(self.depth, self.baseline, self.camera)
         self.assertAlmostEqual(result.liters, 45.0, places=5)
-        self.assertEqual(result.geometry_mode, "surface-columns")
+        self.assertEqual(result.geometry_mode, "support-plane-jacobian (requested surface-columns)")
         self.assertAlmostEqual(result.raw_liters, 45.0, places=5)
 
     def test_ray_frustum_integrates_exact_pixel_frustum(self) -> None:
         result = estimate_volume(self.depth, self.baseline, self.camera, geometry_mode="ray-frustum")
-        expected = 400 * (2.0**3 - 1.5**3) / (3 * 100 * 100) * 1000
-        self.assertAlmostEqual(result.liters, expected, places=5)
-        self.assertGreater(result.liters, 45.0)
+        # V54: a flat top at 1.5 m over 20 x 20 px (f = 100) on a 2.0 m floor is 400 x (1.5/100)^2 m^2 x
+        # 0.5 m = 45 L. The ray frustum (54.17 L) also counted the top's ray shadow; every mode now
+        # integrates the support-plane Jacobian.
+        self.assertAlmostEqual(result.liters, 45.0, places=4)
 
     def test_reference_plane_geometry_uses_backplane_pixel_footprint(self) -> None:
         result = estimate_volume(self.depth, self.baseline, self.camera, geometry_mode="reference-plane")
-        self.assertAlmostEqual(result.liters, 80.0, places=5)
+        # V54: was 80 L -- the top's height times the FLOOR-distance pixel area (2.0/100)^2: +78 %.
+        self.assertAlmostEqual(result.liters, 45.0, places=4)
 
     def test_known_volume_factor_changes_value_without_hiding_raw_measurement(self) -> None:
         result = estimate_volume(self.depth, self.baseline, self.camera, calibration_factor=1.2)

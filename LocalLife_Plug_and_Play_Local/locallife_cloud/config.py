@@ -325,7 +325,9 @@ class AppConfig:
     # against a camera that has been moved, tilted or repositioned.
     camera_move_max_tilt_deg: float = 3.0
     camera_move_max_distance_m: float = 0.05
-    volume_geometry: str = "height-map-grid"
+    # V54: every per-pixel mode integrates with the support-plane Jacobian (volume.estimate_volume);
+    # the old names stay accepted. "height-map-grid-legacy" keeps the old 1 cm grid for comparisons.
+    volume_geometry: str = "support-plane-jacobian"
     # Playbook section 27 tunables. These are its own suggested starting points,
     # not validated constants -- record the final values after tuning on the
     # real camera and bin.
@@ -906,6 +908,8 @@ class AppConfig:
             "reference-plane",
             "triangulated-surface",
             "height-map-grid",
+            "height-map-grid-legacy",
+            "support-plane-jacobian",
         }:
             raise ValueError(
                 "Volume geometry must be height-map-grid, surface-columns, ray-frustum, "

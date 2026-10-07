@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import warnings
 from dataclasses import dataclass
 
@@ -503,57 +504,6 @@ def _fill_local_depth_holes(depth: np.ndarray, region: np.ndarray) -> tuple[np.n
     return depth, count
 
 
-def _triangulated_height_field(
-    height_m: np.ndarray,
-    baseline_m: np.ndarray,
-    valid: np.ndarray,
-    intrinsics: CameraIntrinsics,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Integrate a regular triangular mesh over the calibrated baseline plane.
-
-    This is the real-time image-grid equivalent of VolPy's point -> triangle ->
-    plane -> integral method. Each depth pixel contributes four calibrated 3-D
-    corner vertices; the two planar triangles exactly integrate a linearly
-    interpolated height field across that pixel footprint.
-    """
-    rows, columns = height_m.shape
-    height_sum = np.zeros((rows + 1, columns + 1), dtype=np.float64)
-    depth_sum = np.zeros_like(height_sum)
-    samples = np.zeros_like(height_sum)
-    safe_height = np.where(valid, height_m, 0.0)
-    safe_depth = np.where(valid, baseline_m, 0.0)
-    weights = valid.astype(np.float64)
-    for row_offset, column_offset in ((0, 0), (0, 1), (1, 0), (1, 1)):
-        row_slice = slice(row_offset, row_offset + rows)
-        column_slice = slice(column_offset, column_offset + columns)
-        height_sum[row_slice, column_slice] += safe_height
-        depth_sum[row_slice, column_slice] += safe_depth
-        samples[row_slice, column_slice] += weights
-    with np.errstate(divide="ignore", invalid="ignore"):
-        corner_height = np.divide(height_sum, samples, out=np.zeros_like(height_sum), where=samples > 0)
-        corner_depth = np.divide(depth_sum, samples, out=np.zeros_like(depth_sum), where=samples > 0)
-
-    vertical, horizontal = np.indices(corner_depth.shape, dtype=np.float64)
-    horizontal -= 0.5
-    vertical -= 0.5
-    corner_x = (horizontal - intrinsics.ppx) * corner_depth / intrinsics.fx
-    corner_y = (vertical - intrinsics.ppy) * corner_depth / intrinsics.fy
-
-    x_tl, y_tl, h_tl = corner_x[:-1, :-1], corner_y[:-1, :-1], corner_height[:-1, :-1]
-    x_tr, y_tr, h_tr = corner_x[:-1, 1:], corner_y[:-1, 1:], corner_height[:-1, 1:]
-    x_br, y_br, h_br = corner_x[1:, 1:], corner_y[1:, 1:], corner_height[1:, 1:]
-    x_bl, y_bl, h_bl = corner_x[1:, :-1], corner_y[1:, :-1], corner_height[1:, :-1]
-    first_area = 0.5 * np.abs((x_tr - x_tl) * (y_br - y_tl) - (y_tr - y_tl) * (x_br - x_tl))
-    second_area = 0.5 * np.abs((x_br - x_tl) * (y_bl - y_tl) - (y_br - y_tl) * (x_bl - x_tl))
-    cell_area = first_area + second_area
-    cell_volume = (
-        first_area * (h_tl + h_tr + h_br) / 3.0
-        + second_area * (h_tl + h_br + h_bl) / 3.0
-    )
-    usable = valid & np.isfinite(cell_area) & np.isfinite(cell_volume) & (cell_area > 0)
-    return cell_volume[usable], cell_area[usable]
-
-
 def _height_map_measurement(
     depth: np.ndarray,
     baseline: np.ndarray,
@@ -708,6 +658,8 @@ def estimate_volume(
         "reference-plane",
         "triangulated-surface",
         "height-map-grid",
+        "height-map-grid-legacy",
+        "support-plane-jacobian",
     }:
         raise ValueError("Unsupported volume integration geometry")
     if not np.isfinite(calibration_factor) or calibration_factor <= 0:
@@ -789,7 +741,9 @@ def estimate_volume(
     if pixel_count < min_pixels:
         return None
 
-    if geometry_mode == "height-map-grid":
+    if geometry_mode == "height-map-grid-legacy":
+        # Kept only for comparing against old recordings: whole 1 cm cells at the footprint's edge add
+        # half a cell all round (a 1 L box at 15 deg read 1.12 L, 2 L standing on end at 30 deg 2.19 L).
         return _height_map_measurement(
             depth,
             baseline,
@@ -817,34 +771,32 @@ def estimate_volume(
     reference_depth = baseline[valid]
     object_height = effective_height[valid]
     focal_product = intrinsics.fx * intrinsics.fy
-    if geometry_mode == "ray-frustum":
-        # Correction (round 16): this sum is computed directly from raw
-        # camera-Z `object_depth`/`reference_depth` and does NOT read
-        # `object_height` (== `effective_height[valid]`, the tilt-corrected
-        # perpendicular height) anywhere in the volume math below -- it is
-        # used only to back-solve `pixel_area_m2` for the uncertainty budget.
-        # This mode's own volume total is therefore NOT tilt-corrected,
-        # despite round 12's claim that it was exact regardless of mounting
-        # tilt; that claim was wrong in a way real-hardware testing
-        # confirmed (see config.py's `volume_geometry` comment for the full
-        # story). Kept available for the documented thesis sensitivity
-        # comparison, but it is no longer the default for exactly this
-        # reason -- prefer "reference-plane" for a genuinely tilt-corrected
-        # per-pixel sum.
-        contributions_m3 = (reference_depth**3 - object_depth**3) / (3.0 * focal_product)
-        pixel_area_m2 = contributions_m3 / object_height
-    elif geometry_mode == "reference-plane":
-        pixel_area_m2 = (reference_depth * reference_depth) / focal_product
-        contributions_m3 = object_height * pixel_area_m2
-    elif geometry_mode == "triangulated-surface":
-        contributions_m3, pixel_area_m2 = _triangulated_height_field(
-            effective_height, baseline, valid, intrinsics
-        )
-        if contributions_m3.size < min_pixels:
-            return None
+    # V54: ONE per-pixel integration for every non-grid mode (the names stay accepted so existing
+    # configuration loads). Each pixel adds  perpendicular height x the area of ITS OWN surface patch
+    # projected onto the support plane -- the exact Jacobian (P_u x P_v) . n of the back-projected
+    # object surface (volume_experiment._support_area). The former variants were biased:
+    #   reference-plane / triangulated-surface  height x BASELINE-depth pixel area (z_base^2 / fx fy):
+    #       a 2 L box top at 0.9 m over a 1.0 m floor read 2.469 L (+23.5 %);
+    #   ray-frustum  the frustum between object and floor along each RAY (the box's ray shadow): 2.230 L;
+    #   surface-columns  z_obj^2 / fx fy, right only for a surface facing the camera squarely.
+    from .volume_experiment import _support_area, scaled_intrinsics
+
+    if reference_plane is not None and reference_plane.coefficients is not None:
+        a_coef, b_coef, _ = reference_plane.coefficients
+        plane_normal = np.array([a_coef, b_coef, -1.0]) / math.sqrt(a_coef * a_coef + b_coef * b_coef + 1.0)
     else:
-        pixel_area_m2 = (object_depth * object_depth) / focal_product
-        contributions_m3 = object_height * pixel_area_m2
+        plane_normal = np.array([0.0, 0.0, -1.0])          # height = baseline - depth: the camera axis
+    area_map = _support_area(np.where(region, depth, np.nan), scaled_intrinsics(intrinsics, depth.shape),
+                             plane_normal)
+    # a pixel with no valid neighbour has no measurable patch: it leaves the integration (and the
+    # uncertainty budget) consistently, rather than being given a guessed area
+    valid = valid & np.isfinite(area_map)
+    pixel_count = int(np.count_nonzero(valid))
+    if pixel_count < min_pixels:
+        return None
+    object_height = effective_height[valid]
+    pixel_area_m2 = area_map[valid]
+    contributions_m3 = object_height * pixel_area_m2
     raw_liters = float(np.sum(contributions_m3) * 1000.0)
     liters = raw_liters * calibration_factor
     unobserved_fraction = max(0.0, 1.0 - coverage_ratio)
@@ -888,7 +840,8 @@ def estimate_volume(
         coverage_ratio=coverage_ratio,
         uncertainty_l=uncertainty_l,
         raw_liters=raw_liters,
-        geometry_mode=geometry_mode,
+        geometry_mode="support-plane-jacobian" + ("" if geometry_mode == "support-plane-jacobian"
+                                                   else f" (requested {geometry_mode})"),
         calibration_factor=calibration_factor,
         random_uncertainty_l=sensor_uncertainty_l,
         systematic_uncertainty_l=systematic_uncertainty_l,

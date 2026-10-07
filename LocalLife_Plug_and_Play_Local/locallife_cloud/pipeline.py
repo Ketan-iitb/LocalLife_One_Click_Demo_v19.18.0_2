@@ -616,6 +616,12 @@ def _zone_limits_m(zone: Any) -> tuple[float, float] | None:
     return None
 
 
+def _integration_method(method: str | None) -> bool:
+    """Whether a detection's volume came from the per-pixel integration the calibration factor scales."""
+    text = str(method or "").lower()
+    return not any(word in text for word in ("cuboid", "template", "cylinder", "sphere", "box"))
+
+
 GEOMETRY_CHANGE_RATIO = 0.25    # a sorted dimension or the height changing this much is a new geometry
 
 
@@ -1396,14 +1402,9 @@ class VisionPipeline:
             detection.box_template_nominal_volume_liters = (
                 template_match.template.nominal_volume_liters
             )
-            if template_match.template.nominal_volume_liters <= self.config.realsense_max_item_volume_l:
-                detection.realsense_volume_l = round(
-                    template_match.template.nominal_volume_liters, 6
-                )
-                detection.measurement_method = "table-relative-cuboid-template"
-                detection.measurement_quality = "template-matched"
-                detection.height_above_baseline_cm = round(cuboid.height_mm / 10.0, 1)
-        elif cuboid.volume_liters <= self.config.realsense_max_item_volume_l:
+            # V54: the template's NOMINAL litres stay metadata (box_template_*). They never replace the
+            # measured cuboid volume -- that would put a reference value into a measurement comparison.
+        if cuboid.volume_liters <= self.config.realsense_max_item_volume_l:
             detection.realsense_volume_l = round(cuboid.volume_liters, 6)
             detection.measurement_method = cuboid.volume_method
             detection.measurement_quality = (
@@ -1792,11 +1793,22 @@ class VisionPipeline:
         measurement_plane = self.reference_plane
         self.support_plane_source = "captured-baseline" if captured_support_plane else "none"
         effective_reference = self.reference_realsense
+        if self.camera_id != "logitech" and self.reference_realsense is None:
+            # V54: a live plane belongs to the frame it was fitted on; never measure against an earlier one.
+            measurement_plane = None
+        elif (self.camera_id != "logitech" and self.reference_plane is None and intrinsics is not None
+              and self.reference_realsense is not None):
+            # V54: a captured baseline's plane comes from THAT baseline, so height, footprint and reference
+            # depth describe one geometry (a live plane here mixed two surfaces).
+            baseline_plane = fit_reference_plane(self.reference_realsense, intrinsics)
+            if reference_plane_is_usable(baseline_plane):
+                measurement_plane = self.reference_plane = baseline_plane
+                self.support_plane_source = "captured-baseline"
         if (
             self.camera_id != "logitech"
             and depth_m is not None
             and intrinsics is not None
-            and (self.reference_plane is None or self.reference_realsense is None)
+            and self.reference_realsense is None
         ):
             live_plane = fit_support_plane_from_background(
                 depth_m,
@@ -3002,7 +3014,18 @@ class VisionPipeline:
                         scores=list(self._material_scores[detection.track_id]),
                     )
             measured = self._detection_volume(detection)
+            if measured is not None and detection.raw_volume_l is None:
+                detection.raw_volume_l = measured          # this frame's own value, beside any smoothed one
             if detection.track_id is not None and measured is not None:
+                identity = (detection.measurement_method, self.config.volume_geometry,
+                            round(float(self.config.volume_calibration_factor), 6),
+                            id(self.reference_realsense if self.camera_id != "logitech" else self.reference_monocular),
+                            None if depth_m is None else depth_m.shape)
+                identities = self.__dict__.setdefault("_volume_history_identity", {})
+                if identities.get(detection.track_id) != identity:
+                    # V54: never smooth across a method, calibration, baseline or resolution change.
+                    self._volume_history.pop(detection.track_id, None)
+                    identities[detection.track_id] = identity
                 history = self._volume_history[detection.track_id]
                 history.append(measured)
                 required = self.config.volume_stability_frames if self.config.record_only_measured_objects else 1
@@ -4148,6 +4171,17 @@ class VisionPipeline:
                 )
             if not np.isfinite(observed_liters) or observed_liters <= 0:
                 raise ValueError("Observed reference volume must be a finite positive number of liters")
+            # V54: this factor multiplies ONLY the per-pixel integration (estimate_volume). A reading from
+            # another method (the RealSense box cuboid, a cylinder/sphere fit) never had the factor applied,
+            # so fitting it from that reading compounded the factor against the wrong algorithm.
+            latest = getattr(self, "latest_analysis", None)
+            observed_method = None if not latest else next(
+                (d.measurement_method for d in latest.detections
+                 if (d.monocular_volume_l if self.camera_id == "logitech" else d.realsense_volume_l) == observed_liters),
+                None)
+            if observed_method and not _integration_method(observed_method):
+                raise ValueError(f"The shown volume comes from '{observed_method}', which the integration factor "
+                                 "does not multiply; calibrate with an object measured by per-pixel integration")
             previous = self.config.volume_calibration_factor
             factor = previous * known_liters / observed_liters
             if not 0.10 <= factor <= 10.0:
@@ -4159,6 +4193,8 @@ class VisionPipeline:
                 "observed_liters": float(observed_liters),
                 "previous_factor": float(previous),
                 "factor": float(factor),
+                "applies_to": f"per-pixel integration ({self.config.volume_geometry}) only",
+                "observed_method": observed_method,
                 "calibrated_at": time.time(),
                 "warning": "Validate accuracy using separate objects not used to fit this factor.",
             }

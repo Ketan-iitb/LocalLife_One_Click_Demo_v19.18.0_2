@@ -188,8 +188,10 @@ class TriangulatedVolumeTests(unittest.TestCase):
             depth, baseline, camera, geometry_mode="triangulated-surface"
         )
         self.assertIsNotNone(result)
-        self.assertAlmostEqual(result.liters, 80.0, places=5)
-        self.assertAlmostEqual(result.projected_area_m2, 0.16, places=6)
+        # V54: a flat top at 1.5 m covering 20 x 20 px (f = 100) has footprint 400 x (1.5/100)^2 = 0.09 m^2
+        # and volume 0.09 x 0.5 = 45 L. The old mesh used FLOOR-depth vertices: 0.16 m^2, 80 L.
+        self.assertAlmostEqual(result.liters, 45.0, places=4)
+        self.assertAlmostEqual(result.projected_area_m2, 0.09, places=6)
 
     def test_lotion_bottle_conflict_prevents_false_bag_count(self) -> None:
         bag = Detection("garbage bag", .50, (5, 5, 35, 35))
