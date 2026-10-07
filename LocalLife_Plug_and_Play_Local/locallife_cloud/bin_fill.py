@@ -724,10 +724,15 @@ class FillEstimator:
         if np.count_nonzero(risen) < 10:
             return None
         raster = _floor_raster(surface, risen, rise_map)
-        if raster is not None:
-            # Heights rasterised on the FLOOR plane: right for any camera tilt. Summing rise x the
-            # pixel's camera-facing area assumed a camera looking straight down; at the Logitech's
-            # 45-65 deg it read a 1.54 L carton as 1.07-2.50 L with perfect depth.
+        jacobian = _support_jacobian_area(surface)
+        if jacobian is not None and np.count_nonzero(risen & np.isfinite(jacobian)) >= 10:
+            # V54: each pixel's rise x the area of ITS surface patch projected onto the support plane
+            # ((P_u x P_v) . up) -- exact for any camera tilt and unbiased by depth noise. The floor
+            # raster kept the per-cell MAXIMUM, which noise and side-face tops pushed up: a 9 x 7 x 22 cm
+            # carton (1.39 L) read 1.55 L at 30-45 deg with 3 mm noise. The raster still gives L x W.
+            use = risen & np.isfinite(jacobian)
+            litres = float(np.sum(rise_map[use] * jacobian[use])) * 1000.0
+        elif raster is not None:
             litres = raster["litres"]
         else:
             litres = float(np.sum(rise_map[risen] * area[risen])) * 1000.0
@@ -1259,6 +1264,37 @@ def _oriented_box(surface: dict[str, Any], cells: np.ndarray, support: float | N
             "litres": ext[0] * ext[1] * ext[2] * 1000.0, "faces": len(normals),
             "coverage": float(len(on_faces)) / max(1, len(pts)),
             "method": f"box from {len(normals)} visible faces: extents along the faces' own axes (L x W x H)"}
+
+
+def _support_jacobian_area(surface: dict[str, Any]) -> np.ndarray | None:
+    """Per-pixel area (m^2) of the surface patch projected onto the support plane, from the map's own
+    back-projected points: (P_u x P_v) . up with P = z q, q = (x/z, y/z, 1) (linear in pixel position for
+    a pinhole camera). z derivatives are central, one-sided across a > 2 cm + 2 % depth edge; NaN where
+    no difference exists. Same formula as volume_experiment._support_area."""
+    if "x" not in surface or "up" not in surface:
+        return None
+    z = np.where(np.isfinite(surface["z"]) & (surface["z"] > 0.05), surface["z"], np.nan).astype(np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        q = np.dstack([surface["x"] / z, surface["y"] / z, np.ones(z.shape)])
+    if z.shape[0] < 3 or z.shape[1] < 3:
+        return None
+    qu = np.nanmedian(np.diff(q, axis=1).reshape(-1, 3), axis=0)
+    qv = np.nanmedian(np.diff(q, axis=0).reshape(-1, 3), axis=0)
+
+    def derivative(axis: int) -> np.ndarray:
+        fwd = np.diff(z, axis=axis, append=np.nan)
+        bwd = np.diff(z, axis=axis, prepend=np.nan)
+        central = 0.5 * (fwd + bwd)
+        edge = np.abs(fwd + bwd) > 0.02 + 0.02 * z
+        one = np.where(np.abs(fwd) <= np.abs(bwd), fwd, bwd)
+        one = np.where(np.isnan(fwd), bwd, np.where(np.isnan(bwd), fwd, one))
+        return np.where(edge | np.isnan(central), one, central)
+
+    up = np.asarray(surface["up"], dtype=np.float64)
+    up = up / max(1e-9, float(np.linalg.norm(up)))
+    t0 = float(np.cross(qu, qv) @ up)
+    area = z * (z * t0 + derivative(1) * (np.cross(q, qv) @ up) + derivative(0) * (np.cross(qu, q) @ up))
+    return -area if t0 < 0 else area
 
 
 def _mask_from(base: np.ndarray, selected: np.ndarray) -> np.ndarray:

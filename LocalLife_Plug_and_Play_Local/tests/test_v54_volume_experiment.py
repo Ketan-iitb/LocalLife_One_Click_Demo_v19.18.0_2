@@ -285,7 +285,8 @@ class RecorderReplayEvaluationTests(unittest.TestCase):
 class EvaluationMathTests(unittest.TestCase):
     def test_errors_are_per_trial_and_failures_count_against_availability(self):
         trials = [{"trial_id": f"t{i}", "object_id": "bag1", "designation": "test", "condition": "isolated",
-                   "reference_volume_l": 4.0, "cameras": {"realsense": {"volume_l": v, "motion_state": "settled",
+                   "reference_volume_l": 4.0, "reference": {"reference_quantity": "displacement"},
+                   "cameras": {"realsense": {"volume_l": v, "motion_state": "settled",
                                                                        "reasons": [] if v else ["coverage"]}}}
                   for i, v in enumerate([3.0, 5.0, 4.0, None])]
         row = ve.evaluate(trials, criteria={"max_mape_pct": 20.0, "min_availability": 0.8})["rows"][0]
@@ -298,6 +299,12 @@ class EvaluationMathTests(unittest.TestCase):
         self.assertEqual(row["failure_reasons"], {"coverage": 1})
         self.assertEqual(row["criteria"], "fail")                         # availability 0.75 < 0.8
         self.assertEqual(ve.evaluate(trials)["rows"][0]["criteria"], "not agreed")
+        # a printed liquid capacity (a 1.5 L milk carton) is not an external volume: not scored as accuracy
+        printed = [{**t, "reference": {"reference_quantity": "printed_capacity"}} for t in trials]
+        row = ve.evaluate(printed)["rows"][0]
+        self.assertNotIn("mape_pct", row)
+        self.assertIn("not a measured external volume", row["error_note"])
+        self.assertEqual(row["availability"], 0.75)
 
 
 if __name__ == "__main__":
@@ -455,6 +462,27 @@ class PlacementRobustnessTests(unittest.TestCase):
 
 
 class LiveDiagnosticsTests(unittest.TestCase):
+    def test_live_integrated_volume_is_not_inflated_by_the_per_cell_maximum(self):
+        # A 9 x 7 x 22 cm carton-like box (1.386 L) through the LIVE path with 3 mm noise. The floor raster's
+        # per-cell maximum read 1.548 / 1.542 L at 30 / 45 deg; the support-plane Jacobian integration reads 1.39 L.
+        from pathlib import Path as _P
+        from tempfile import TemporaryDirectory as _T
+
+        from locallife_cloud import bin_fill as bf
+        from test_v45_bin_fill_events import _profile
+        for pitch in (30.0, 45.0):
+            depth, mask = _scene(lambda x, y: 0 * x, _obb(0.09, 0.07, 0.22, 0, 20, 0.0), pitch, cam=0.8, far=2.4)
+            empty, _ = _scene(lambda x, y: 0 * x, None, pitch, cam=0.8, far=2.4)
+            with self.subTest(pitch=pitch), _T() as d:
+                est = bf.FillEstimator("realsense", _P(d), _profile(camera_to_empty_floor_m=0.8, usable_height_m=0.45,
+                                                                     tilt_from_vertical_deg=pitch))
+                est.recalibrate(empty, KW, None)
+                est.update(np.zeros((KW.height, KW.width, 3), np.uint8), noisy(depth), KW, None, 0.0, 1.0)
+                r, c = np.nonzero(mask)
+                litres, _ = est.object_volume((c.min(), r.min(), c.max() + 1, r.max() + 1), mask, 1.5,
+                                              deformable_hint=True)
+                self.assertLess(abs(litres - 1.386) / 1.386, 0.03)
+
     def test_live_support_reading_carries_its_trace(self):
         from test_v51_box_rotation import measure
         result, obj = measure((0.10, 0.10, 0.20), 45.0, 0.8)

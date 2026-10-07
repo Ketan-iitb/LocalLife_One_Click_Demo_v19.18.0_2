@@ -62,7 +62,7 @@ from typing import Any
 
 import numpy as np
 
-MEASUREMENT_VERSION = "V54.1"
+MEASUREMENT_VERSION = "V54.2"   # bump on ANY change that can alter a measurement; evaluate per version
 QUANTITY = "visible_surface_volume_above_empty_bin"
 CELL_M = 0.005
 TOP_BAND_M = 0.015
@@ -82,7 +82,8 @@ CAMERAS = ("realsense", "logitech")
 DESIGNATIONS = ("calibration", "test")
 CONDITIONS = ("isolated", "dark_bag", "overlapping", "falling", "other")
 REFERENCE_STATUSES = ("measured", "pending", "unverified")
-REFERENCE_QUANTITIES = ("external_geometric", "enclosing_box", "displacement", "other")
+REFERENCE_QUANTITIES = ("external_geometric", "displacement", "enclosing_box", "printed_capacity", "other")
+EXTERNAL_VOLUME_REFERENCES = ("external_geometric", "displacement")   # accuracy is scored only against these
 
 
 # --------------------------------------------------------------------------------------- geometry
@@ -404,6 +405,20 @@ def measure_frame(depth: np.ndarray, intrinsics: Any, mask: np.ndarray, baseline
     out["volume_l_partial"] = round(volume_l, 5)
     out["height_max_m"] = round(float(np.percentile(rise[up], 99)), 4)
     out["top_height_m"] = round(top_height(rise[up]), 5)
+    # share of the object's pixels on a depth edge (> 2 cm + 2 % between neighbours): stereo "flying
+    # pixels" between an object's edge and the floor behind it spread the footprint along the view
+    zz = np.where(valid_now, depth, np.nan)
+    jump = np.zeros(shape, bool)
+    for axis in (0, 1):
+        dz = np.abs(np.diff(zz, axis=axis))
+        big = np.nan_to_num(dz, nan=0.0) > 0.02 + 0.02 * np.nan_to_num(zz[:-1] if axis == 0 else zz[:, :-1], nan=0.0)
+        if axis == 0:
+            jump[:-1] |= big
+            jump[1:] |= big
+        else:
+            jump[:, :-1] |= big
+            jump[:, 1:] |= big
+    out["depth_edge_fraction"] = round(float(np.count_nonzero(jump & obj)) / max(1, int(np.count_nonzero(obj))), 4)
     # share of the integrated footprint rising < 25 % of the top: floor counted as object (mask leakage,
     # monocular depth smeared over the object's edge) shows here; a box has ~0, a domed bag up to ~25 %
     top95 = float(np.percentile(rise[up], 95))
@@ -703,7 +718,12 @@ def evaluate(trials: list[dict[str, Any]], *, calibration_objects: dict[str, set
                "attempted": len(items), "valid": len(valid), "failed": len(items) - len(valid),
                "availability": round(len(valid) / len(items), 4), "failure_reasons": fails,
                "reference_l": ref, **{f"estimate_{k}_l": v for k, v in _stats(valid).items()}}
-        if ref is None or ref <= 0:
+        quantities = {(t.get("reference") or {}).get("reference_quantity") for t, _, _ in items}
+        row["reference_quantity"] = next(iter(quantities)) if len(quantities) == 1 else sorted(map(str, quantities))
+        if not quantities <= set(EXTERNAL_VOLUME_REFERENCES):
+            row["error_note"] = (f"reference is {row['reference_quantity']}, not a measured external volume: "
+                                 "errors not computed (record an external measurement to score accuracy)")
+        elif ref is None or ref <= 0:
             row["error_note"] = "no single positive reference volume: errors not computed"
         elif valid:
             err = np.asarray(valid) - ref                        # per trial, before averaging
@@ -777,6 +797,7 @@ class ExperimentRecorder:
         self.trial: dict[str, Any] | None = None
         self._motion: dict[str, dict[str, Any]] = {}
         self.last_trial: dict[str, Any] | None = None
+        self.config_meta: dict[str, Any] = {}      # effective app configuration, set by the coordinator
 
     # paths
     @property
@@ -824,6 +845,7 @@ class ExperimentRecorder:
         with self.lock:
             sid = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
             self.session = {"session_id": sid, "started_at": time.time(), "note": note, "software": software_version(),
+                            "app_config": dict(self.config_meta),
                             "settings": {k: v for k, v in globals().items() if k.isupper() and isinstance(v, (int, float, str))}}
             self.baselines, self._baseline_depth, self.trial, self._capture = {}, {}, None, None
             self.session_dir.mkdir(parents=True, exist_ok=True)

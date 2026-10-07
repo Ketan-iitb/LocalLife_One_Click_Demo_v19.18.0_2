@@ -144,6 +144,16 @@ def cmd_evaluate(args) -> int:
         else:
             record = json.loads((directory / "trial.json").read_text(encoding="utf-8"))
         trials.append(record)
+    versions: dict[tuple, int] = {}
+    for t in trials:
+        key = ((t.get("software") or {}).get("measurement_version"), str((t.get("software") or {}).get("commit"))[:9],
+               (t.get("software") or {}).get("uncommitted_changes"))
+        versions[key] = versions.get(key, 0) + 1
+    if args.commit:
+        trials = [t for t in trials if str((t.get("software") or {}).get("commit", "")).startswith(args.commit)]
+    print("trials per (measurement version, commit, uncommitted changes):", versions)
+    if len(versions) > 1 and not args.commit:
+        print("WARNING: trials from more than one software version are pooled; pass --commit <hash> to evaluate one")
     calibration_objects = {}
     for camera in ve.CAMERAS:
         path = root / "calibration" / f"{camera}.json"
@@ -231,6 +241,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("evaluate")
     p.add_argument("--session", action="append", default=[])
     p.add_argument("--replay", action="store_true", help="recompute with the current frozen calibrations")
+    p.add_argument("--commit", help="evaluate only trials recorded by this commit (prefix)")
     p.add_argument("--max-mape-pct", type=float)
     p.add_argument("--min-availability", type=float)
     p.add_argument("--out")
