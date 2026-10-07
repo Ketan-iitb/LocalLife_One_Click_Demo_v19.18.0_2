@@ -11,6 +11,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+
+import numpy as np
 import sys
 import urllib.request
 from pathlib import Path
@@ -42,57 +44,40 @@ def _trial_dirs(root: Path, sessions: list[str]) -> list[Path]:
 
 
 def cmd_calibrate(args) -> int:
+    """THE calibration procedure: fit this camera's raw-depth -> metres mapping to the measured top heights
+    of CALIBRATION placements (+ the perpendicular floor distance), then freeze it."""
     root = _root(args)
-    samples, metas = [], []
+    samples = []
     for directory in _trial_dirs(root, args.session):
-        record = json.loads((directory / "trial.json").read_text(encoding="utf-8"))
-        if record.get("designation") != "calibration" or args.camera not in record.get("cameras", {}):
+        got = ve.calibration_samples(directory, args.camera)
+        if not got:
             continue
-        if (record.get("reference") or {}).get("reference_status") != "measured":
-            print(f"skip {record['trial_id']}: reference not measured")
+        if not got[0].get("reference_top_height_m"):
+            print(f"skip {got[0]['trial_id']}: no measured top height (trial-start --top-height-m)")
             continue
-        replay = ve.replay_trial(directory, {args.camera: {"depth_scale": 1.0, "align_background": args.align_background,
-                                                           "calibration_id": "fitting"}})
-        result = replay["cameras"][args.camera]
-        frames = [f for f in result["frames"] if f.get("saved")]
-        if not frames or result["volume_l"] is None:
-            print(f"skip {record['trial_id']}: {result.get('reasons')}")
-            continue
-        samples.append({"trial_id": record["trial_id"], "session_id": record["session_id"],
-                        "object_id": record["object_id"], "reference_l": record["reference_volume_l"],
-                        "raw_volume_l": result["volume_l"]})
-        session_dir = directory.parent.parent
-        baseline = json.loads((session_dir / frames[0]["baseline_file"].replace(".npz", ".json")).read_text(encoding="utf-8"))
-        metas.append(baseline)
-    if not metas:
-        print("no usable calibration trials")
+        samples += got
+    if not samples:
+        print("no usable calibration placements")
         return 2
-    first = metas[0]
-    for other in metas[1:]:
-        problems = ve.compatibility(first, other)
+    baselines = []
+    for smp in samples:
+        session_dir = next(p for p in (root / "sessions").iterdir() if (p / smp["baseline_file"]).exists())
+        baselines.append(json.loads((session_dir / smp["baseline_file"].replace(".npz", ".json")).read_text(encoding="utf-8")))
+    for other in baselines[1:]:
+        problems = ve.compatibility(baselines[0], other)
         if problems:
-            print(f"calibration trials come from incompatible setups: {problems}")
+            print(f"calibration placements come from incompatible setups: {problems}")
             return 2
-    meta = {k: first.get(k) for k in ("shape", "intrinsics", "plane", "depth_model", "output_kind",
-                                      "intrinsics_source", "depth_units")}
+    meta = {k: baselines[0].get(k) for k in ("shape", "intrinsics", "plane", "depth_model", "intrinsics_source",
+                                              "depth_units")}
     meta["software"] = ve.software_version()
-    calibration = ve.fit_calibration(samples, camera=args.camera, align_background=args.align_background, meta=meta)
-    # verify by replay at the fitted scale (V ∝ s^3 is exact only up to discretisation)
-    check = []
-    for s in samples:
-        directory = root / "sessions" / s["session_id"] / "trials" / s["trial_id"]
-        r = ve.replay_trial(directory, {args.camera: {k: calibration[k] for k in ("depth_scale", "align_background", "calibration_id")}})
-        v = r["cameras"][args.camera]["volume_l"]
-        check.append(None if v is None else round(100 * (v - s["reference_l"]) / s["reference_l"], 3))
-    calibration["fit_quality"]["replayed_residual_pct"] = check
-    if args.perpendicular_floor_distance_m:
-        # Independent check, NOT used in the fit: the baseline plane's perpendicular camera distance at the
-        # fitted scale vs a tape measurement of the same quantity (perpendicular, not along the view axis).
-        fitted = calibration["depth_scale"] * float(first["plane"]["d"])
-        calibration["fit_quality"]["floor_distance_check"] = {
-            "measured_perpendicular_m": args.perpendicular_floor_distance_m, "fitted_m": round(fitted, 4),
-            "residual_pct": round(100 * (fitted - args.perpendicular_floor_distance_m)
-                                  / args.perpendicular_floor_distance_m, 3)}
+    output_kind = samples[0]["meta"].get("output_kind") or "metric"
+    try:
+        calibration = ve.fit_depth_mapping(samples, camera=args.camera, output_kind=output_kind,
+                                           floor_distance_m=args.perpendicular_floor_distance_m, meta=meta)
+    except ValueError as exc:
+        print(f"calibration refused: {exc}")
+        return 2
     path = root / "calibration" / f"{args.camera}.json"
     if path.exists() and not args.replace:
         print(f"{path} exists: pass --replace to supersede it (the old one is kept as history)")
@@ -102,8 +87,43 @@ def cmd_calibrate(args) -> int:
         old = json.loads(path.read_text(encoding="utf-8"))
         (path.parent / f"{args.camera}_{old['calibration_id']}.json").write_text(json.dumps(old, indent=1), encoding="utf-8")
     path.write_text(json.dumps(calibration, indent=1, default=float), encoding="utf-8")
-    print(json.dumps({k: calibration[k] for k in ("calibration_id", "depth_scale", "align_background",
-                                                  "calibration_objects", "fit_quality")}, indent=1))
+    print(json.dumps({k: calibration[k] for k in ("calibration_id", "mapping", "offset_identifiable", "note",
+                                                  "calibration_objects", "fit_quality")}, indent=1, default=str))
+    return 0
+
+
+def cmd_intrinsics(args) -> int:
+    """Measured intrinsics + distortion from checkerboard photos taken AT THE ACTIVE RESOLUTION."""
+    import glob
+
+    import cv2
+    cols, rows = (int(v) for v in args.pattern.lower().split("x"))
+    grid = np.zeros((rows * cols, 3), np.float32)
+    grid[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2) * (args.square_mm / 1000.0)
+    obj, img, size = [], [], None
+    for name in sorted(glob.glob(args.images)):
+        grey = cv2.imread(name, cv2.IMREAD_GRAYSCALE)
+        if grey is None:
+            continue
+        found, corners = cv2.findChessboardCorners(grey, (cols, rows))
+        if not found:
+            print(f"no board in {name}")
+            continue
+        corners = cv2.cornerSubPix(grey, corners, (11, 11), (-1, -1),
+                                   (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1e-3))
+        obj.append(grid)
+        img.append(corners.reshape(-1, 2))
+        size = (grey.shape[1], grey.shape[0])
+    if len(img) < 8:
+        print(f"only {len(img)} usable views; take at least 8 (whole field of view, tilted board)")
+        return 2
+    result = ve.intrinsics_from_corners(obj, img, size, f"checkerboard {args.pattern} {args.square_mm} mm, {len(img)} views")
+    path = _root(args) / "cameras.json"
+    config = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    config[args.camera] = result
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(config, indent=1), encoding="utf-8")
+    print(json.dumps(result, indent=1))
     return 0
 
 
@@ -117,7 +137,8 @@ def cmd_evaluate(args) -> int:
                 cal = json.loads((root / "calibration" / f"{camera}.json").read_text(encoding="utf-8")) \
                     if (root / "calibration" / f"{camera}.json").exists() else None
                 if cal:
-                    setups[camera] = {k: cal[k] for k in ("depth_scale", "align_background", "calibration_id")}
+                    setups[camera] = {"mapping": cal["mapping"], "align_background": cal.get("align_background", False),
+                                      "calibration_id": cal["calibration_id"]}
             record = json.loads((directory / "trial.json").read_text(encoding="utf-8"))
             record["cameras"] = ve.replay_trial(directory, setups)["cameras"]
         else:
@@ -190,6 +211,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--placement", default="")
     p.add_argument("--condition", choices=ve.CONDITIONS, default="isolated")
     p.add_argument("--motion", choices=("settled", "moving"), default="settled")
+    p.add_argument("--top-height-m", type=float,
+                   help="calibration placements: tape-measured height of the object's top surface above the floor")
     sub.add_parser("trial-stop")
     sub.add_parser("status")
     p = sub.add_parser("replay", help="recompute a recorded trial from its raw files")
@@ -197,10 +220,14 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("calibrate", help="fit and freeze one camera's depth scale on CALIBRATION trials only")
     p.add_argument("--camera", choices=ve.CAMERAS, required=True)
     p.add_argument("--session", action="append", default=[])
-    p.add_argument("--align-background", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--replace", action="store_true")
     p.add_argument("--perpendicular-floor-distance-m", type=float,
                    help="tape-measured PERPENDICULAR camera-to-bin-floor distance: an independent check only")
+    p = sub.add_parser("intrinsics", help="measured intrinsics/distortion from checkerboard photos")
+    p.add_argument("--camera", choices=ve.CAMERAS, required=True)
+    p.add_argument("--images", required=True, help="glob, e.g. 'board/*.png' (active resolution)")
+    p.add_argument("--pattern", default="9x6", help="inner corners, columns x rows")
+    p.add_argument("--square-mm", type=float, required=True)
     p = sub.add_parser("evaluate")
     p.add_argument("--session", action="append", default=[])
     p.add_argument("--replay", action="store_true", help="recompute with the current frozen calibrations")
@@ -218,15 +245,16 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(ve.ExperimentRecorder(_root(args)).objects(), indent=1))
         return 0
     if args.command == "calibrate":
-        if args.align_background is None:
-            args.align_background = args.camera == "logitech"
         return cmd_calibrate(args)
+    if args.command == "intrinsics":
+        return cmd_intrinsics(args)
     if args.command == "evaluate":
         return cmd_evaluate(args)
     if args.command == "replay":
         return cmd_replay(args)
     body = {"session": {"note": getattr(args, "note", "")}, "baseline": {"cameras": getattr(args, "camera", None)},
-            "trial-start": {k: getattr(args, k, None) for k in ("object_id", "designation", "placement", "condition", "motion")},
+            "trial-start": {k: getattr(args, k, None) for k in ("object_id", "designation", "placement", "condition",
+                                                                "motion", "top_height_m")},
             "trial-stop": {}, "status": None}[args.command]
     print(json.dumps(_post(args, args.command, body), indent=1, default=str))
     return 0

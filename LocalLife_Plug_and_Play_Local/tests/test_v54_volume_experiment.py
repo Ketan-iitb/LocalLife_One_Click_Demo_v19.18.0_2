@@ -159,21 +159,44 @@ class BaselineAndCalibrationTests(unittest.TestCase):
         tilted = {"normal": [0, -0.6, -0.8], "d": 0.8}
         self.assertTrue(any("pose" in r for r in ve.compatibility(ref, {**ref, "plane": tilted})))
 
-    def test_calibration_fits_on_calibration_objects_and_generalises_to_another(self):
-        # A monocular-like depth with a wrong uniform scale (0.7 x true): fit on the 1 L box, test on 2 L.
-        cal = []
-        for yaw in (10.0, 50.0):
-            depth, mask, empty = render((0.10, 0.10, 0.10), yaw=yaw)
-            raw = ve.measure_frame(depth * 0.7, KW, mask, empty * 0.7)["volume_l"]
-            cal.append({"trial_id": f"c{yaw}", "object_id": "box1L", "reference_l": 1.0, "raw_volume_l": raw})
-        fit = ve.fit_calibration(cal, camera="logitech", align_background=False, meta={})
-        self.assertAlmostEqual(fit["depth_scale"], 1 / 0.7, delta=0.02)
-        self.assertEqual(fit["calibration_objects"], ["box1L"])
-        depth, mask, empty = render((0.20, 0.10, 0.10))
-        test = ve.measure_frame(depth * 0.7, KW, mask, empty * 0.7, scale=fit["depth_scale"])
-        self.assertLess(abs(test["volume_l"] - 2.0) / 2.0, 0.04)
+    def test_calibration_fits_heights_not_volumes_and_generalises_to_another_object(self):
+        # A monocular-like metric depth with a wrong scale AND offset: raw = (Z - t) / s, s = 1.3, t = -0.08 m.
+        s_true, t_true = 1.3, -0.08
+
+        def raw(z):
+            return ((z - t_true) / s_true).astype(np.float32)
+
+        samples = []
+        for dims, yaw in (((0.10, 0.10, 0.10), 10.0), ((0.10, 0.10, 0.20), 50.0)):   # tops 10 cm and 20 cm
+            depth, mask, empty = render(dims, yaw=yaw)
+            samples.append({"trial_id": f"c{yaw}", "object_id": f"cal{dims[2]}", "depth": raw(depth),
+                            "baseline": raw(empty), "mask": mask, "roi": None, "intrinsics": KW,
+                            "reference_top_height_m": dims[2]})
+        # render(): camera 0.8 m above the floor -> the tape-measured PERPENDICULAR floor distance is 0.8 m
+        fit = ve.fit_depth_mapping(samples, camera="logitech", output_kind="metric", floor_distance_m=0.8)
+        self.assertTrue(fit["offset_identifiable"])
+        self.assertAlmostEqual(fit["mapping"]["s"], s_true, delta=0.05)
+        self.assertAlmostEqual(fit["mapping"]["t"], t_true, delta=0.03)
+        self.assertLess(fit["fit_quality"]["rms_height_residual_m"], 0.004)
+        self.assertNotIn("volume", json.dumps(fit["fitted_on"]))            # heights only: no volume enters
+        depth, mask, empty = render((0.20, 0.10, 0.10))                       # held-out object
+        test = ve.measure_frame(raw(depth), KW, mask, raw(empty), mapping=fit["mapping"])
+        self.assertEqual(test["status"], "ok", test["reasons"])
+        self.assertLess(abs(test["volume_l"] - 2.0) / 2.0, 0.05)
+        # heights only (no floor distance): the offset is not identifiable -> scale only, and said so
+        single = ve.fit_depth_mapping(samples, camera="logitech", output_kind="metric")
+        self.assertFalse(single["offset_identifiable"])
+        self.assertEqual(single["mapping"]["t"], 0.0)
         with self.assertRaises(ValueError):
-            ve.fit_calibration(cal[:1], camera="logitech", align_background=False, meta={})
+            ve.fit_depth_mapping([{**samples[0], "reference_top_height_m": None}], camera="logitech",
+                                 output_kind="metric")
+
+    def test_measurement_outside_the_calibrated_range_is_not_reported(self):
+        depth, mask, empty = render((0.10, 0.10, 0.10))
+        mapping = {"kind": "scale", "scale": 1.0, "valid_raw_depth": [0.2, 0.5]}
+        result = ve.measure_frame(depth, KW, mask, empty, mapping=mapping)
+        self.assertIsNone(result["volume_l"])
+        self.assertTrue(any("calibrated range" in r for r in result["reasons"]))
 
 
 def _payload(camera, t, depth, mask, *, rgb=None, model="depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf"):
@@ -202,7 +225,7 @@ class RecorderReplayEvaluationTests(unittest.TestCase):
 
     def _run_trial(self, rec, dims, t0, designation, scale=0.7, frames=8, still=True, **kw):
         rec.start_trial(object_id="box1L" if dims[2] * dims[0] * dims[1] < 0.0015 else "box2L",
-                        designation=designation, placement="centre", **kw)
+                        designation=designation, placement="centre", top_height_m=dims[2], **kw)
         rec.trial["started_at"] = t0 - 0.01
         depth, mask, _ = render(dims)
         rec.observe(_payload("realsense", t0 - 5.0, noisy(depth, seed=99), mask))     # captured before the start
@@ -228,17 +251,15 @@ class RecorderReplayEvaluationTests(unittest.TestCase):
             replay = ve.replay_trial(trial_dir)
             self.assertAlmostEqual(replay["cameras"]["realsense"]["volume_l"], rs["volume_l"], places=6)
             self.assertTrue(all(f.get("timestamp", 0) >= 100.0 - 0.01 for f in rs["frames"]))
-            # fit the Logitech calibration on calibration trials only (as the CLI does), then freeze it
+            # fit the Logitech calibration on calibration placements only (as the CLI does), then freeze it
             trial2 = self._run_trial(rec, (0.10, 0.10, 0.10), 200.0, "calibration")
             samples = []
             for tr in (trial, trial2):
-                r = ve.replay_trial(rec.session_dir / "trials" / tr["trial_id"],
-                                    {"logitech": {"depth_scale": 1.0, "align_background": True, "calibration_id": "fit"}})
-                samples.append({"trial_id": tr["trial_id"], "object_id": "box1L", "reference_l": 1.0,
-                                "raw_volume_l": r["cameras"]["logitech"]["volume_l"]})
+                samples += ve.calibration_samples(rec.session_dir / "trials" / tr["trial_id"], "logitech")
+            self.assertEqual(len(samples), 2)
             meta = {k: rec.baselines["logitech"].get(k) for k in ("shape", "intrinsics", "plane", "depth_model",
-                                                                  "output_kind", "intrinsics_source", "depth_units")}
-            calibration = ve.fit_calibration(samples, camera="logitech", align_background=True, meta=meta)
+                                                                  "intrinsics_source", "depth_units")}
+            calibration = ve.fit_depth_mapping(samples, camera="logitech", output_kind="metric", meta=meta)
             rec.calibration_path("logitech").parent.mkdir(parents=True, exist_ok=True)
             rec.calibration_path("logitech").write_text(json.dumps(calibration, default=float))
             with self.assertRaises(ValueError):                    # calibration object as held-out test
@@ -309,3 +330,86 @@ class ServerSmokeTests(unittest.TestCase):
             status = client.get("/api/experiment/status").get_json()
             self.assertIn("realsense", status["baselines"])
             self.assertEqual(status["baselines"]["realsense"]["frames"], 5)
+
+
+class CameraModelAndValidityTests(unittest.TestCase):
+    def test_measured_lens_distortion_is_removed_before_the_geometry(self):
+        import cv2
+        # Front-facing pinhole scene near the image CORNER (where barrel distortion matters): floor at
+        # Z = 1.0 m, a box top at Z = 0.9 m over pixels rows 12:72, cols 12:112 -> footprint
+        # (100 x 0.9/300) x (60 x 0.9/300) = 0.30 x 0.18 m, height 0.10 m: 5.4 L exactly.
+        empty = np.full((240, 320), 1.0, np.float32)
+        depth = empty.copy()
+        depth[12:72, 12:112] = 0.9
+        mask = np.zeros(depth.shape, bool)
+        mask[12:72, 12:112] = True
+        dist = [-0.25, 0.08, 0.0, 0.0, 0.0]                  # a webcam-like barrel distortion
+        K = np.array([[KW.fx, 0, KW.ppx], [0, KW.fy, KW.ppy], [0, 0, 1]], np.float64)
+        rows, cols = np.indices(depth.shape)
+        # distorted image(u, v) = pinhole image at undistort(u, v)
+        pts = cv2.undistortPoints(np.c_[cols.ravel(), rows.ravel()].astype(np.float64)[:, None, :], K,
+                                  np.array(dist), P=K).reshape(depth.shape + (2,)).astype(np.float32)
+
+        def distort(img):
+            return cv2.remap(img, pts[..., 0], pts[..., 1], cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT,
+                             borderValue=float("nan") if img.dtype == np.float32 else 0)
+
+        d_depth, d_empty, d_mask = distort(depth), distort(empty), distort(mask.astype(np.uint8)).astype(bool)
+        ignored = ve.measure_frame(d_depth, KW, d_mask, d_empty)
+        modelled = ve.measure_frame(d_depth, KW, d_mask, d_empty, distortion=dist)
+        self.assertTrue(modelled["distortion_modelled"])
+        self.assertLess(abs(modelled["volume_l_partial"] - 5.4) / 5.4, 0.03)
+        self.assertGreater(abs(ignored["volume_l_partial"] - 5.4), 2 * abs(modelled["volume_l_partial"] - 5.4))
+
+    def test_clipping_is_judged_on_the_original_mask(self):
+        depth, mask, empty = render((0.20, 0.10, 0.10))
+        clipped = mask.copy()
+        rows, cols = np.nonzero(mask)
+        clipped[rows.min():rows.max() + 1, 0] = True        # one-pixel contact: erosion would remove it
+        result = ve.measure_frame(depth, KW, clipped, empty)
+        self.assertIsNone(result["volume_l"])
+        self.assertTrue(any("image edge" in r for r in result["reasons"]))
+
+    def test_unstable_settled_window_is_not_a_measurement(self):
+        frames = [{"phase": "settled", "volume_l": v, "reasons": []} for v in (1.0, 1.4, 0.8, 1.6, 1.0)]
+        agg = ve.aggregate_trial(frames, "settled", settled=True)
+        self.assertEqual(agg["status"], "unstable")
+        self.assertIsNone(agg["volume_l"])
+        steady = ve.aggregate_trial([{"phase": "settled", "volume_l": v} for v in (2.0, 2.02, 1.99)], "settled", True)
+        self.assertEqual((steady["status"], steady["volume_l"]), ("ok", 2.0))
+
+    def test_checkerboard_intrinsics_recover_a_known_camera(self):
+        import cv2
+        K = np.array([[610.0, 0, 322.0], [0, 612.0, 241.0], [0, 0, 1]])
+        dist = np.array([-0.21, 0.05, 0.001, -0.001, 0.0])
+        grid = np.zeros((54, 3), np.float32)
+        grid[:, :2] = np.mgrid[0:9, 0:6].T.reshape(-1, 2) * 0.025
+        obj, img = [], []
+        rng = np.random.default_rng(0)
+        for i in range(12):
+            rvec = rng.normal(0, 0.35, 3)
+            tvec = np.array([-0.1 + 0.02 * (i % 4), -0.06 + 0.03 * (i % 3), 0.45 + 0.03 * i])
+            p, _ = cv2.projectPoints(grid, rvec, tvec, K, dist)
+            obj.append(grid)
+            img.append(p.reshape(-1, 2))
+        got = ve.intrinsics_from_corners(obj, img, (640, 480), "synthetic")
+        self.assertAlmostEqual(got["intrinsics"]["fx"], 610.0, delta=3.0)
+        self.assertAlmostEqual(got["distortion"][0], -0.21, delta=0.03)
+        self.assertLess(got["reprojection_rms_px"], 0.1)
+
+    def test_relative_inverse_depth_mapping_through_the_same_geometry(self):
+        a_true, b_true = 2.5, -0.4                             # d = (1/Z - b) / a  <=>  Z = 1 / (a d + b)
+        def inv(z):
+            return ((1.0 / z - b_true) / a_true).astype(np.float32)
+        samples = []
+        for dims, yaw in (((0.10, 0.10, 0.10), 10.0), ((0.10, 0.10, 0.20), 50.0)):
+            depth, mask, empty = render(dims, yaw=yaw)
+            samples.append({"trial_id": str(yaw), "object_id": "cal", "depth": inv(depth), "baseline": inv(empty),
+                            "mask": mask, "roi": None, "intrinsics": KW, "reference_top_height_m": dims[2]})
+        with self.assertRaises(ValueError):                    # relative output needs the floor distance
+            ve.fit_depth_mapping(samples, camera="logitech", output_kind="relative-inverse")
+        fit = ve.fit_depth_mapping(samples, camera="logitech", output_kind="relative-inverse", floor_distance_m=0.8)
+        self.assertEqual(fit["mapping"]["kind"], "inverse_affine")
+        depth, mask, empty = render((0.20, 0.10, 0.10))
+        test = ve.measure_frame(inv(depth), KW, mask, inv(empty), mapping=fit["mapping"])
+        self.assertLess(abs(test["volume_l_partial"] - 2.0) / 2.0, 0.06)

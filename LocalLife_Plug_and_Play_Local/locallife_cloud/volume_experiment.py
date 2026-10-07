@@ -35,12 +35,14 @@ Per-pixel geometry (both cameras, independent depth sources)
        An invalid frame has volume_l = None (never 0, never a previous value); `volume_l_partial`
        keeps the integral for diagnosis only.
 
-Calibration (one procedure, camera-specific parameters; see `fit_calibration`)
-    depth_scale s per camera, fitted ONLY on trials designated "calibration": V(s) = s^3 V(1) for a
-    uniform depth scale (heights scale by s, plane areas by s^2), so log s = mean(log(V_ref / V_1)) / 3.
-    Logitech additionally aligns each frame's ROI background to the baseline (median depth ratio) --
-    this keeps the frozen baseline scale fixed instead of re-normalising to a new scale every frame.
-    The setting is part of the calibration record, so fitting and evaluation use the same procedure.
+Calibration (one procedure, camera-specific parameters; see `fit_depth_mapping`)
+    The raw-depth -> metres mapping chosen by the model's output semantics (metric checkpoint:
+    Z = s raw + t; relative inverse depth: Z = 1/(a d + b)), fitted ONLY to independently measured
+    geometry of calibration placements -- top-surface heights at several bin positions and, optionally,
+    the perpendicular camera-to-floor distance. No volumes are fitted. Frozen with its residuals and its
+    validated raw-depth range; outside that range a measurement is not reported.
+    Per-frame background alignment (median depth ratio to the baseline) is OFF by default; when enabled
+    it is bounded (0.7-1.4), logged per frame and part of the calibration record.
 """
 
 from __future__ import annotations
@@ -75,6 +77,7 @@ BASELINE_MAX_TEMPORAL_STD_M = 0.020
 POSE_MAX_ANGLE_DEG = 3.0
 POSE_MAX_DISTANCE_REL = 0.05
 MIN_VALID_FRAMES_PER_TRIAL = 3
+MAX_FRAME_IQR_REL = 0.15          # settled-window frame volumes must agree this well (IQR / median)
 CAMERAS = ("realsense", "logitech")
 DESIGNATIONS = ("calibration", "test")
 CONDITIONS = ("isolated", "dark_bag", "overlapping", "falling", "other")
@@ -212,6 +215,48 @@ def occluding_boundary_fraction(depth: np.ndarray, obj: np.ndarray) -> float | N
     return round(float(np.count_nonzero(boundary & deeper)) / int(boundary.sum()), 4)
 
 
+def top_height(rise: np.ndarray) -> float:
+    """Height of the object's top surface: median of the samples within the top band (rise >= 80 % of
+    the 95th percentile). For a flat-topped box this is its top face, unaffected by side-face samples."""
+    if rise.size == 0:
+        return float("nan")
+    p95 = float(np.percentile(rise, 95))
+    return float(np.median(rise[rise >= 0.8 * p95]))
+
+
+def apply_depth_mapping(raw: np.ndarray, mapping: dict[str, Any]) -> np.ndarray:
+    """Raw camera depth -> metres. kind 'scale': Z = scale x raw (RealSense: 1). 'metric_affine'
+    (metric checkpoint): Z = s x raw + t. 'inverse_affine' (relative inverse-depth output d):
+    Z = 1 / (a x d + b). Non-positive results are invalid (NaN)."""
+    raw = raw.astype(np.float64)
+    kind = mapping.get("kind", "scale")
+    if kind == "scale":
+        z = raw * float(mapping.get("scale", 1.0))
+    elif kind == "metric_affine":
+        z = float(mapping["s"]) * raw + float(mapping["t"])
+    elif kind == "inverse_affine":
+        with np.errstate(divide="ignore", invalid="ignore"):
+            z = 1.0 / (float(mapping["a"]) * raw + float(mapping["b"]))
+    else:
+        raise ValueError(f"unknown depth mapping {kind!r}")
+    return np.where(np.isfinite(raw) & (raw > 0) & np.isfinite(z) & (z > 0.05), z, np.nan)
+
+
+def undistort_inputs(k: dict[str, float], distortion: list[float], depth, baseline, mask, roi):
+    """Remap depth, baseline, mask and ROI from the distorted image to the pinhole model with the same
+    camera matrix (nearest neighbour: depth values are never blended across an edge)."""
+    import cv2
+    K = np.array([[k["fx"], 0, k["cx"]], [0, k["fy"], k["cy"]], [0, 0, 1]], np.float64)
+    h, w = depth.shape
+    mx, my = cv2.initUndistortRectifyMap(K, np.asarray(distortion, np.float64), None, K, (w, h), cv2.CV_32FC1)
+
+    def remap(img, fill):
+        return cv2.remap(img, mx, my, cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=fill)
+
+    return (remap(depth.astype(np.float32), float("nan")), remap(baseline.astype(np.float32), float("nan")),
+            remap(mask.astype(np.uint8), 0).astype(bool), remap(roi.astype(np.uint8), 0).astype(bool))
+
+
 def _per_cell_mean(keys: np.ndarray, values: np.ndarray):
     uniq, inv = np.unique(keys, return_inverse=True)
     return uniq, np.bincount(inv, values) / np.bincount(inv)
@@ -244,11 +289,18 @@ def _dilate(mask: np.ndarray, px: int) -> np.ndarray:
 
 def measure_frame(depth: np.ndarray, intrinsics: Any, mask: np.ndarray, baseline_depth: np.ndarray,
                   roi: np.ndarray | None = None, *, scale: float = 1.0, align_background: bool = False,
-                  fallback_shape: tuple[int, int] | None = None, cell: float = CELL_M) -> dict[str, Any]:
-    """Per-pixel visible-surface volume of `mask` above the empty-bin baseline. See module docstring."""
+                  fallback_shape: tuple[int, int] | None = None, cell: float = CELL_M,
+                  mapping: dict[str, Any] | None = None, distortion: list[float] | None = None) -> dict[str, Any]:
+    """Per-pixel visible-surface volume of `mask` above the empty-bin baseline. See module docstring.
+
+    `mapping` (from the frozen calibration) turns the camera's raw depth into metres; without it the raw
+    depth is multiplied by `scale` (RealSense: already metres, scale 1). `distortion` (OpenCV k1 k2 p1 p2
+    [k3], measured for this camera) undistorts depth, baseline, mask and ROI to the pinhole model first."""
+    mapping = mapping or {"kind": "scale", "scale": scale}
     reasons: list[str] = []
     out: dict[str, Any] = {"quantity": QUANTITY, "measurement_version": MEASUREMENT_VERSION, "volume_l": None,
-                           "volume_l_partial": None, "status": "invalid", "reasons": reasons, "depth_scale": scale,
+                           "volume_l_partial": None, "status": "invalid", "reasons": reasons,
+                           "depth_mapping": mapping, "distortion_modelled": bool(distortion),
                            "cell_m": cell, "background_ratio": None}
     if depth is None or baseline_depth is None or depth.shape != baseline_depth.shape:
         reasons.append("depth and baseline missing or of different resolution")
@@ -257,8 +309,25 @@ def measure_frame(depth: np.ndarray, intrinsics: Any, mask: np.ndarray, baseline
     mask = _resize_mask(mask, shape)
     roi = np.ones(shape, bool) if roi is None else _resize_mask(roi, shape)
     k = scaled_intrinsics(intrinsics, shape, fallback_shape)
-    depth = depth.astype(np.float64) * scale
-    base = baseline_depth.astype(np.float64) * scale
+    # clipping is judged on the ORIGINAL mask (no erosion): touching the image edge or the ROI boundary
+    edge = np.zeros(shape, bool)
+    edge[0, :] = edge[-1, :] = edge[:, 0] = edge[:, -1] = True
+    if (mask & edge).any():
+        reasons.append("object clipped at the image edge: part of it is outside the view")
+    elif roi is not None and not roi.all() and (mask & _dilate(~roi, 1)).any():
+        reasons.append("object reaches the ROI boundary: part of it may be outside the measured region")
+    if distortion:
+        depth, baseline_depth, mask, roi = undistort_inputs(k, distortion, depth, baseline_depth, mask, roi)
+    raw_obj = depth[mask & roi & np.isfinite(depth)]
+    depth = apply_depth_mapping(depth.astype(np.float64), mapping)
+    base = apply_depth_mapping(baseline_depth.astype(np.float64), mapping)
+    valid_range = mapping.get("valid_raw_depth")
+    if valid_range and raw_obj.size:
+        median_raw = float(np.median(raw_obj))
+        lo, hi = valid_range
+        if not lo <= median_raw <= hi:
+            reasons.append(f"object depth {median_raw:.3f} (raw) outside the calibrated range "
+                           f"[{lo:.3f}, {hi:.3f}]: calibration not validated here")
     valid_now = np.isfinite(depth) & (depth > 0.05)
     valid_base = np.isfinite(base) & (base > 0.05)
     obj = mask & roi
@@ -334,6 +403,8 @@ def measure_frame(depth: np.ndarray, intrinsics: Any, mask: np.ndarray, baseline
     volume_l = float(np.sum(rise[up] * a[up])) * 1000.0
     out["volume_l_partial"] = round(volume_l, 5)
     out["height_max_m"] = round(float(np.percentile(rise[up], 99)), 4)
+    out["top_height_m"] = round(top_height(rise[up]), 5)
+    out["plane_distance_m"] = round(float(plane["d"]), 5)
     # coverage: cells of the footprint's convex hull that were actually seen
     import cv2
     fx_, fy_ = foot_keys // (1 << 21), foot_keys % (1 << 21)
@@ -461,23 +532,131 @@ def compatibility(reference: dict[str, Any], current: dict[str, Any]) -> list[st
 
 
 # ------------------------------------------------------------------------------------ calibration
-def fit_calibration(samples: list[dict[str, Any]], *, camera: str, align_background: bool,
-                    meta: dict[str, Any]) -> dict[str, Any]:
-    """samples: [{trial_id, object_id, reference_l, raw_volume_l (measured at scale 1)}] from CALIBRATION
-    trials only. log s = mean(log(V_ref/V_1))/3 (least squares in log volume, V ∝ s^3)."""
-    usable = [s for s in samples if s.get("raw_volume_l") and s.get("reference_l") and s["reference_l"] > 0]
-    if len(usable) < 2 or len({s["object_id"] for s in usable}) < 1:
-        raise ValueError("calibration needs at least 2 valid calibration trials with references")
-    logs = np.array([math.log(s["reference_l"] / s["raw_volume_l"]) for s in usable]) / 3.0
-    scale = float(math.exp(logs.mean()))
-    residual_pct = [round(100 * (s["raw_volume_l"] * scale ** 3 - s["reference_l"]) / s["reference_l"], 3) for s in usable]
-    body = {"camera": camera, "method": "depth-scale fit on calibration-object trials: log s = mean(log(Vref/V1))/3",
-            "quantity": QUANTITY, "measurement_version": MEASUREMENT_VERSION, "depth_scale": scale,
-            "align_background": align_background, "fitted_on": usable,
-            "calibration_objects": sorted({s["object_id"] for s in usable}),
-            "fit_quality": {"n_trials": len(usable), "n_objects": len({s["object_id"] for s in usable}),
-                            "log_scale_std": round(float(logs.std(ddof=1)) if len(logs) > 1 else 0.0, 5),
-                            "residual_pct": residual_pct}, "created_at": time.time(), "frozen": True, **meta}
+def _nelder_mead(f, x0, step, iterations=200, tol=1e-9):
+    """Minimal Nelder-Mead (NumPy only)."""
+    pts = [np.asarray(x0, float)] + [np.asarray(x0, float) + np.eye(len(x0))[i] * step[i] for i in range(len(x0))]
+    vals = [f(p) for p in pts]
+    for _ in range(iterations):
+        order = np.argsort(vals)
+        pts, vals = [pts[i] for i in order], [vals[i] for i in order]
+        if abs(vals[-1] - vals[0]) < tol:
+            break
+        centre = np.mean(pts[:-1], axis=0)
+        reflect = centre + (centre - pts[-1])
+        fr = f(reflect)
+        if fr < vals[0]:
+            expand = centre + 2 * (centre - pts[-1])
+            fe = f(expand)
+            pts[-1], vals[-1] = (expand, fe) if fe < fr else (reflect, fr)
+        elif fr < vals[-2]:
+            pts[-1], vals[-1] = reflect, fr
+        else:
+            contract = centre + 0.5 * (pts[-1] - centre)
+            fc = f(contract)
+            if fc < vals[-1]:
+                pts[-1], vals[-1] = contract, fc
+            else:
+                pts = [pts[0] + 0.5 * (p - pts[0]) for p in pts]
+                vals = [f(p) for p in pts]
+    best = int(np.argmin(vals))
+    return pts[best], vals[best]
+
+
+def _mapping_from(kind: str, x: np.ndarray, offset_free: bool) -> dict[str, Any]:
+    if kind == "metric_affine":
+        return {"kind": kind, "s": float(math.exp(x[0])), "t": float(x[1]) if offset_free else 0.0}
+    return {"kind": kind, "a": float(math.exp(x[0])), "b": float(x[1]) if offset_free else 0.0}
+
+
+def fit_depth_mapping(samples: list[dict[str, Any]], *, camera: str, output_kind: str,
+                      floor_distance_m: float | None = None, meta: dict[str, Any] | None = None) -> dict[str, Any]:
+    """THE calibration procedure (one per camera). Fits the raw-depth -> metres mapping chosen by the
+    model's output semantics -- metric checkpoint: Z = s x raw + t; relative inverse depth d:
+    Z = 1 / (a x d + b); RealSense hardware depth may be checked the same way (metric_affine) -- to
+    INDEPENDENT geometric references only:
+      * each calibration placement's tape-measured top-surface height above the bin floor
+        (`reference_top_height_m`), measured through the same per-pixel geometry (`top_height`), at
+        several bin positions/depths;
+      * optionally the tape-measured PERPENDICULAR camera-to-floor distance (`floor_distance_m`).
+    No volume is fitted, so evaluation objects' volumes never enter. The offset is fitted only when the
+    perpendicular floor distance is given (heights alone do not identify it); otherwise only the scale is
+    fitted and the record says so.
+    samples: [{trial_id, object_id, depth (raw), baseline (raw), mask, roi, intrinsics, distortion,
+               fallback_shape, reference_top_height_m}] from CALIBRATION trials only."""
+    usable = [smp for smp in samples if smp.get("reference_top_height_m") and smp["reference_top_height_m"] > 0]
+    if not usable:
+        raise ValueError("calibration needs calibration placements with a measured top-surface height")
+    kind = "metric_affine" if output_kind == "metric" else "inverse_affine"
+    if kind == "inverse_affine" and not floor_distance_m:
+        raise ValueError("relative (inverse-depth) output needs the measured perpendicular floor distance too")
+    heights = [smp["reference_top_height_m"] for smp in usable]
+    # A depth offset moves an object's top and the floor below it almost equally, so heights pin the SCALE
+    # and barely the offset (synthetic: s 1.30 / t -0.08 m came back as s 1.24 from heights alone). Only an
+    # absolute distance -- the measured perpendicular floor distance -- identifies the offset.
+    offset_free = bool(floor_distance_m)
+
+    def predict(mapping):
+        out = []
+        for smp in usable:
+            r = measure_frame(smp["depth"][::2, ::2], smp["intrinsics"], smp["mask"][::2, ::2],
+                              smp["baseline"][::2, ::2], None if smp.get("roi") is None else smp["roi"][::2, ::2],
+                              mapping=mapping, distortion=None, fallback_shape=smp.get("fallback_shape"))
+            out.append((r.get("top_height_m"), r.get("plane_distance_m")))
+        return out
+
+    def cost(x):
+        mapping = _mapping_from(kind, x, offset_free)
+        total = 0.0
+        for (h, d), smp in zip(predict(mapping), usable):
+            if h is None or not np.isfinite(h):
+                return 1e6
+            total += (h - smp["reference_top_height_m"]) ** 2
+            if floor_distance_m and d is not None:
+                total += (d - floor_distance_m) ** 2 / len(usable)
+        return total
+
+    if kind == "metric_affine":
+        x0 = [0.0, 0.0]
+    else:
+        floor_raw = float(np.nanmedian(usable[0]["baseline"]))
+        x0 = [math.log(1.0 / (floor_raw * floor_distance_m)), 0.0]
+    if offset_free:
+        x, _ = _nelder_mead(cost, x0, [0.2, 0.05 if kind == "metric_affine" else 0.05 * abs(math.exp(x0[0]))])
+    else:
+        x, _ = _nelder_mead(lambda v: cost(np.array([v[0], 0.0])), [x0[0]], [0.2])
+        x = np.array([x[0], 0.0])
+    mapping = _mapping_from(kind, x, offset_free)
+    preds = predict(mapping)
+    residuals = [{"trial_id": smp.get("trial_id"), "object_id": smp.get("object_id"),
+                  "reference_top_height_m": smp["reference_top_height_m"],
+                  "fitted_top_height_m": None if h is None else round(h, 5),
+                  "residual_m": None if h is None else round(h - smp["reference_top_height_m"], 5),
+                  "residual_pct": None if h is None else round(100 * (h - smp["reference_top_height_m"])
+                                                                / smp["reference_top_height_m"], 3)}
+                 for (h, _), smp in zip(preds, usable)]
+    all_raw = np.concatenate([smp["depth"][smp["mask"] & np.isfinite(smp["depth"])] for smp in usable])
+    lo, hi = np.percentile(all_raw, (5, 95))
+    mapping["valid_raw_depth"] = [round(float(lo) * 0.9, 4), round(float(hi) * 1.1, 4)]
+    floor_check = None
+    if floor_distance_m:
+        d_fit = [d for _, d in preds if d is not None]
+        floor_check = {"measured_perpendicular_m": floor_distance_m,
+                       "fitted_m": None if not d_fit else round(float(np.median(d_fit)), 4)}
+    body = {"camera": camera, "procedure": "depth mapping fitted to measured top heights (+ perpendicular floor "
+                                          "distance) of calibration placements; no volumes fitted",
+            "measurement_version": MEASUREMENT_VERSION, "mapping": mapping, "output_kind": output_kind,
+            "offset_identifiable": offset_free,
+            "note": None if offset_free else ("no measured perpendicular floor distance: offset not identifiable, "
+                                              "fixed at 0; scale fitted to the heights"),
+            "align_background": False, "fitted_on": [{k: smp.get(k) for k in ("trial_id", "object_id",
+                                                                              "reference_top_height_m")} for smp in usable],
+            "calibration_objects": sorted({smp.get("object_id") for smp in usable}),
+            "fit_quality": {"n_placements": len(usable), "residuals": residuals, "floor_check": floor_check,
+                            "rms_height_residual_m": round(float(np.sqrt(np.nanmean(
+                                [r["residual_m"] ** 2 for r in residuals if r["residual_m"] is not None]))), 5),
+                            "reference_heights_m": [min(heights), max(heights)],
+                            "raw_depth_range": [round(float(lo), 4), round(float(hi), 4)]},
+            "created_at": time.time(), "frozen": True, **(meta or {})}
     body["calibration_id"] = f"{camera}-cal-{hashlib.sha1(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()[:10]}"
     return body
 
@@ -680,7 +859,8 @@ class ExperimentRecorder:
 
     # trials
     def start_trial(self, *, object_id: str, designation: str, placement: str = "", condition: str = "isolated",
-                    motion: str = "settled", trial_id: str | None = None) -> dict[str, Any]:
+                    motion: str = "settled", trial_id: str | None = None,
+                    top_height_m: float | None = None) -> dict[str, Any]:
         with self.lock:
             if self.session is None:
                 raise RuntimeError("start a session first")
@@ -699,6 +879,8 @@ class ExperimentRecorder:
                           "designation": designation, "placement": placement, "condition": condition,
                           "motion_requested": motion, "started_at": time.time(),
                           "reference_volume_l": obj["reference_volume_l"], "reference": obj,
+                          # tape-measured top-surface height above the floor in THIS placement (calibration)
+                          "reference_top_height_m": top_height_m,
                           "software": self.session["software"], "cameras": {}, "_frames": {c: [] for c in CAMERAS},
                           "_settled_at": {}, "_still_since": {}}
             self._motion = {}
@@ -722,25 +904,45 @@ class ExperimentRecorder:
                    "intrinsics": scaled_intrinsics(payload.intrinsics, payload.depth.shape, payload.rgb.shape[:2]),
                    **{k: payload.meta.get(k) for k in ("depth_model", "output_kind", "intrinsics_source", "depth_units")}}
         reasons += [f"baseline invalid: {r}" for r in compatibility(baseline, current)]
-        if payload.meta.get("output_kind") not in (None, "metric"):
-            reasons.append("relative (inverse) depth output: no fixed metric geometry; use a metric checkpoint")
         calibration = self.calibration(camera)
+        distortion = payload.meta.get("distortion")
         if calibration is None:
             if camera == "logitech":
                 reasons.append("no frozen Logitech calibration (run the calibration procedure)")
                 return None, reasons
-            setup = {"depth_scale": 1.0, "align_background": False, "calibration_id": "factory-depth-scale"}
+            setup = {"mapping": {"kind": "scale", "scale": 1.0}, "align_background": False,
+                     "calibration_id": "factory-depth-scale", "distortion": distortion}
         else:
             reasons += [f"calibration invalid: {r}" for r in compatibility(calibration, {**current, "plane": baseline.get("plane")})]
-            setup = {k: calibration[k] for k in ("depth_scale", "align_background", "calibration_id")}
+            setup = {"mapping": calibration["mapping"], "align_background": calibration.get("align_background", False),
+                     "calibration_id": calibration["calibration_id"], "distortion": distortion}
+        if payload.meta.get("output_kind") not in (None, "metric") and setup["mapping"].get("kind") != "inverse_affine":
+            reasons.append("relative (inverse) depth output needs an inverse-depth calibration")
         return (None if reasons else setup), reasons
 
     def wants_frames(self) -> bool:
         """Cheap check for the pipeline: only a baseline capture or a running trial needs frames."""
         return self._capture is not None or self.trial is not None
 
+    def cameras_path(self) -> Path:
+        return self.root / "cameras.json"
+
+    def _apply_camera_config(self, payload: FramePayload) -> None:
+        """Measured intrinsics/distortion for this camera (cameras.json, e.g. from the checkerboard
+        command) replace the pipeline's (Logitech: field-of-view estimate); recorded as the source."""
+        try:
+            config = json.loads(self.cameras_path().read_text(encoding="utf-8")).get(payload.camera)
+        except (OSError, ValueError):
+            config = None
+        if config:
+            payload.intrinsics = dict(config["intrinsics"])
+            payload.meta["intrinsics_source"] = f"measured: {config.get('source', 'cameras.json')}"
+            payload.meta["distortion"] = config.get("distortion")
+        payload.meta.setdefault("distortion", None)
+
     def observe(self, payload: FramePayload) -> None:
         """Called for every processed frame of each camera."""
+        self._apply_camera_config(payload)
         with self.lock:
             if self._capture is not None and payload.camera in self._capture and payload.depth is not None:
                 frames = self._capture[payload.camera]
@@ -810,7 +1012,7 @@ class ExperimentRecorder:
         if setup is not None and payload.masks:
             result = measure_objects(payload.depth, payload.intrinsics, payload.masks,
                                      self._baseline_depth[payload.camera], payload.roi,
-                                     scale=setup["depth_scale"], align_background=setup["align_background"],
+                                     **_setup_kwargs(setup),
                                      fallback_shape=payload.rgb.shape[:2])
         else:
             result = {"volume_l": None, "status": "unavailable",
@@ -862,6 +1064,13 @@ class ExperimentRecorder:
                     "last_trial": None if self.last_trial is None else trial_rows(self.last_trial)}
 
 
+def _setup_kwargs(setup: dict[str, Any]) -> dict[str, Any]:
+    """measure_frame keyword arguments from a recorded setup (older records carry depth_scale)."""
+    mapping = setup.get("mapping") or {"kind": "scale", "scale": float(setup.get("depth_scale", 1.0))}
+    return {"mapping": mapping, "align_background": bool(setup.get("align_background", False)),
+            "distortion": setup.get("distortion")}
+
+
 def aggregate_trial(frames: list[dict[str, Any]], motion_requested: str, settled: bool) -> dict[str, Any]:
     """Trial value = MEDIAN of the valid frame volumes inside the trial's window (settled frames, or all
     frames of a 'moving' trial); fewer than MIN_VALID_FRAMES_PER_TRIAL valid frames -> unavailable."""
@@ -889,8 +1098,18 @@ def aggregate_trial(frames: list[dict[str, Any]], motion_requested: str, settled
                    reasons=[f"{len(vols)} valid frames < {MIN_VALID_FRAMES_PER_TRIAL}"] + sorted(reasons, key=reasons.get, reverse=True)[:1])
     else:
         a = np.asarray(vols)
-        out.update(volume_l=round(float(np.median(a)), 5), status="ok", reasons=[],
-                   frame_iqr_l=round(float(np.percentile(a, 75) - np.percentile(a, 25)), 5))
+        median = float(np.median(a))
+        iqr = float(np.percentile(a, 75) - np.percentile(a, 25))
+        out.update(frame_iqr_l=round(iqr, 5), frame_iqr_rel=round(iqr / median, 4) if median > 0 else None)
+        tops = [f.get("result", {}).get("top_height_m") for f in window if f.get("volume_l") is not None]
+        tops = [t for t in tops if t is not None]
+        out["top_height_m"] = round(float(np.median(tops)), 5) if tops else None
+        if median > 0 and iqr / median > MAX_FRAME_IQR_REL:
+            out.update(volume_l=None, status="unstable", volume_l_unstable_median=round(median, 5),
+                       reasons=[f"frame volumes vary by {iqr / median:.0%} (IQR/median) in the settled window "
+                                f"(> {MAX_FRAME_IQR_REL:.0%})"])
+        else:
+            out.update(volume_l=round(median, 5), status="ok", reasons=[])
     return out
 
 
@@ -898,6 +1117,10 @@ def trial_rows(record: dict[str, Any]) -> list[dict[str, Any]]:
     rows = []
     for camera, res in record.get("cameras", {}).items():
         setups = [f.get("setup") for f in res.get("frames", []) if f.get("setup")]
+        saved = [f for f in res.get("frames", []) if f.get("saved")]
+        last = saved[-1] if saved else {}
+        meta = last.get("meta") or {}
+        mapping = (setups[-1] or {}).get("mapping") if setups else None
         rows.append({"session_id": record["session_id"], "trial_id": record["trial_id"], "camera": camera,
                      "object_id": record["object_id"], "designation": record["designation"],
                      "condition": record["condition"], "placement": record["placement"],
@@ -907,6 +1130,15 @@ def trial_rows(record: dict[str, Any]) -> list[dict[str, Any]]:
                      "valid_frames": res.get("valid_frames"), "window_frames": res.get("window_frames"),
                      "reasons": "; ".join(res.get("reasons") or []),
                      "calibration_id": setups[-1]["calibration_id"] if setups else None,
+                     "depth_mapping": None if not mapping else json.dumps({k: v for k, v in mapping.items()
+                                                                          if k != "valid_raw_depth"}),
+                     "baseline_id": last.get("baseline_id"), "depth_model": meta.get("depth_model"),
+                     "output_kind": meta.get("output_kind"), "intrinsics_source": meta.get("intrinsics_source"),
+                     "distortion_modelled": bool(meta.get("distortion")),
+                     "resolution": None if not last.get("intrinsics") else
+                     f"{last['intrinsics'].get('width')}x{last['intrinsics'].get('height')}",
+                     "frame_iqr_rel": res.get("frame_iqr_rel"), "top_height_m": res.get("top_height_m"),
+                     "reference_top_height_m": record.get("reference_top_height_m"),
                      "quantity": QUANTITY, "measurement_version": MEASUREMENT_VERSION,
                      "commit": (record.get("software") or {}).get("commit")})
     return rows
@@ -955,7 +1187,11 @@ def replay_trial(trial_dir: Path, setups: dict[str, dict[str, Any]] | None = Non
             if not f.get("saved"):
                 frames.append(f)
                 continue
-            setup = (setups or {}).get(camera) or f.get("setup")
+            override = (setups or {}).get(camera)
+            setup = f.get("setup")
+            if override is not None:
+                # a new calibration replaces the mapping; the frame's own camera geometry (distortion) stays
+                setup = {"distortion": (f.get("meta") or {}).get("distortion"), **override}
             g = dict(f)
             if f.get("setup_blockers"):
                 g.update(volume_l=None, status="unavailable", reasons=f["setup_blockers"])
@@ -972,8 +1208,8 @@ def replay_trial(trial_dir: Path, setups: dict[str, dict[str, Any]] | None = Non
                 g.update(volume_l=None, status="unavailable", reasons=["no object mask in this frame"])
             else:
                 r = measure_objects(raw["depth"], f["intrinsics"], masks, base,
-                                    raw["roi"] if raw["roi"].size else None, scale=setup["depth_scale"],
-                                    align_background=setup["align_background"], fallback_shape=raw["rgb"].shape[:2])
+                                    raw["roi"] if raw["roi"].size else None, **_setup_kwargs(setup),
+                                    fallback_shape=raw["rgb"].shape[:2])
                 g.update(volume_l=r["volume_l"], status=r["status"], reasons=r["reasons"],
                          volume_l_partial=r.get("volume_l_partial"), setup=setup)
             frames.append(g)
@@ -982,6 +1218,49 @@ def replay_trial(trial_dir: Path, setups: dict[str, dict[str, Any]] | None = Non
         agg["recorded_volume_l"] = res.get("volume_l")
         out["cameras"][camera] = agg
     return out
+
+
+def calibration_samples(trial_dir: Path, camera: str) -> list[dict[str, Any]]:
+    """Raw inputs of a CALIBRATION trial for `fit_depth_mapping`: its middle saved settled frame."""
+    trial_dir = Path(trial_dir)
+    record = json.loads((trial_dir / "trial.json").read_text(encoding="utf-8"))
+    if record.get("designation") != "calibration" or camera not in record.get("cameras", {}):
+        return []
+    frames = [f for f in record["cameras"][camera].get("frames", [])
+              if f.get("saved") and f.get("phase") == "settled" and f.get("baseline_file") and not f.get("setup_blockers")]
+    if not frames:
+        return []
+    f = frames[len(frames) // 2]
+    raw = np.load(trial_dir / f["file"])
+    if not raw["masks"].size:
+        return []
+    base = np.load(trial_dir.parent.parent / f["baseline_file"])["median"]
+    mask = np.zeros(raw["depth"].shape, bool)
+    for m in raw["masks"]:
+        mask |= _resize_mask(m, raw["depth"].shape)
+    roi = _resize_mask(raw["roi"], raw["depth"].shape) if raw["roi"].size else None
+    depth, baseline = raw["depth"], base
+    k = scaled_intrinsics(f["intrinsics"], depth.shape, raw["rgb"].shape[:2])
+    if (f.get("meta") or {}).get("distortion"):
+        depth, baseline, mask, roi_u = undistort_inputs(k, f["meta"]["distortion"], depth, base, mask,
+                                                         np.ones(depth.shape, bool) if roi is None else roi)
+        roi = roi_u
+    return [{"trial_id": record["trial_id"], "object_id": record["object_id"], "depth": depth, "baseline": baseline,
+             "mask": mask, "roi": roi, "intrinsics": k, "fallback_shape": None,
+             "reference_top_height_m": record.get("reference_top_height_m"), "baseline_file": f["baseline_file"],
+             "meta": f.get("meta") or {}}]
+
+
+def intrinsics_from_corners(object_points: list[np.ndarray], image_points: list[np.ndarray],
+                            image_size: tuple[int, int], source: str) -> dict[str, Any]:
+    """Measured pinhole intrinsics + distortion from checkerboard correspondences (cv2.calibrateCamera)."""
+    import cv2
+    rms, K, dist, _, _ = cv2.calibrateCamera([o.astype(np.float32) for o in object_points],
+                                             [i.astype(np.float32) for i in image_points], image_size, None, None)
+    return {"intrinsics": {"fx": float(K[0, 0]), "fy": float(K[1, 1]), "ppx": float(K[0, 2]), "ppy": float(K[1, 2]),
+                           "width": int(image_size[0]), "height": int(image_size[1])},
+            "distortion": [float(v) for v in dist.ravel()[:5]], "reprojection_rms_px": float(rms),
+            "views": len(image_points), "source": source, "created_at": time.time()}
 
 
 def env_criteria() -> dict[str, Any]:

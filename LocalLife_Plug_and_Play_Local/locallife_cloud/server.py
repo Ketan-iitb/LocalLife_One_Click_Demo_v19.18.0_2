@@ -1050,7 +1050,8 @@ def create_app(
                 return jsonify(recorder.start_trial(
                     object_id=str(body["object_id"]), designation=str(body["designation"]),
                     placement=str(body.get("placement", "")), condition=str(body.get("condition", "isolated")),
-                    motion=str(body.get("motion", "settled"))))
+                    motion=str(body.get("motion", "settled")),
+                    top_height_m=None if body.get("top_height_m") is None else float(body["top_height_m"])))
             if action == "trial-stop":
                 record = recorder.stop_trial()
                 return jsonify({"stopped": record is not None})
