@@ -71,6 +71,7 @@ class Detection:
     resolved_label: str | None = None
     resolved_share: float | None = None
     support_method: str | None = None
+    support_diagnostics: dict | None = None          # V54: depth/plane/coverage/footprint trace of the reading
     support_raw_volume_l: float | None = None        # Logitech: before the known-object factor
     material: str = "unknown"
     material_confidence: float = 0.0
@@ -227,6 +228,7 @@ class Detection:
             "support_length_cm": self.support_length_cm,
             "support_width_cm": self.support_width_cm,
             "support_method": self.support_method,
+            "support_diagnostics": self.support_diagnostics,
             "support_raw_volume_l": self.support_raw_volume_l,
             "raw_label": self.label,
             "resolved_label": self.resolved_label,

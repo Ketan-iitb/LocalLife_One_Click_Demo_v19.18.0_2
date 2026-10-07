@@ -22,7 +22,7 @@ def _intrinsics(k: Any) -> dict | None:
 
 def _detection(d: Any) -> dict:
     keys = ("label", "confidence", "box", "source", "track_id", "color", "material", "material_confidence",
-            "accepted_class", "support_volume_l", "support_height_cm", "support_length_cm", "support_width_cm",
+            "accepted_class", "support_volume_l", "support_height_cm", "support_length_cm", "support_width_cm", "support_diagnostics",
             "realsense_volume_l", "monocular_volume_l")
     out = {}
     for key in keys:

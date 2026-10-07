@@ -566,6 +566,61 @@ class FillEstimator:
 
     def object_volume(self, box, mask: np.ndarray | None, now: float,
                       rigid_hint: bool = False, deformable_hint: bool = False) -> tuple[float, float] | None:
+        """`_object_volume` plus V54 diagnostics in `last_object["diagnostics"]` (whatever path answered)."""
+        self._diag_ctx = None
+        result = self._object_volume(box, mask, now, rigid_hint=rigid_hint, deformable_hint=deformable_hint)
+        try:
+            diag = self._object_diagnostics()
+        except Exception:  # noqa: BLE001 - diagnostics never break a measurement
+            diag = None
+        if diag is not None:
+            self.last_object = {**(self.last_object or {}), "diagnostics": diag}
+        return result
+
+    def _object_diagnostics(self) -> dict[str, Any] | None:
+        """What a wrong live reading needs to be traced: depth of the object and of the surface around it,
+        the plane/scale used, valid coverage, perpendicular heights, the metric footprint and the share of
+        that footprint that rises < 25 % of the top (a large 'low skirt' = floor counted as object: mask
+        leakage, or monocular depth smeared across the object's edge)."""
+        ctx = getattr(self, "_diag_ctx", None)
+        if not ctx:
+            return None
+        surface, top, ring, inside, support = ctx
+        z = surface["z"]
+        full = surface.get("full") or {}
+
+        def pct(values):
+            values = values[np.isfinite(values)]
+            return None if not values.size else [round(float(v), 4) for v in np.percentile(values, (10, 50, 90))]
+
+        rise = surface["height"][top] - support
+        risen = rise > 0.02
+        diag = {"object_depth_m_p10_50_90": pct(z[top]), "support_depth_m_p10_50_90": pct(z[ring]),
+                "valid_coverage": round(float(np.count_nonzero(top)) / max(1, int(np.count_nonzero(inside))), 3),
+                "support_height_m": round(support, 4), "up_vector": [round(float(v), 4) for v in surface["up"]],
+                "depth_scale": full.get("scale"), "scale_drift": full.get("drift"),
+                "floor_source": (getattr(self, "last_diag", {}) or {}).get("floor_source"),
+                "perpendicular_height_m_p50_90": pct(rise[risen]) and pct(rise[risen])[1:],
+                "risen_pixels": int(np.count_nonzero(risen))}
+        if np.count_nonzero(risen) >= 10:
+            raster = _floor_raster(surface, _mask_from(top, risen), np.where(top, surface["height"] - support, 0.0))
+            pts = np.c_[surface["x"][top][risen], surface["y"][top][risen], surface["z"][top][risen]]
+            up = np.asarray(surface["up"], float) / max(1e-9, float(np.linalg.norm(surface["up"])))
+            e1 = np.cross(up, [1.0, 0.0, 0.0] if abs(up[0]) < 0.9 else [0.0, 1.0, 0.0])
+            e1 /= np.linalg.norm(e1)
+            e2 = np.cross(up, e1)
+            import cv2
+            uv = np.c_[pts @ e1, pts @ e2].astype(np.float32)
+            diag["footprint_hull_m2"] = round(float(cv2.contourArea(cv2.convexHull(uv))), 5)
+            topv = float(np.percentile(rise[risen], 95))
+            diag["low_skirt_fraction"] = round(float(np.mean(rise[risen] < 0.25 * topv)), 3)
+            if raster is not None:
+                diag["integrated_litres_floor_raster"] = round(raster["litres"], 3)
+                diag["raster_cell_m"] = round(raster["cell_m"], 4)
+        return diag
+
+    def _object_volume(self, box, mask: np.ndarray | None, now: float,
+                       rigid_hint: bool = False, deformable_hint: bool = False) -> tuple[float, float] | None:
         """(litres, height m) of one detection above the surface AROUND it, from this camera's own map.
 
         Volume = sum over the object's pixels of (height - local support) x pixel floor area. The local
@@ -612,6 +667,7 @@ class FillEstimator:
             height = surface["height"]
             support_px = height[ring & ok]
             support = float(np.percentile(support_px, 50)) if support_px.size else 0.0
+        self._diag_ctx = (surface, top, ring & ok, inside, support)
         # A closed rigid box shows a flat rectangular face: measure it as a cuboid from its own
         # face and an OBSERVED thickness (side face / support at its low edge), not as the volume
         # above a ring median -- on uneven bags that support cut the box's low end off (45 cm box
@@ -1203,6 +1259,13 @@ def _oriented_box(surface: dict[str, Any], cells: np.ndarray, support: float | N
             "litres": ext[0] * ext[1] * ext[2] * 1000.0, "faces": len(normals),
             "coverage": float(len(on_faces)) / max(1, len(pts)),
             "method": f"box from {len(normals)} visible faces: extents along the faces' own axes (L x W x H)"}
+
+
+def _mask_from(base: np.ndarray, selected: np.ndarray) -> np.ndarray:
+    """A full-size mask of the `selected` entries among `base`'s True pixels."""
+    out = np.zeros_like(base)
+    out[np.nonzero(base)[0][selected], np.nonzero(base)[1][selected]] = True
+    return out
 
 
 def _floor_raster(surface: dict[str, Any], risen: np.ndarray, rise_map: np.ndarray) -> dict[str, float] | None:

@@ -404,6 +404,10 @@ def measure_frame(depth: np.ndarray, intrinsics: Any, mask: np.ndarray, baseline
     out["volume_l_partial"] = round(volume_l, 5)
     out["height_max_m"] = round(float(np.percentile(rise[up], 99)), 4)
     out["top_height_m"] = round(top_height(rise[up]), 5)
+    # share of the integrated footprint rising < 25 % of the top: floor counted as object (mask leakage,
+    # monocular depth smeared over the object's edge) shows here; a box has ~0, a domed bag up to ~25 %
+    top95 = float(np.percentile(rise[up], 95))
+    out["low_skirt_area_fraction"] = round(float(np.sum(a[up][rise[up] < 0.25 * top95]) / max(np.sum(a[up]), 1e-12)), 4)
     out["plane_distance_m"] = round(float(plane["d"]), 5)
     # coverage: cells of the footprint's convex hull that were actually seen
     import cv2

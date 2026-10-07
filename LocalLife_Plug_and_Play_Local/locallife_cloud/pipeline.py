@@ -3317,6 +3317,22 @@ class VisionPipeline:
                             history.pop(key, None)
                     sample = sorted(samples, key=lambda v: v[1])[len(samples) // 2]
                 _, litres, height_m, length_m, width_m, method = sample
+                k = intrinsics if self.camera_id != "logitech" else (
+                    measure_intrinsics or self._field_of_view_intrinsics(frame.shape))
+                item.support_diagnostics = {
+                    **(dims.get("diagnostics") or {}), "camera": self.camera_id,
+                    "this_frame_litres": round(float(estimate[0]), 3), "aggregated_litres": round(float(litres), 3),
+                    "aggregation": "median-volume sample of this track's last 15 s (same geometry only)",
+                    "method": dims.get("method"), "shape_model": dims.get("shape_model"),
+                    "intrinsics": None if k is None else {"fx": round(float(k.fx), 2), "fy": round(float(k.fy), 2),
+                                                          "ppx": round(float(k.ppx), 2), "ppy": round(float(k.ppy), 2)},
+                    "intrinsics_source": ("realsense-factory" if self.camera_id != "logitech"
+                                          else "provided" if intrinsics is not None else "field-of-view estimate"),
+                    "depth_source": "aligned hardware depth" if self.camera_id != "logitech"
+                    else f"{self.config.depth_model} ({self.calibration_mode}); floor rescale "
+                         f"{(self.logitech_floor_scale or {}).get('state')}",
+                    "quantity": "visible volume above the local surface (live diagnostic; the camera comparison "
+                                "uses the experiment's empty-baseline per-pixel path)"}
                 item.support_volume_l = round(float(litres), 2)
                 item.support_height_cm = round(float(height_m) * 100, 1)
                 if length_m:

@@ -413,3 +413,53 @@ class CameraModelAndValidityTests(unittest.TestCase):
         depth, mask, empty = render((0.20, 0.10, 0.10))
         test = ve.measure_frame(inv(depth), KW, mask, inv(empty), mapping=fit["mapping"])
         self.assertLess(abs(test["volume_l_partial"] - 2.0) / 2.0, 0.06)
+
+
+class PlacementRobustnessTests(unittest.TestCase):
+    """Fixed oblique camera (45 deg from vertical, 0.8 m above the floor, 3 mm depth noise); the same rigid
+    boxes at centre/near/far/left/right, upright and lying. Their volume is constant; the estimate's
+    error and spread across placements are what is checked (not identical readings)."""
+
+    def test_rigid_boxes_across_positions_and_orientations(self):
+        offsets = {"centre": (0.0, 0.0), "near": (0.0, -0.12), "far": (0.0, 0.12),
+                   "left": (-0.15, 0.0), "right": (0.15, 0.0)}
+        poses = {"1L upright": (0.10, 0.10, 0.10), "2L lying": (0.20, 0.10, 0.10), "2L on end": (0.10, 0.10, 0.20)}
+        empty = _scene(lambda x, y: 0 * x, None, 45.0, cam=0.8, far=2.4)[0]
+        for pose, dims in poses.items():
+            truth = dims[0] * dims[1] * dims[2] * 1000.0
+            estimates = []
+            for name, (dx, dy) in offsets.items():
+                centre, axes, half = _obb(*dims, 0.0, 30.0, 0.0)
+                depth, mask = _scene(lambda x, y: 0 * x, (centre + np.array([dx, dy, 0.0]), axes, half), 45.0,
+                                     cam=0.8, far=2.4)
+                r = ve.measure_frame(noisy(depth, seed=7), KW, mask, noisy(empty, seed=8))
+                with self.subTest(pose=pose, placement=name):
+                    self.assertEqual(r["status"], "ok", r["reasons"])
+                    self.assertLess(abs(r["volume_l"] - truth) / truth, 0.04)
+                    self.assertLess(r["low_skirt_area_fraction"], 0.10)
+                    estimates.append(r["volume_l"])
+            self.assertLess((max(estimates) - min(estimates)) / truth, 0.06, (pose, estimates))
+
+    def test_smeared_monocular_depth_shows_as_a_low_skirt(self):
+        import cv2
+        depth, mask, empty = render((0.10, 0.10, 0.20))
+        rows, cols = np.nonzero(mask)
+        loose = np.zeros_like(mask)                              # a box-shaped detector mask
+        loose[rows.min() - 12:rows.max() + 12, cols.min() - 12:cols.max() + 12] = True
+        smeared = cv2.GaussianBlur(depth, (0, 0), 6)               # depth bled across the object's edges
+        clean = ve.measure_frame(depth, KW, loose, empty)
+        bad = ve.measure_frame(smeared, KW, loose, empty)
+        self.assertLess(clean["low_skirt_area_fraction"], 0.05)
+        self.assertGreater(bad["low_skirt_area_fraction"], 0.2)
+        self.assertGreater(bad["volume_l_partial"], clean["volume_l_partial"])   # the footprint spreads
+
+
+class LiveDiagnosticsTests(unittest.TestCase):
+    def test_live_support_reading_carries_its_trace(self):
+        from test_v51_box_rotation import measure
+        result, obj = measure((0.10, 0.10, 0.20), 45.0, 0.8)
+        diag = obj["diagnostics"]
+        for key in ("object_depth_m_p10_50_90", "support_depth_m_p10_50_90", "valid_coverage", "up_vector",
+                    "perpendicular_height_m_p50_90", "footprint_hull_m2", "low_skirt_fraction"):
+            self.assertIn(key, diag)
+        self.assertAlmostEqual(diag["footprint_hull_m2"], 0.01, delta=0.003)   # a 10 x 10 cm base
