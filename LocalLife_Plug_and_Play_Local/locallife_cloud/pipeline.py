@@ -2138,9 +2138,6 @@ class VisionPipeline:
             if leak_trimmed:
                 detection.dimension_flags = tuple(dict.fromkeys(
                     tuple(detection.dimension_flags or ()) + ("leaked_mask_pixels_trimmed",)))
-            # The box-cuboid estimator erodes its own mask against leaks; it
-            # keeps the unfiltered one, or its edge would be cut twice.
-            cuboid_mask = instance_mask
             if self.camera_id != "logitech" and depth_m is not None and np.any(instance_mask):
                 # Stereo "flying pixels" along the silhouette put points
                 # between the object and the floor, which smears the
@@ -2151,6 +2148,9 @@ class VisionPipeline:
                     # is the visible part only. Flagged, never clamped.
                     detection.dimension_flags = tuple(dict.fromkeys(
                         tuple(detection.dimension_flags or ()) + ("object_cropped_by_frame_border",)))
+            # V54: the box-cuboid estimator no longer erodes its mask (erosion cut real edges and made the size
+            # depend on distance), so it uses the same flying-pixel-filtered mask as the per-pixel path.
+            cuboid_mask = instance_mask
             logitech_height_coherent = True
             if depth_m is not None:
                 valid_distance = instance_mask & np.isfinite(depth_m) & (depth_m > 0.10) & (depth_m < 20.0)
