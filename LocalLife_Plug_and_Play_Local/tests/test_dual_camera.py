@@ -790,7 +790,11 @@ class LogitechTuningTests(unittest.TestCase):
         self.assertTrue(diagnostics["applied"])
         self.assertGreater(diagnostics["anchor_pixels"], 5000)
         self.assertAlmostEqual(float(np.median(fixed[~self.object_mask])), 2.0, places=4)
-        self.assertAlmostEqual(float(np.median(fixed[self.object_mask])), 1.7, places=3)
+        # V54: the background is ONE depth (2.0 vs 1.8 m), so "+0.2 m offset" (object -> 1.70 m) and "x 1.111
+        # scale" (object -> 1.667 m) explain it equally; the old 1.70 expectation was an arbitrary choice
+        # between them. Such a fit is now scale-only and labelled.
+        self.assertIn("scale only", diagnostics["fit"])
+        self.assertAlmostEqual(float(np.median(fixed[self.object_mask])), 1.5 * 2.0 / 1.8, places=3)
 
     def test_depth_is_not_adjusted_when_no_static_background_exists(self) -> None:
         reference = np.full((80, 100), 2.0, dtype=np.float32)

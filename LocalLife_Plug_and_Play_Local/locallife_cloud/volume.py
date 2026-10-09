@@ -1097,6 +1097,33 @@ def object_plane_points(
     return footprint, height_map[elevated].astype(np.float64)
 
 
+
+
+
+
+
+
+def _depth_edge_pixels(depth: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    """The FARTHER pixel of each neighbour pair across a depth jump > 2 cm + 2 %: stereo "flying pixels"
+    lie between an object's edge and the floor behind it, i.e. on the far side of the jump. The object's
+    own edge pixel (the near side) is kept, so real edges are not shortened."""
+    z = np.where(valid, depth, np.nan)
+    edge = np.zeros(depth.shape, bool)
+    for axis in (0, 1):
+        a = z[:-1] if axis == 0 else z[:, :-1]
+        b = z[1:] if axis == 0 else z[:, 1:]
+        jump = np.nan_to_num(np.abs(b - a), nan=0.0) > 0.02 + 0.02 * np.nan_to_num(np.fmin(a, b), nan=0.0)
+        a_far = jump & (np.nan_to_num(a, nan=0.0) > np.nan_to_num(b, nan=0.0))
+        b_far = jump & ~a_far
+        if axis == 0:
+            edge[:-1] |= a_far
+            edge[1:] |= b_far
+        else:
+            edge[:, :-1] |= a_far
+            edge[:, 1:] |= b_far
+    return edge
+
+
 def estimate_box_volume_cuboid(
     depth_m: np.ndarray | None,
     intrinsics: CameraIntrinsics | None,
@@ -1158,9 +1185,13 @@ def estimate_box_volume_cuboid(
     height_map = _plane_perpendicular_height(depth, intrinsics, reference_plane.coefficients)
     if height_map is None:
         return None
+    # V54: geometry uses the ORIGINAL mask (erosion cut every edge: a 20 cm box read 17.6-18.6 cm); floor
+    # leakage is removed by the height threshold, stereo "flying pixels" by dropping depth-edge pixels.
+    del eroded_mask
     valid = (
-        eroded_mask
+        geometric_mask
         & depth_ok
+        & ~_depth_edge_pixels(depth, depth_ok)
         & np.isfinite(height_map)
         & (height_map >= min_height_m)
         & (height_map <= max_height_m)
@@ -1185,7 +1216,10 @@ def estimate_box_volume_cuboid(
     # back to a higher, narrower percentile if too few points land in that
     # band to take a stable median from (PDF section 2's pseudocode: "never
     # raw max(h)").
-    threshold = float(np.percentile(height, height_percentile))
+    # V54: the whole top-face band (within 1.5 cm of the 95th percentile), not the top 10 % of samples:
+    # selecting the highest noisy samples biased the height up (+4 mm at 3 mm noise).
+    threshold = float(np.percentile(height, 95)) - 0.015
+    del height_percentile
     top_band = height[height >= threshold]
     if top_band.size < 5:
         threshold = float(np.percentile(height, fallback_height_percentile))
@@ -1211,17 +1245,22 @@ def estimate_box_volume_cuboid(
     u = points @ u_hat
     v = points @ v_hat
     footprint = np.column_stack((u, v))
-    footprint -= footprint.mean(axis=0)
-    covariance = np.cov(footprint, rowvar=False)
-    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
-    # eigh returns ascending eigenvalues; the largest-variance axis last.
-    principal = footprint @ eigenvectors
-    axis_a = principal[:, 1]
-    axis_b = principal[:, 0]
-    low_a, high_a = np.percentile(axis_a, (footprint_trim_percentile, 100 - footprint_trim_percentile))
-    low_b, high_b = np.percentile(axis_b, (footprint_trim_percentile, 100 - footprint_trim_percentile))
-    length_m = max(0.0, float(high_a - low_a))
-    width_m = max(0.0, float(high_b - low_b))
+    # V54: footprint = minimum-area rectangle of ALL visible box points projected onto the support plane
+    # (top-face points cover the top, side-face points fall on its edges). PCA + 2-98 % trimming made the
+    # axes depend on where pixels happen to be dense (oblique views) and was undefined for a square base:
+    # 45 independent placements/rotations of three boxes read -33 % ... +18 %. Point centres sit half a
+    # pixel inside each edge, so one pixel pitch (at the object's depth) is added per axis.
+    del footprint_trim_percentile
+    import cv2
+    # Orientation from the rectangle; extents as the 1st-99th percentile along its axes (the extreme points
+    # of a noisy cloud stretch a hull), plus the pitch.
+    (_, _), _, angle = cv2.minAreaRect(footprint.astype(np.float32))
+    t = math.radians(angle)
+    along = footprint @ np.array([[math.cos(t), -math.sin(t)], [math.sin(t), math.cos(t)]])
+    sides = [float(np.percentile(along[:, i], 99) - np.percentile(along[:, i], 1)) for i in (0, 1)]
+    pitch_m = float(np.median(z)) / math.sqrt(intrinsics.fx * intrinsics.fy)
+    length_m = max(sides)
+    width_m = min(sides)
     if length_m <= 0 or width_m <= 0:
         return None
 

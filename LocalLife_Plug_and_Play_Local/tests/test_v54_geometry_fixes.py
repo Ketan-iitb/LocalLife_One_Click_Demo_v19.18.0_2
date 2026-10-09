@@ -122,3 +122,82 @@ class MeasurementContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RigidCuboidPlacementTests(unittest.TestCase):
+    """The live RealSense box path (estimate_box_volume_cuboid) on independently ray-traced boxes, fixed
+    oblique camera (45 deg, 0.8 m, 3 mm noise). Before: PCA + 2-98 % trimming of an eroded mask read
+    -33 % ... +18 % over these placements."""
+
+    def test_volume_and_sorted_edges_do_not_depend_on_placement_or_rotation(self):
+        from locallife_cloud.volume import estimate_box_volume_cuboid
+        empty = _scene(lambda x, y: 0 * x, None, 45.0, cam=0.8, far=2.4)[0]
+        plane = fit_reference_plane(empty, KW)
+        for name, dims in (("upright carton", (0.09, 0.09, 0.20)), ("lying carton", (0.20, 0.09, 0.09)),
+                           ("2 L box", (0.20, 0.10, 0.10))):
+            truth = dims[0] * dims[1] * dims[2] * 1000.0
+            volumes = []
+            for yaw in (0.0, 25.0, 45.0):
+                for dx, dy in ((0, -0.15), (0, 0), (0, 0.15), (-0.15, 0), (0.15, 0)):
+                    centre, axes, half = _obb(*dims, 0, yaw, 0.0)
+                    depth, mask = _scene(lambda x, y: 0 * x, (centre + np.array([dx, dy, 0.0]), axes, half), 45.0,
+                                         cam=0.8, far=2.4)
+                    depth = depth + np.random.default_rng(5).normal(0, 0.003, depth.shape).astype(np.float32)
+                    r = estimate_box_volume_cuboid(depth, KW, mask, plane)
+                    with self.subTest(box=name, yaw=yaw, at=(dx, dy)):
+                        self.assertIsNotNone(r)
+                        self.assertLess(abs(r.volume_liters - truth) / truth, 0.09)
+                        edges = sorted((r.length_mm, r.width_mm), reverse=True)
+                        for got, want in zip(edges, sorted((dims[0], dims[1]), reverse=True)):
+                            self.assertLess(abs(got / 1000.0 - want), 0.012)      # footprint edges
+                        self.assertLess(abs(r.height_mm / 1000.0 - dims[2]), 0.006)  # height above support
+                        volumes.append(r.volume_liters)
+            self.assertLess((max(volumes) - min(volumes)) / truth, 0.12, (name, volumes))
+
+    def test_insufficient_geometry_gives_no_cuboid(self):
+        from locallife_cloud.volume import estimate_box_volume_cuboid
+        empty = _scene(lambda x, y: 0 * x, None, 45.0, cam=0.8, far=2.4)[0]
+        depth, mask = _scene(lambda x, y: 0 * x, _obb(0.02, 0.02, 0.03, 0, 0, 0.0), 45.0, cam=0.8, far=2.4)
+        self.assertIsNone(estimate_box_volume_cuboid(depth, KW, mask, fit_reference_plane(empty, KW)))
+
+
+class MeasurementStateTests(unittest.TestCase):
+    def test_per_pixel_result_survives_a_cuboid_selection(self):
+        fake = SimpleNamespace(box_templates=[], config=SimpleNamespace(realsense_max_item_volume_l=250.0))
+        det = Detection("cardboard box", 0.9, (0, 0, 10, 10))
+        det.realsense_volume_l = det.per_pixel_volume_l = 2.05
+        det.per_pixel_raw_volume_l = 2.05
+        VisionPipeline._apply_box_cuboid(fake, det, MeasurementContractTests._cuboid(None, 1.97), [])
+        self.assertEqual((det.per_pixel_volume_l, det.cuboid_volume_l, det.realsense_volume_l), (2.05, 1.97, 1.97))
+        self.assertIn("cuboid", det.volume_selected_method)
+        self.assertIn("per_pixel_volume_l", det.volume_selection_reason)
+
+    def test_a_moved_or_turned_object_starts_a_new_measurement_history(self):
+        from locallife_cloud.pipeline import _placement_changed
+        self.assertFalse(_placement_changed((100, 100, 200, 180), (102, 101, 203, 181)))   # jitter
+        self.assertTrue(_placement_changed((100, 100, 200, 180), (160, 100, 260, 180)))    # moved
+        self.assertTrue(_placement_changed((100, 100, 200, 180), (100, 100, 150, 260)))    # laid down/turned
+
+    def test_flat_background_stabilisation_fits_scale_only(self):
+        from locallife_cloud.logitech import stabilize_background_depth
+        reference = np.full((60, 80), 1.0, np.float32)          # one flat surface at one distance
+        current = reference * 1.1
+        fixed, diag = stabilize_background_depth(current, reference, np.zeros((60, 80, 3), np.uint8), None, [],
+                                                 np.ones((60, 80), bool))
+        self.assertIn("scale only", diag.get("fit", ""))
+        if diag["applied"]:
+            self.assertEqual(diag["offset_m"], 0.0)
+            self.assertAlmostEqual(float(np.median(fixed)), 1.0, places=3)
+
+    def test_measurement_provenance_is_exposed(self):
+        from tempfile import TemporaryDirectory
+
+        from locallife_cloud.comparison import DualCameraCoordinator
+        with TemporaryDirectory() as d:
+            config = AppConfig(detector_model="local-opencv-background", enable_monocular_depth=False,
+                               enable_bucket_sync=False, results_dir=Path(d))
+            report = DualCameraCoordinator(config).camera("realsense").stage_report()
+            prov = report["measurement_provenance"]
+            for key in ("commit", "measurement_version", "volume_geometry", "depth_model", "baseline_id",
+                        "intrinsics", "measurement_context_id"):
+                self.assertIn(key, prov)

@@ -357,7 +357,20 @@ def stabilize_background_depth(
     minimum = min(100, max(30, int(np.count_nonzero(region)) // 20))
     if count < minimum:
         return current, diagnostics
-    calibration = calibrate_monocular_depth(current, reference, mask=anchors, minimum_samples=minimum)
+    # V54: scale AND offset are identifiable only if the background spans a range of depths. On a nearly
+    # flat background at one distance any scale fits with a compensating offset, and the wrong pair then
+    # moves the (nearer) object; there only a scale is fitted (median depth ratio).
+    ref_bg = reference[anchors]
+    spread = float(np.percentile(ref_bg, 90) - np.percentile(ref_bg, 10)) / max(float(np.median(ref_bg)), 1e-6)
+    diagnostics["background_depth_spread"] = round(spread, 4)
+    if spread < 0.10:
+        ratio = float(np.median(ref_bg / current[anchors]))
+        calibration = type("ScaleOnly", (), {"scale": ratio, "offset_m": 0.0,
+                                               "apply": staticmethod(lambda d: d * ratio)})()
+        diagnostics["fit"] = "scale only (background depth range too narrow to identify an offset)"
+    else:
+        calibration = calibrate_monocular_depth(current, reference, mask=anchors, minimum_samples=minimum)
+        diagnostics["fit"] = "scale and offset"
     if calibration is None or not 0.70 <= calibration.scale <= 1.35 or abs(calibration.offset_m) > 0.30:
         return current, diagnostics
     before = float(np.median(np.abs(reference[anchors] - current[anchors])))

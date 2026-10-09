@@ -616,6 +616,16 @@ def _zone_limits_m(zone: Any) -> tuple[float, float] | None:
     return None
 
 
+def _placement_changed(previous: tuple, current: tuple) -> bool:
+    """The same track moved or was turned: centre shifted > 1/4 of the box size, or area changed > 30 %."""
+    px1, py1, px2, py2 = previous
+    cx1, cy1, cx2, cy2 = current
+    size = max(1.0, ((px2 - px1) ** 2 + (py2 - py1) ** 2) ** 0.5)
+    shift = (((px1 + px2) - (cx1 + cx2)) ** 2 + ((py1 + py2) - (cy1 + cy2)) ** 2) ** 0.5 / 2.0
+    a0, a1 = max(1.0, (px2 - px1) * (py2 - py1)), max(1.0, (cx2 - cx1) * (cy2 - cy1))
+    return shift > 0.25 * size or max(a0, a1) / min(a0, a1) > 1.3
+
+
 def _integration_method(method: str | None) -> bool:
     """Whether a detection's volume came from the per-pixel integration the calibration factor scales."""
     text = str(method or "").lower()
@@ -1404,8 +1414,12 @@ class VisionPipeline:
             )
             # V54: the template's NOMINAL litres stay metadata (box_template_*). They never replace the
             # measured cuboid volume -- that would put a reference value into a measurement comparison.
+        detection.cuboid_volume_l = round(cuboid.volume_liters, 6)
         if cuboid.volume_liters <= self.config.realsense_max_item_volume_l:
             detection.realsense_volume_l = round(cuboid.volume_liters, 6)
+            detection.volume_selected_method = "rigid-box cuboid (L x W x H)"
+            detection.volume_selection_reason = ("accepted box-family class with a valid cuboid fit; the per-pixel "
+                                                 "integral stays in per_pixel_volume_l")
             detection.measurement_method = cuboid.volume_method
             detection.measurement_quality = (
                 "high" if cuboid.volume_confidence >= 0.65
@@ -2227,6 +2241,10 @@ class VisionPipeline:
                     )
                 else:
                     detection.realsense_volume_l = round(individual.liters, 6)
+                    detection.per_pixel_volume_l = round(individual.liters, 6)
+                    detection.per_pixel_raw_volume_l = None if individual.raw_liters is None else round(individual.raw_liters, 6)
+                    detection.volume_selected_method = "per-pixel support-plane integral"
+                    detection.volume_selection_reason = "primary method"
                     # Replace the raw median-over-the-whole-mask height above
                     # (line ~898) with the 90th-percentile height from this
                     # same accepted, hole-filled, outlier-rejected column
@@ -2722,6 +2740,10 @@ class VisionPipeline:
                         self.stage_counters[f"logitech_withheld_{logitech_publish.reason}"] += 1
                     else:
                         detection.monocular_volume_l = round(individual_mono.liters, 6)
+                        detection.per_pixel_volume_l = round(individual_mono.liters, 6)
+                        detection.per_pixel_raw_volume_l = None if individual_mono.raw_liters is None else round(individual_mono.raw_liters, 6)
+                        detection.volume_selected_method = "per-pixel support-plane integral"
+                        detection.volume_selection_reason = "primary method"
                         if self.camera_id == "logitech":
                             # Same reasoning as the RealSense branch above:
                             # report the near-top percentile height from the
@@ -3022,6 +3044,16 @@ class VisionPipeline:
                             id(self.reference_realsense if self.camera_id != "logitech" else self.reference_monocular),
                             None if depth_m is None else depth_m.shape)
                 identities = self.__dict__.setdefault("_volume_history_identity", {})
+                boxes = self.__dict__.setdefault("_volume_history_box", {})
+                previous_box = boxes.get(detection.track_id)
+                boxes[detection.track_id] = tuple(float(v) for v in detection.box)
+                if len(boxes) > 500:
+                    for key in list(boxes)[:250]:
+                        boxes.pop(key, None)
+                        identities.pop(key, None)
+                if previous_box is not None and _placement_changed(previous_box, boxes[detection.track_id]):
+                    identities.pop(detection.track_id, None)     # moved/turned: a new placement, a new history
+                    self.stage_counters["volume_history_reset_on_placement_change"] += 1
                 if identities.get(detection.track_id) != identity:
                     # V54: never smooth across a method, calibration, baseline or resolution change.
                     self._volume_history.pop(detection.track_id, None)
@@ -6445,6 +6477,36 @@ class VisionPipeline:
             "volume_trace": self.last_logitech_volume_diagnostics,
         }
 
+    def measurement_provenance(self) -> dict[str, Any]:
+        """What produced this camera's numbers: build, geometry, depth model, calibration, baseline, intrinsics."""
+        import hashlib
+
+        from .volume_experiment import MEASUREMENT_VERSION, software_version
+        cached = self.__dict__.setdefault("_software_version", software_version())
+        reference = self.reference_realsense if self.camera_id != "logitech" else self.reference_monocular
+        baseline_id = None
+        if reference is not None:
+            key = id(reference)
+            ids = self.__dict__.setdefault("_baseline_ids", {})
+            if key not in ids:
+                ids.clear()
+                ids[key] = hashlib.sha1(np.ascontiguousarray(reference[::8, ::8]).tobytes()).hexdigest()[:10]
+            baseline_id = ids[key]
+        k = self.latest_intrinsics
+        body = {"commit": cached.get("commit"), "uncommitted_changes": cached.get("uncommitted_changes"),
+                "measurement_version": MEASUREMENT_VERSION, "volume_geometry": self.config.volume_geometry,
+                "depth_model": self.config.depth_model if self.camera_id == "logitech" else "realsense-hardware",
+                "calibration_mode": getattr(self, "calibration_mode", None),
+                "volume_calibration_factor": self.config.volume_calibration_factor,
+                "logitech_calibration_id": None if self.calibration is None else getattr(self.calibration, "calibration_id", None),
+                "baseline_id": baseline_id, "support_plane_source": getattr(self, "support_plane_source", None),
+                "logitech_background_stabilization": getattr(self, "last_background_stabilization", None)
+                if self.camera_id == "logitech" else None,
+                "intrinsics": None if k is None else {"fx": k.fx, "fy": k.fy, "ppx": k.ppx, "ppy": k.ppy,
+                                                      "width": k.width, "height": k.height}}
+        body["measurement_context_id"] = hashlib.sha1(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()[:12]
+        return body
+
     def stage_report(self) -> dict[str, Any]:
         """Counters plus the single most likely reason nothing is reaching history."""
         counters = dict(self.stage_counters)
@@ -6465,6 +6527,7 @@ class VisionPipeline:
             reason = None
         return {
             "counters": counters,
+            "measurement_provenance": self.measurement_provenance(),
             "last_frame_rejections": self.last_stage_rejections,
             "blocking_reason": reason,
             "detector": {

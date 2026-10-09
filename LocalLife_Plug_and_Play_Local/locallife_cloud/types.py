@@ -72,6 +72,11 @@ class Detection:
     resolved_share: float | None = None
     support_method: str | None = None
     support_diagnostics: dict | None = None          # V54: depth/plane/coverage/footprint trace of the reading
+    per_pixel_volume_l: float | None = None          # V54: per-pixel support-plane integral (calibrated), kept
+    per_pixel_raw_volume_l: float | None = None      #      even when a cuboid is the displayed value
+    cuboid_volume_l: float | None = None             # V54: secondary rigid-box estimate (L x W x H), if any
+    volume_selected_method: str | None = None        # which of the above the camera volume field shows ...
+    volume_selection_reason: str | None = None       # ... and why
     support_raw_volume_l: float | None = None        # Logitech: before the known-object factor
     material: str = "unknown"
     material_confidence: float = 0.0
@@ -229,6 +234,9 @@ class Detection:
             "support_width_cm": self.support_width_cm,
             "support_method": self.support_method,
             "support_diagnostics": self.support_diagnostics,
+            "per_pixel_volume_l": self.per_pixel_volume_l, "per_pixel_raw_volume_l": self.per_pixel_raw_volume_l,
+            "cuboid_volume_l": self.cuboid_volume_l, "volume_selected_method": self.volume_selected_method,
+            "volume_selection_reason": self.volume_selection_reason,
             "support_raw_volume_l": self.support_raw_volume_l,
             "raw_label": self.label,
             "resolved_label": self.resolved_label,

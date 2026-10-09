@@ -191,23 +191,23 @@ class BoxCuboidVolumeTests(unittest.TestCase):
         depth, mask, intrinsics, plane = self._scene_and_plane()
         result = estimate_box_volume_cuboid(depth, intrinsics, mask, plane, mask_erosion_px=0)
         self.assertIsNotNone(result)
-        self.assertAlmostEqual(result.length_mm, 43.070, delta=0.3)
-        self.assertAlmostEqual(result.width_mm, 28.208, delta=0.3)
+        # V54: within half a pixel (this scene: 1.11 mm/px) -- the quantisation of any pixel-centre estimate;
+        # the earlier 0.3 mm matched the old PCA + percentile-trim output.
+        self.assertAlmostEqual(result.length_mm, 43.070, delta=0.56)
+        self.assertAlmostEqual(result.width_mm, 28.208, delta=0.56)
 
-    def test_default_mask_erosion_shrinks_the_footprint_as_expected(self) -> None:
-        # Numerically verified exact ground truth after accounting for the
-        # default 2px erosion on each side (PDF section 4.1): the footprint
-        # shrinks to the pixel range [row_half-2, col_half-2] on each edge.
-        # length ~= 38.697 mm, width ~= 23.302 mm.
+    def test_mask_erosion_no_longer_shrinks_the_physical_footprint(self) -> None:
+        # V54: geometry uses the ORIGINAL mask. The default 2 px erosion used to cut every edge (here
+        # 43.07 -> 38.70 mm; a 20 cm box read 17.6-18.6 cm at 45 deg), which made the volume depend on
+        # how many pixels an edge spans, i.e. on distance and pose. Floor leakage is removed by the height
+        # threshold and flying pixels by the depth-edge filter instead.
         depth, mask, intrinsics, plane = self._scene_and_plane()
-        result = estimate_box_volume_cuboid(depth, intrinsics, mask, plane)
-        self.assertIsNotNone(result)
-        self.assertAlmostEqual(result.length_mm, 38.697, delta=0.3)
-        self.assertAlmostEqual(result.width_mm, 23.302, delta=0.3)
-        # And the un-eroded measurement must be strictly larger in both axes.
+        default = estimate_box_volume_cuboid(depth, intrinsics, mask, plane)
         no_erosion = estimate_box_volume_cuboid(depth, intrinsics, mask, plane, mask_erosion_px=0)
-        self.assertGreater(no_erosion.length_mm, result.length_mm)
-        self.assertGreater(no_erosion.width_mm, result.width_mm)
+        self.assertIsNotNone(default)
+        self.assertAlmostEqual(default.length_mm, no_erosion.length_mm, places=6)
+        self.assertAlmostEqual(default.length_mm, 43.070, delta=0.56)
+        self.assertAlmostEqual(default.width_mm, 28.208, delta=0.56)
 
     def test_volume_liters_equals_length_times_width_times_height(self) -> None:
         depth, mask, intrinsics, plane = self._scene_and_plane()

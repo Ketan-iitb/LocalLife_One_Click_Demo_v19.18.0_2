@@ -62,7 +62,7 @@ from typing import Any
 
 import numpy as np
 
-MEASUREMENT_VERSION = "V54.3"   # bump on ANY change that can alter a measurement; evaluate per version
+MEASUREMENT_VERSION = "V54.4"   # bump on ANY change that can alter a measurement; evaluate per version
 QUANTITY = "visible_surface_volume_above_empty_bin"
 CELL_M = 0.005
 TOP_BAND_M = 0.015
