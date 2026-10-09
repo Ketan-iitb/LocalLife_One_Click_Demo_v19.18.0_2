@@ -62,7 +62,7 @@ from typing import Any
 
 import numpy as np
 
-MEASUREMENT_VERSION = "V54.2"   # bump on ANY change that can alter a measurement; evaluate per version
+MEASUREMENT_VERSION = "V54.3"   # bump on ANY change that can alter a measurement; evaluate per version
 QUANTITY = "visible_surface_volume_above_empty_bin"
 CELL_M = 0.005
 TOP_BAND_M = 0.015
@@ -216,6 +216,74 @@ def occluding_boundary_fraction(depth: np.ndarray, obj: np.ndarray) -> float | N
     return round(float(np.count_nonzero(boundary & deeper)) / int(boundary.sum()), 4)
 
 
+MASK_COMPLETION_MARGIN = 0.15     # growth stays inside the detection box enlarged by this share per side
+MASK_COMPLETION_MAX_GROWTH = 4.0  # a raised region > 4x the mask is a neighbour/pile, not this object
+MASK_TRUNCATION_GROWTH = 1.15     # connected raised surface > 15 % beyond the mask = the mask is truncated
+
+
+def complete_object_mask(rise: np.ndarray, valid: np.ndarray, z: np.ndarray, mask: np.ndarray,
+                         box: tuple[int, int, int, int] | None = None, exclude: np.ndarray | None = None,
+                         min_rise: float = 0.008):
+    """The object's mask completed from GEOMETRY: detector masks often cover only part of an object (a
+    carton's printed panel, an eroded outline), and integrating only those pixels under-read a 1.62 L
+    box as 0.0-1.2 L depending on placement. Added: pixels raised >= `min_rise` above the support,
+    connected to the mask without crossing a depth edge (> 2 cm + 2 %), inside the detection box +15 %,
+    not in another detection (`exclude`). Not completed (mask kept, flagged) when the raised region is
+    > 4x the mask or runs to the edge of that zone: a pile or neighbour, not this object.
+    Returns (completed mask or None, info)."""
+    import cv2
+    h, w = rise.shape
+    mask = mask.astype(bool)
+    info = {"mask_pixels": int(mask.sum()), "completed_pixels": int(mask.sum()), "completed": False, "reason": None}
+    if not mask.any():
+        return None, info
+    if box is None:
+        rows, cols = np.nonzero(mask)
+        box = (int(cols.min()), int(rows.min()), int(cols.max()) + 1, int(rows.max()) + 1)
+    x1, y1, x2, y2 = (int(round(v)) for v in box)
+    mx, my = int((x2 - x1) * MASK_COMPLETION_MARGIN) + 1, int((y2 - y1) * MASK_COMPLETION_MARGIN) + 1
+    zx1, zy1, zx2, zy2 = max(0, x1 - mx), max(0, y1 - my), min(w, x2 + mx), min(h, y2 + my)
+    zone = np.zeros((h, w), bool)
+    zone[zy1:zy2, zx1:zx2] = True
+    risen = valid & zone & np.isfinite(rise) & (np.nan_to_num(rise, nan=-1.0) >= min_rise)
+    if exclude is not None:
+        risen &= ~exclude.astype(bool)
+    zz = np.nan_to_num(np.where(valid, z, np.nan), nan=0.0)
+    edge = np.zeros((h, w), bool)
+    for axis in (0, 1):
+        d = np.abs(np.diff(zz, axis=axis))
+        big = d > 0.02 + 0.02 * (zz[:-1] if axis == 0 else zz[:, :-1])
+        if axis == 0:
+            edge[:-1] |= big
+            edge[1:] |= big
+        else:
+            edge[:, :-1] |= big
+            edge[:, 1:] |= big
+    count, labels = cv2.connectedComponents((risen & ~edge).astype(np.uint8), connectivity=4)
+    ids = np.unique(labels[mask & (labels > 0)])
+    if not ids.size:
+        info["reason"] = "no raised surface connected to the mask"
+        return None, info
+    grown = np.isin(labels, ids)
+    grown |= cv2.dilate(grown.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool) & risen
+    completed = mask | grown
+    border = np.zeros((h, w), bool)
+    border[zy1, zx1:zx2] = border[zy2 - 1, zx1:zx2] = border[zy1:zy2, zx1] = border[zy1:zy2, zx2 - 1] = True
+    image_edge = np.zeros((h, w), bool)
+    image_edge[0, :] = image_edge[-1, :] = image_edge[:, 0] = image_edge[:, -1] = True
+    border &= ~image_edge                                   # image-edge contact is the clipping check's job
+    info["completed_pixels"] = int(completed.sum())
+    info["growth"] = round(info["completed_pixels"] / max(1, info["mask_pixels"]), 3)
+    if info["growth"] > MASK_COMPLETION_MAX_GROWTH:
+        info["reason"] = f"raised region {info['growth']:.1f}x the mask: a neighbour or pile, not completed"
+        return None, info
+    if (grown & border & ~mask).any():
+        info["reason"] = "raised surface runs past the detection box: not completed (neighbour or larger object)"
+        return None, info
+    info["completed"] = info["completed_pixels"] > info["mask_pixels"]
+    return completed, info
+
+
 def top_height(rise: np.ndarray) -> float:
     """Height of the object's top surface: median of the samples within the top band (rise >= 80 % of
     the 95th percentile). For a flat-topped box this is its top face, unaffected by side-face samples."""
@@ -291,7 +359,9 @@ def _dilate(mask: np.ndarray, px: int) -> np.ndarray:
 def measure_frame(depth: np.ndarray, intrinsics: Any, mask: np.ndarray, baseline_depth: np.ndarray,
                   roi: np.ndarray | None = None, *, scale: float = 1.0, align_background: bool = False,
                   fallback_shape: tuple[int, int] | None = None, cell: float = CELL_M,
-                  mapping: dict[str, Any] | None = None, distortion: list[float] | None = None) -> dict[str, Any]:
+                  mapping: dict[str, Any] | None = None, distortion: list[float] | None = None,
+                  complete_mask: bool = True, exclude: np.ndarray | None = None,
+                  box: tuple[float, float, float, float] | None = None) -> dict[str, Any]:
     """Per-pixel visible-surface volume of `mask` above the empty-bin baseline. See module docstring.
 
     `mapping` (from the frozen calibration) turns the camera's raw depth into metres; without it the raw
@@ -373,6 +443,31 @@ def measure_frame(depth: np.ndarray, intrinsics: Any, mask: np.ndarray, baseline
         hit = base_keys[pos] == keys
         return np.where(hit, base_h[pos], 0.0), hit
 
+    if complete_mask:
+        # complete a partial detector mask from the raised surface connected to it (relative to the empty
+        # baseline, so floor never qualifies); recorded, and refused for piles/neighbours
+        allv = roi & valid_now
+        ax, ay, ah = _cells(P[allv], plane, cell)
+        rise_all = np.full(shape, np.nan)
+        rise_all[allv] = ah - base_at(_key(ax, ay))[0]
+        ex = None if exclude is None else _resize_mask(exclude, shape)
+        box_px = None
+        if box is not None and fallback_shape is not None:
+            # detector boxes are in RGB pixels; the depth map may have another resolution
+            sx, sy = shape[1] / fallback_shape[1], shape[0] / fallback_shape[0]
+            box_px = (box[0] * sx, box[1] * sy, box[2] * sx, box[3] * sy)
+        elif box is not None:
+            box_px = box
+        completed, info = complete_object_mask(rise_all, allv, depth, obj, box_px, ex)
+        out["mask_completion"] = info
+        if completed is not None and info["completed"]:
+            obj = completed & roi
+            sel = obj & valid_now & np.isfinite(area)
+            out["object_pixels_completed"] = int(np.count_nonzero(obj))
+            background = roi & ~_dilate(obj, 4) & valid_now & valid_base
+        elif info.get("growth", 1.0) > MASK_TRUNCATION_GROWTH:
+            reasons.append(f"the mask covers only part of the raised object ({info['growth']:.2f}x larger), "
+                           f"and it could not be completed: {info.get('reason')}")
     ox, oy, oh = _cells(P[sel], plane, cell)
     okeys = _key(ox, oy)
     base_o, has_base = base_at(okeys)
@@ -454,7 +549,8 @@ def measure_frame(depth: np.ndarray, intrinsics: Any, mask: np.ndarray, baseline
     return out
 
 
-def measure_objects(depth, intrinsics, masks: list[np.ndarray], baseline_depth, roi=None, **kw) -> dict[str, Any]:
+def measure_objects(depth, intrinsics, masks: list[np.ndarray], baseline_depth, roi=None, boxes=None,
+                    **kw) -> dict[str, Any]:
     """Aggregate volume of the union of `masks`, plus individual volumes only for masks that touch no
     other mask (overlapping bags have no observable boundary or support between them)."""
     shape = depth.shape
@@ -462,7 +558,11 @@ def measure_objects(depth, intrinsics, masks: list[np.ndarray], baseline_depth, 
     union = np.zeros(shape, bool)
     for m in resized:
         union |= m
-    aggregate = measure_frame(depth, intrinsics, union, baseline_depth, roi, **kw)
+    union_box = None
+    if boxes:
+        b = np.asarray(boxes, float)
+        union_box = (float(b[:, 0].min()), float(b[:, 1].min()), float(b[:, 2].max()), float(b[:, 3].max()))
+    aggregate = measure_frame(depth, intrinsics, union, baseline_depth, roi, box=union_box, **kw)
     individual = []
     for i, m in enumerate(resized):
         others = np.zeros(shape, bool)
@@ -473,7 +573,8 @@ def measure_objects(depth, intrinsics, masks: list[np.ndarray], baseline_depth, 
             individual.append({"index": i, "volume_l": None, "status": "unavailable",
                                "reasons": ["touches or overlaps another object: no individual boundary/support"]})
         else:
-            r = measure_frame(depth, intrinsics, m, baseline_depth, roi, **kw)
+            r = measure_frame(depth, intrinsics, m, baseline_depth, roi, exclude=others,
+                              box=None if not boxes or i >= len(boxes) else tuple(boxes[i]), **kw)
             individual.append({"index": i, "volume_l": r["volume_l"], "status": r["status"], "reasons": r["reasons"]})
     aggregate["objects_in_mask"] = len(masks)
     aggregate["individual"] = individual
@@ -778,7 +879,8 @@ class FramePayload:
     track_ids: list[int | None]
     labels: list[str]
     roi: np.ndarray | None
-    meta: dict[str, Any] = field(default_factory=dict)   # depth_model, output_kind, intrinsics_source, depth_units
+    meta: dict[str, Any] = field(default_factory=dict)
+    boxes: list[tuple[float, float, float, float]] = field(default_factory=list)   # detector boxes, RGB pixels   # depth_model, output_kind, intrinsics_source, depth_units
 
 
 class ExperimentRecorder:
@@ -1037,7 +1139,7 @@ class ExperimentRecorder:
         setup, reasons = self._camera_setup(payload.camera, payload)
         if setup is not None and payload.masks:
             result = measure_objects(payload.depth, payload.intrinsics, payload.masks,
-                                     self._baseline_depth[payload.camera], payload.roi,
+                                     self._baseline_depth[payload.camera], payload.roi, boxes=payload.boxes,
                                      **_setup_kwargs(setup),
                                      fallback_shape=payload.rgb.shape[:2])
         else:
@@ -1048,7 +1150,8 @@ class ExperimentRecorder:
         np.savez_compressed(directory / name, rgb=payload.rgb,
                             depth=empty if payload.depth is None else payload.depth.astype(np.float32),
                             masks=np.stack(payload.masks).astype(bool) if payload.masks else empty,
-                            roi=empty if payload.roi is None else payload.roi.astype(bool))
+                            roi=empty if payload.roi is None else payload.roi.astype(bool),
+                            boxes=np.asarray(payload.boxes, np.float32) if payload.boxes else empty)
         frame = {"index": index, "file": f"{payload.camera}/{name}", "timestamp": payload.timestamp, "phase": phase,
                  "motion": motion, "saved": True, "track_ids": payload.track_ids, "labels": payload.labels,
                  "intrinsics": payload.intrinsics, "meta": payload.meta, "setup": setup,
@@ -1233,8 +1336,9 @@ def replay_trial(trial_dir: Path, setups: dict[str, dict[str, Any]] | None = Non
             if not masks:
                 g.update(volume_l=None, status="unavailable", reasons=["no object mask in this frame"])
             else:
+                boxes = [tuple(b) for b in raw["boxes"]] if "boxes" in raw.files and raw["boxes"].size else None
                 r = measure_objects(raw["depth"], f["intrinsics"], masks, base,
-                                    raw["roi"] if raw["roi"].size else None, **_setup_kwargs(setup),
+                                    raw["roi"] if raw["roi"].size else None, boxes=boxes, **_setup_kwargs(setup),
                                     fallback_shape=raw["rgb"].shape[:2])
                 g.update(volume_l=r["volume_l"], status=r["status"], reasons=r["reasons"],
                          volume_l_partial=r.get("volume_l_partial"), setup=setup)

@@ -565,15 +565,29 @@ class FillEstimator:
                 x.astype(np.float32), y.astype(np.float32))
 
     def object_volume(self, box, mask: np.ndarray | None, now: float,
-                      rigid_hint: bool = False, deformable_hint: bool = False) -> tuple[float, float] | None:
-        """`_object_volume` plus V54 diagnostics in `last_object["diagnostics"]` (whatever path answered)."""
+                      rigid_hint: bool = False, deformable_hint: bool = False,
+                      exclude_mask: np.ndarray | None = None) -> tuple[float, float] | None:
+        """`_object_volume` plus V54 diagnostics in `last_object["diagnostics"]` (whatever path answered).
+        `exclude_mask`: the OTHER detections -- kept out of this object's support ring and mask completion."""
         self._diag_ctx = None
+        self._mask_completion = None
+        if mask is not None and getattr(mask, "ndim", 0) == 2 and mask.any():
+            edge = np.zeros(mask.shape, bool)
+            edge[0, :] = edge[-1, :] = edge[:, 0] = edge[:, -1] = True
+            if (mask.astype(bool) & edge).any():
+                # judged on the ORIGINAL mask: part of the object is outside the view
+                self.last_object = {"method": "unavailable", "reason": "object clipped at the image edge"}
+                return None
+            if exclude_mask is not None and exclude_mask.shape == mask.shape:
+                # one array carries both through the crop: 1 = this object, 2 = other detections
+                mask = np.where(mask.astype(bool), 1, np.where(exclude_mask.astype(bool), 2, 0)).astype(np.uint8)
         result = self._object_volume(box, mask, now, rigid_hint=rigid_hint, deformable_hint=deformable_hint)
         try:
             diag = self._object_diagnostics()
         except Exception:  # noqa: BLE001 - diagnostics never break a measurement
             diag = None
         if diag is not None:
+            diag["mask_completion"] = getattr(self, "_mask_completion", None)
             self.last_object = {**(self.last_object or {}), "diagnostics": diag}
         return result
 
@@ -643,9 +657,11 @@ class FillEstimator:
         if x2 - x1 < 3 or y2 - y1 < 3:
             return None
         inside = np.zeros_like(ok)
+        others = np.zeros_like(ok)
         if mask is not None and mask.ndim == 2:
             small = mask[::step, ::step][:h, :w]
-            inside[:small.shape[0], :small.shape[1]] = small
+            inside[:small.shape[0], :small.shape[1]] = small == 1
+            others[:small.shape[0], :small.shape[1]] = small == 2
             inside[:, :x1] = inside[:, x2:] = False
             inside[:y1] = inside[y2:] = False
         if not inside.any():
@@ -653,7 +669,7 @@ class FillEstimator:
         pad_x, pad_y = max(2, (x2 - x1) // 4), max(2, (y2 - y1) // 4)
         ring = np.zeros_like(ok)
         ring[max(0, y1 - pad_y):min(h, y2 + pad_y), max(0, x1 - pad_x):min(w, x2 + pad_x)] = True
-        ring &= ~inside
+        ring &= ~inside & ~others                      # neighbouring detections are not this object's support
         support_px = height[ring & ok]                   # support: median of the surface around the bag
         top = inside & valid                             # the bag's own surface: any valid depth
         if support_px.size < 10 or np.count_nonzero(top) < 10:
@@ -667,6 +683,32 @@ class FillEstimator:
             height = surface["height"]
             support_px = height[ring & ok]
             support = float(np.percentile(support_px, 50)) if support_px.size else 0.0
+        from .volume_experiment import MASK_TRUNCATION_GROWTH
+        level = support_px.size >= 10 and float(np.percentile(support_px, 75) - np.percentile(support_px, 25)) <= 0.02
+        if not deformable_hint and level:
+            # V54: a detector mask can cover only part of a rigid object (a carton's printed panel); the raised
+            # surface connected to it inside the box completes it. Deformable objects in a pile: flag only.
+            from .volume_experiment import complete_object_mask
+            completed, info = complete_object_mask(height - support, valid, surface["z"], inside,
+                                                   (x1, y1, x2, y2), others)
+            self._mask_completion = info
+            if completed is not None and info["completed"]:
+                inside = completed
+                ring &= ~inside
+                support_px = height[ring & ok]
+                if support_px.size >= 10:
+                    support = float(np.percentile(support_px, 50))
+                top = inside & valid
+            elif info.get("growth", 1.0) > MASK_TRUNCATION_GROWTH:
+                # Refused (a pile or neighbour connects to it): keep the detector mask, flag the reading. On a
+                # pile of bags this is normal; on an isolated object it means the value may be too low.
+                self._mask_completion = {**info, "warning": "mask may cover only part of the object"}
+        else:
+            from .volume_experiment import complete_object_mask
+            _, info = complete_object_mask(height - support, valid, surface["z"], inside, (x1, y1, x2, y2), others)
+            self._mask_completion = {**info, "completed": False,
+                                     "note": "deformable object" if deformable_hint else
+                                     "uneven surroundings (pile): not completed, check only"}
         self._diag_ctx = (surface, top, ring & ok, inside, support)
         # A closed rigid box shows a flat rectangular face: measure it as a cuboid from its own
         # face and an OBSERVED thickness (side face / support at its low edge), not as the volume

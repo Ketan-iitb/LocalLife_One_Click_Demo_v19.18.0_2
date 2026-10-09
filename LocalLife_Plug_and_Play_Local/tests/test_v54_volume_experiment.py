@@ -491,3 +491,70 @@ class LiveDiagnosticsTests(unittest.TestCase):
                     "perpendicular_height_m_p50_90", "footprint_hull_m2", "low_skirt_fraction"):
             self.assertIn(key, diag)
         self.assertAlmostEqual(diag["footprint_hull_m2"], 0.01, delta=0.003)   # a 10 x 10 cm base
+
+
+class PartialMaskTests(unittest.TestCase):
+    """The same rigid 9 x 9 x 20 cm carton-like box (1.62 L) under a fixed 45 deg camera, measured with the
+    kind of partial masks a detector gives a printed carton. A truncated mask used to under-read by
+    0-100 % depending on placement and pose (the reported 0.5-1.0 L spread)."""
+    TRUTH = 0.09 * 0.09 * 0.20 * 1000.0
+
+    @staticmethod
+    def _cases():
+        import cv2
+        empty = _scene(lambda x, y: 0 * x, None, 45.0, cam=0.8, far=2.4)[0]
+        for pose, dims in (("upright", (0.09, 0.09, 0.20)), ("lying", (0.20, 0.09, 0.09))):
+            for place, dy in (("near", -0.15), ("far", 0.15)):
+                c, a, h = _obb(*dims, 0, 15, 0.0)
+                depth, mask = _scene(lambda x, y: 0 * x, (c + np.array([0, dy, 0]), a, h), 45.0, cam=0.8, far=2.4)
+                depth = noisy(depth, seed=3)
+                r, cc = np.nonzero(mask)
+                box = (cc.min(), r.min(), cc.max() + 1, r.max() + 1)
+                upper = mask.copy()
+                upper[r.min() + int(0.6 * (r.max() - r.min())):] = False
+                eroded = cv2.erode(mask.astype(np.uint8), np.ones((7, 7), np.uint8)).astype(bool)
+                for name, m in (("upper 60%", upper), ("eroded", eroded)):
+                    yield f"{pose} {place} {name}", depth, m, box, empty
+
+    def test_experiment_path_completes_partial_masks(self):
+        for name, depth, mask, box, empty in self._cases():
+            with self.subTest(case=name):
+                r = ve.measure_frame(depth, KW, mask, noisy(empty, seed=4), box=box)
+                self.assertEqual(r["status"], "ok", r["reasons"])
+                self.assertLess(abs(r["volume_l"] - self.TRUTH) / self.TRUTH, 0.04)
+
+    def test_live_rigid_path_completes_partial_masks(self):
+        from pathlib import Path as _P
+        from tempfile import TemporaryDirectory as _T
+
+        from locallife_cloud import bin_fill as bf
+        from test_v45_bin_fill_events import _profile
+        for name, depth, mask, box, empty in self._cases():
+            with self.subTest(case=name), _T() as d:
+                est = bf.FillEstimator("realsense", _P(d), _profile(camera_to_empty_floor_m=0.8, usable_height_m=0.5,
+                                                                     tilt_from_vertical_deg=45.0))
+                est.recalibrate(empty, KW, None)
+                est.update(np.zeros((KW.height, KW.width, 3), np.uint8), depth, KW, None, 0.0, 1.0)
+                litres, _ = est.object_volume(box, mask, 1.5, rigid_hint=True)
+                self.assertLess(abs(litres - self.TRUTH) / self.TRUTH, 0.10)
+                self.assertTrue(est.last_object["diagnostics"]["mask_completion"]["completed"])
+
+    def test_truncated_mask_that_cannot_be_completed_is_not_a_measurement(self):
+        name, depth, mask, box, empty = next(iter(self._cases()))
+        r = ve.measure_frame(depth, KW, mask, empty)                     # no detector box: zone = the mask
+        self.assertIsNone(r["volume_l"])
+        self.assertTrue(any("covers only part" in reason for reason in r["reasons"]))
+
+    def test_completion_never_takes_a_neighbouring_detection(self):
+        empty = _scene(lambda x, y: 0 * x, None, 45.0, cam=0.8, far=2.4)[0]
+        c, a, h = _obb(0.20, 0.09, 0.09, 0, 0, 0.0)
+        depth, mask = _scene(lambda x, y: 0 * x, (c, a, h), 45.0, cam=0.8, far=2.4)
+        rows, cols = np.nonzero(mask)
+        mid = (cols.min() + cols.max()) // 2
+        left, right = mask.copy(), mask.copy()
+        left[:, mid:] = False
+        right[:, :mid] = False
+        # "left" is this object; "right" is another detection touching it: excluded, so not grown into
+        r = ve.measure_frame(depth, KW, left, empty, exclude=right, box=(cols.min(), rows.min(), mid, rows.max() + 1))
+        half = 0.10 * 0.09 * 0.09 * 1000.0                                  # this object: half the 1.62 L box
+        self.assertLess(abs(r["volume_l_partial"] - half) / half, 0.15)

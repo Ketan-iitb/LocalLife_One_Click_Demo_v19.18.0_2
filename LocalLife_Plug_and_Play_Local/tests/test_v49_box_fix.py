@@ -294,7 +294,12 @@ class RealSenseBoxCuboidTests(unittest.TestCase):
     depth, bleeding mask; physical accuracy still needs measured references."""
 
     def test_tilted_box_is_a_coherent_cuboid_of_its_own_face_and_side(self):
-        for L, W, T, tilt, yaw in ((0.45, 0.15, 0.07, 25, 0), (0.45, 0.15, 0.07, 35, 30), (0.30, 0.20, 0.10, 20, -40)):
+        # V54: (0.45, 0.15, 0.07, 35, 30) runs off the top of this 320 x 240 view (mask row 0): part of the box
+        # is not seen, so it is reported unavailable ("clipped at the image edge"), not as a full volume.
+        result, obj = _measure_box(0.45, 0.15, 0.07, 35, 30)
+        self.assertIsNone(result)
+        self.assertIn("clipped at the image edge", obj["reason"])
+        for L, W, T, tilt, yaw in ((0.45, 0.15, 0.07, 25, 0), (0.30, 0.20, 0.10, 20, -40)):
             with self.subTest(box=(L, W, T, tilt, yaw)):
                 (litres, height), obj = _measure_box(L, W, T, tilt, yaw)
                 truth = L * W * T * 1000

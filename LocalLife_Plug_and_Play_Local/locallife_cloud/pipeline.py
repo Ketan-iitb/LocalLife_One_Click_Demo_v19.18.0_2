@@ -3286,9 +3286,16 @@ class VisionPipeline:
             resolved = item.resolved_label
             try:
                 rigid = resolved in FLAT_FACED
+                others = None
+                if item.mask is not None:
+                    others = np.zeros(item.mask.shape, bool)
+                    for other in detections:
+                        if other is not item and other.mask is not None and other.mask.shape == others.shape \
+                                and not _is_phantom_detection(other):
+                            others |= other.mask.astype(bool)
                 estimate = self.fill.object_volume(
                     item.box, item.mask, time.time(), rigid_hint=rigid,
-                    deformable_hint=not rigid and deformable_label(resolved or item.label))
+                    deformable_hint=not rigid and deformable_label(resolved or item.label), exclude_mask=others)
                 dims = dict(self.fill.last_object) if estimate is not None else None
             except Exception:  # noqa: BLE001 - display-only estimate
                 estimate, dims = None, None
@@ -3324,6 +3331,10 @@ class VisionPipeline:
                     "this_frame_litres": round(float(estimate[0]), 3), "aggregated_litres": round(float(litres), 3),
                     "aggregation": "median-volume sample of this track's last 15 s (same geometry only)",
                     "method": dims.get("method"), "shape_model": dims.get("shape_model"),
+                    # pose-independent edge lengths of a cuboid (L x W x H changes order when it is laid down)
+                    "edges_sorted_cm": None if not str(dims.get("method") or "").startswith("box ") or None in (
+                        dims.get("length_m"), dims.get("width_m"), dims.get("height_m")) else
+                    sorted((round(float(dims[k]) * 100, 1) for k in ("length_m", "width_m", "height_m")), reverse=True),
                     "intrinsics": None if k is None else {"fx": round(float(k.fx), 2), "fy": round(float(k.fy), 2),
                                                           "ppx": round(float(k.ppx), 2), "ppy": round(float(k.ppy), 2)},
                     "intrinsics_source": ("realsense-factory" if self.camera_id != "logitech"
@@ -3800,6 +3811,7 @@ class VisionPipeline:
                 depth=None if depth is None else np.asarray(depth, dtype=np.float32),
                 intrinsics=intrinsics_dict(k), masks=[d.mask.astype(bool) for d in kept],
                 track_ids=[d.track_id for d in kept], labels=[d.label for d in kept], roi=bin_region,
+                boxes=[tuple(float(v) for v in d.box) for d in kept],
                 meta={"depth_model": self.config.depth_model if logitech else "realsense-d435-aligned-hardware-depth",
                       "output_kind": depth_output_kind(self.config.depth_model) if logitech else "metric",
                       "intrinsics_source": ("provided" if intrinsics is not None else "field-of-view estimate")
