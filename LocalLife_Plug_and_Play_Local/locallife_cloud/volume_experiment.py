@@ -791,7 +791,7 @@ def _stats(values: list[float]) -> dict[str, float | None]:
 
 
 def evaluate(trials: list[dict[str, Any]], *, calibration_objects: dict[str, set[str]] | None = None,
-             criteria: dict[str, Any] | None = None) -> dict[str, Any]:
+             criteria: dict[str, Any] | None = None, target_pct: float = 10.0) -> dict[str, Any]:
     """Per camera/object/condition/motion statistics, held-out separation and paired comparison.
     trials: trial records with `cameras[camera].volume_l` (None = failed) and the reference."""
     calibration_objects = calibration_objects or {}
@@ -832,6 +832,10 @@ def evaluate(trials: list[dict[str, Any]], *, calibration_objects: dict[str, set
             row.update(mean_signed_error_l=round(float(err.mean()), 5), mean_signed_error_pct=round(float(pct.mean()), 3),
                        mae_l=round(float(np.abs(err).mean()), 5), rmse_l=round(float(np.sqrt((err ** 2).mean())), 5),
                        mape_pct=round(float(np.abs(pct).mean()), 3),
+                       # per-trial pass share against the PROPOSED target (not an approved threshold); failed
+                       # trials count as not within it, so availability cannot inflate it
+                       within_target_share_of_attempted=round(float(np.sum(np.abs(pct) <= target_pct)) / len(items), 4),
+                       target_pct=target_pct,
                        std_signed_error_pct=round(float(pct.std(ddof=1)), 3) if len(pct) > 1 else None)
         acc, avail = criteria.get("max_mape_pct"), criteria.get("min_availability")
         if acc is None or avail is None:

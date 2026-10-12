@@ -167,7 +167,8 @@ def cmd_evaluate(args) -> int:
               f"{row['split']:32} n={row['attempted']:2} valid={row['valid']:2} avail={row['availability']:.2f} "
               f"ref={row['reference_l']} mean={row['estimate_mean_l']} sd={row['estimate_std_l']} "
               f"bias%={row.get('mean_signed_error_pct')} MAE={row.get('mae_l')} RMSE={row.get('rmse_l')} "
-              f"MAPE%={row.get('mape_pct')} criteria={row['criteria']}")
+              f"MAPE%={row.get('mape_pct')} within±10%={row.get('within_target_share_of_attempted')} "
+              f"criteria={row['criteria']}")
     paired = result["paired"]
     print(f"paired valid trials: {paired['n_paired_valid']}; Logitech - RealSense (L): "
           f"{paired['logitech_minus_realsense_l']} ({paired['note']})")

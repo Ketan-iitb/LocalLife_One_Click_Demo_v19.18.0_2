@@ -296,6 +296,7 @@ class EvaluationMathTests(unittest.TestCase):
         self.assertAlmostEqual(row["mae_l"], 2.0 / 3.0, places=5)          # ... absolute error does not
         self.assertAlmostEqual(row["rmse_l"], math.sqrt(2.0 / 3.0), places=5)
         self.assertAlmostEqual(row["mape_pct"], 100 * (0.25 + 0.25 + 0) / 3, places=3)
+        self.assertEqual(row["within_target_share_of_attempted"], 0.25)   # 1 of 4 attempts within 10 %
         self.assertEqual(row["failure_reasons"], {"coverage": 1})
         self.assertEqual(row["criteria"], "fail")                         # availability 0.75 < 0.8
         self.assertEqual(ve.evaluate(trials)["rows"][0]["criteria"], "not agreed")
