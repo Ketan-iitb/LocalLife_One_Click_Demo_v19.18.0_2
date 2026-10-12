@@ -642,7 +642,6 @@ class FillEstimator:
         measured from the pile, not from the bin floor. None when the map is stale or support unclear.
         """
         self.last_object = {}                            # never a previous object's geometry
-        rigid_candidate = None                           # (geometry, litres, height) awaiting a check
         surface = getattr(self, "last_surface", None)
         if not surface or now - surface["at"] > 10.0:      # the pile changes slowly; settled maps stay valid
             return None
@@ -684,7 +683,12 @@ class FillEstimator:
             support_px = height[ring & ok]
             support = float(np.percentile(support_px, 50)) if support_px.size else 0.0
         from .volume_experiment import MASK_TRUNCATION_GROWTH
-        level = support_px.size >= 10 and float(np.percentile(support_px, 75) - np.percentile(support_px, 25)) <= 0.02
+        # Judged OUTSIDE the detector box: with a partial mask the rest of the object lies inside the box but
+        # outside the mask, and counted as "surroundings" it made a flat floor look uneven (no completion).
+        outside = ring & ok
+        outside[y1:y2, x1:x2] = False
+        level_px = height[outside] if np.count_nonzero(outside) >= 10 else support_px
+        level = level_px.size >= 10 and float(np.percentile(level_px, 75) - np.percentile(level_px, 25)) <= 0.02
         if not deformable_hint and level:
             # V54: a detector mask can cover only part of a rigid object (a carton's printed panel); the raised
             # surface connected to it inside the box completes it. Deformable objects in a pile: flag only.
@@ -718,40 +722,28 @@ class FillEstimator:
         # an unresolved class -- one flat face covering most of the object. A deformable class (bag,
         # backpack, sack, textile) never gets it: a smooth patch of a backpack (monocular depth is
         # smooth everywhere) was measured as a 14.8 x 13.3 x 6.1 cm "box" = 1.2 L.
-        face = None
+        # V54.5: ONE primary result -- the per-pixel support-plane integral -- for every object and both
+        # cameras. Rigid-box estimators are computed beside it (side by side, never instead of it): the
+        # earlier dispatch returned whichever of face cuboid / box-from-faces / tilted slab / integral won
+        # for that pose, so one carton read 1.06 / 1.01 / 1.87 L and its third edge 5.6 or 10.4 cm.
+        estimators: dict[str, Any] = {}
+        face = box3d = None
         if not deformable_hint:
             face = _box_face(surface, top, valid, height, support, float(np.percentile(support_px, 25)))
             if face is not None and not rigid_hint and face["share"] < RIGID_FACE_SHARE_UNRESOLVED:
+                estimators["box_face"] = {"status": "rejected", "reason": "flat face covers too little of the object"}
                 face = None
+            box3d = _oriented_box(surface, top, support)
+            if box3d is not None and not rigid_hint and box3d.get("coverage", 1.0) < RIGID_FACE_SHARE_UNRESOLVED:
+                estimators["box_from_faces"] = {"status": "rejected", "reason": "box faces cover too little of the object"}
+                box3d = None
         if face is not None:
-            self.last_object = {"length_m": face["length"], "width_m": face["width"],
-                                "height_m": face.get("thickness"), "method": face["method"], "planar": True,
-                                "litres": None if face.get("litres") is None else round(face["litres"], 2),
-                                "tilt_deg": face["tilt_deg"], "face_share": face["share"],
-                                "thickness_source": face.get("thickness_source"), "reason": face.get("reason")}
-            if face.get("litres") is not None:
-                if rigid_hint:
-                    return round(face["litres"], 2), face["thickness"]
-                tilt = math.radians(float(face.get("tilt_deg") or 0.0))
-                low = min(face["length"], face["width"]) * math.sin(tilt) + face["thickness"] * math.cos(tilt)
-                high = max(face["length"], face["width"]) * math.sin(tilt) + face["thickness"] * math.cos(tilt)
-                rigid_candidate = (dict(self.last_object), face["litres"], face["thickness"], low, high)
-        box3d = _oriented_box(surface, top, support) if (rigid_hint or (face is None and not deformable_hint)) \
-            else None
-        if box3d is not None and not rigid_hint and box3d.get("coverage", 1.0) < RIGID_FACE_SHARE_UNRESOLVED:
-            box3d = None
+            estimators["box_face"] = _rigid_entry(face["length"], face["width"], face.get("thickness"),
+                                                  face["method"], face.get("thickness_source"), face.get("reason"),
+                                                  tilt_deg=face["tilt_deg"], face_share=face["share"])
         if box3d is not None:
-            # Two or three faces of a box seen from the side (upright carton): each face spans two box
-            # axes, so the visible faces give all three dimensions without any support assumption.
-            self.last_object = {"length_m": box3d["length"], "width_m": box3d["width"],
-                                "height_m": box3d["height"], "method": box3d["method"], "planar": True,
-                                "litres": round(box3d["litres"], 2), "faces": box3d["faces"]}
-            if rigid_hint:
-                return round(box3d["litres"], 2), box3d["height"]
-            rigid_candidate = (dict(self.last_object), box3d["litres"], box3d["height"],
-                               box3d["height"], box3d["height"])
-        if face is not None and rigid_hint and face.get("litres") is None:
-            return None                                  # L x W seen, thickness not observable: no number
+            estimators["box_from_faces"] = _rigid_entry(box3d["length"], box3d["width"], box3d["height"],
+                                                        box3d["method"], "observed faces", None, faces=box3d["faces"])
         rise_map = np.where(top, height - support, 0.0)
         risen = top & (rise_map > 0.02)
         # One object: the largest connected risen region. A box drawn around a diagonal parcel
@@ -764,55 +756,63 @@ class FillEstimator:
         except ImportError:  # pragma: no cover
             cv2 = None
         if np.count_nonzero(risen) < 10:
+            self.last_object = {"method": "unavailable", "reason": "fewer than 10 pixels above the local surface",
+                                "estimators": estimators}
             return None
+        # V54.5: flying pixels (stereo/monocular depth mixed between an object's edge and what lies behind it)
+        # are the FAR pixel of a depth jump; they smeared a carton's footprint to 37 cm and, with random-signed
+        # Jacobian areas, cut its volume to 0.6 L. Dropped from the integral and the footprint, counted.
+        from .volume import _depth_edge_pixels
+        flying = (_depth_edge_pixels(np.nan_to_num(surface["z"], nan=0.0), valid) | _behind_local_surface(
+            surface["z"], risen)) & risen
+        if np.count_nonzero(risen & ~flying) >= 10:
+            risen = risen & ~flying
         raster = _floor_raster(surface, risen, rise_map)
-        jacobian = _support_jacobian_area(surface)
+        # their depth must not enter the neighbours' derivatives either (one-sided there instead)
+        jacobian, bound = _support_jacobian_area({**surface, "z": np.where(flying, np.nan, surface["z"])},
+                                                 with_bound=True)
+        clamped = 0
         if jacobian is not None and np.count_nonzero(risen & np.isfinite(jacobian)) >= 10:
             # V54: each pixel's rise x the area of ITS surface patch projected onto the support plane
             # ((P_u x P_v) . up) -- exact for any camera tilt and unbiased by depth noise. The floor
             # raster kept the per-cell MAXIMUM, which noise and side-face tops pushed up: a 9 x 7 x 22 cm
             # carton (1.39 L) read 1.55 L at 30-45 deg with 3 mm noise. The raster still gives L x W.
+            # Out-of-range areas (< 0 or > 2x a horizontal patch at that depth) are COUNTED, not clipped:
+            # depth noise gives both signs and cancels; clipping biased a clean carton by +9 %.
             use = risen & np.isfinite(jacobian)
+            clamped = int(np.count_nonzero(use & ((jacobian < 0) | (jacobian > JACOBIAN_AREA_LIMIT * bound))))
             litres = float(np.sum(rise_map[use] * jacobian[use])) * 1000.0
+            integral = "support-plane Jacobian"
         elif raster is not None:
-            litres = raster["litres"]
+            litres, integral = raster["litres"], "floor raster"
         else:
-            litres = float(np.sum(rise_map[risen] * area[risen])) * 1000.0
-        # Depth dropouts on the object: assume they resemble the valid pixels around them.
+            litres, integral = float(np.sum(rise_map[risen] * area[risen])) * 1000.0, "pixel area at own depth"
+        valid_litres = litres
+        # Depth dropouts on the object: assume they resemble the valid pixels around them (reported).
         missing = int(np.count_nonzero(cv2_dilate(risen) & inside & ~valid))
         if missing:
             litres *= 1.0 + missing / max(1, int(np.count_nonzero(risen)))
         tall = float(np.percentile(rise_map[risen], 90))
-        observed_tall = tall
         if litres > 250.0 or tall > self.profile.usable_height_m + RIM_TOLERANCE_M:
+            self.last_object = {"method": "unavailable", "reason": "implausible size (never clamped)",
+                                "estimators": estimators}
             return None                                  # implausible: unavailable, never clamped
         length = width = None
-        method = "surface rise above the local surface"
         if raster is not None:
             length, width = raster["length"], raster["width"]      # on the floor plane, oriented
-            method = "heights rasterised on the floor plane, integrated above the local surface"
         elif cv2 is not None and "x" in surface:
             pts = np.c_[surface["x"][risen], surface["y"][risen]].astype(np.float32)
             (_, _), (w1, w2), _ = cv2.minAreaRect(pts)     # oriented: a diagonal parcel stays long/thin
             length, width = float(max(w1, w2)), float(min(w1, w2))
         slab = None if deformable_hint else _tilted_slab(surface, risen, rise_map,
                                                           min_share=0.4 if rigid_hint else 0.7)
-        planar = bool(slab and slab.get("planar") and slab.get("share", 0) >= 0.7)
-        if slab is not None and slab.get("litres") is not None and slab["litres"] < litres:
-            # A rigid flat-topped object (box, book) propped on the pile at an angle: integrating
-            # the top surface down to the support counted the AIR under its raised end (a ~4 L box
-            # read 8.3 L, 31 cm "tall"). Its own plane gives in-plane L x W and the thickness.
-            litres, tall = slab["litres"], slab["thickness"]
-            length, width = slab["length"], slab["width"]
-            method = "tilted rigid slab: top-face L x W x thickness"
-        if rigid_candidate is not None and observed_tall <= 1.5 * rigid_candidate[4]:
-            # Unresolved class: the cuboid is rejected when the object stands much higher than the
-            # cuboid can reach (L sin(tilt) + T cos(tilt) for a face; H for a box from faces). A soft
-            # pack's flat top patch x a 3.7 cm "side face" explains 3.7 cm of a 14 cm-tall object
-            # (2.5 L read for 11.5 L). A box partly sunk among neighbours shows LESS rise than its
-            # cuboid predicts, which is consistent and is kept.
-            self.last_object = {**rigid_candidate[0], "consistency_litres": round(litres, 2)}
-            return round(rigid_candidate[1], 2), rigid_candidate[2]
+        planar = bool(slab and slab.get("planar") and slab.get("share", 0) >= 0.7) or face is not None \
+            or box3d is not None
+        if slab is not None and slab.get("litres") is not None:
+            estimators["tilted_slab"] = _rigid_entry(slab["length"], slab["width"], slab["thickness"],
+                                                     "tilted rigid slab: top-face L x W x thickness",
+                                                     "rise at the low edge / cos(tilt)", None,
+                                                     tilt_deg=slab.get("tilt_deg"))
         if deformable_hint and raster is not None:
             # A deformable object's L x W is its BODY: low loose parts (straps, handles, a flattened
             # corner) rise a few cm and stretched the footprint (a backpack read 45 x 36 cm). The
@@ -822,10 +822,26 @@ class FillEstimator:
                 body_raster = _floor_raster(surface, body, rise_map)
                 if body_raster is not None:
                     length, width = body_raster["length"], body_raster["width"]
-            method = ("deformable object: visible surface integrated above its support "
-                      "(not L x W x H; L x W x H is the body's enclosing box)")
+        method = PER_PIXEL_METHOD + (" (deformable: L x W is the body's enclosing box)" if deformable_hint else "")
+        edge_share = float(np.count_nonzero(flying)) / max(1, int(np.count_nonzero(risen | flying)))
+        estimators["per_pixel"] = {"status": "primary", "litres": round(litres, 3),
+                                   "edge_artifact_share": round(edge_share, 3),
+                                   "quality": ("check: depth smeared across the object's edge "
+                                               f"({edge_share:.0%} of its pixels lie behind the object); the "
+                                               "per-pixel value is unreliable for this frame")
+                                   if edge_share > EDGE_ARTIFACT_CHECK_SHARE else "ok",
+                                   "litres_valid_pixels_only": round(valid_litres, 3), "integration": integral,
+                                   "flying_pixels_dropped": int(np.count_nonzero(flying)),
+                                   "area_out_of_range_pixels": clamped, "pixels_integrated": int(np.count_nonzero(risen)),
+                                   "dropout_pixels_filled": missing, "height_above_support_m": round(tall, 4),
+                                   "footprint_length_m": length, "footprint_width_m": width}
+        rigid = _select_rigid(estimators, tall)
+        if rigid is not None and not level:
+            # On a pile, neighbours can hide part of a face: an observed extent may be truncated (synthetic:
+            # a 30 x 20 x 10 cm box tilted on bags read 29.6 x 20.0 x 7.4 cm). Kept, labelled, not trusted.
+            rigid["warning"] = "uneven surroundings: a face may be partly hidden by neighbours (unverified)"
         self.last_object = {"length_m": length, "width_m": width, "height_m": tall, "litres": round(litres, 2),
-                            "method": method, "planar": planar,
+                            "method": method, "planar": planar, "estimators": estimators, "rigid": rigid,
                             "quantity": "visible-surface volume above the local support",
                             "shape_model": "deformable" if deformable_hint else ("rigid" if rigid_hint else "unresolved")}
         return round(litres, 2), tall
@@ -1163,7 +1179,13 @@ def _box_from_face(surface, cells, rows, cols, keep, face_img, pts, centre, axes
                     runs.append(float(np.median(stretch)))
         return max(runs) if runs else None
 
-    run = side_run()
+    if tilt < 5.0:
+        # V54.5: a face lying flat OBSERVES its thickness -- its own height above the surrounding surface --
+        # and that wins over a side-face run, which only shows as much of the side as is in view.
+        face_h = float(np.median(height[rows[keep], cols[keep]]))
+        if face_h - support > 0.005:
+            thickness, source = face_h - support, "face height above the surrounding surface"
+    run = side_run() if thickness is None else None
     runs = [run] if run is not None else []
     if runs:
         thickness, source = max(runs), "visible side face"
@@ -1206,6 +1228,49 @@ def _box_from_face(surface, cells, rows, cols, keep, face_img, pts, centre, axes
                    "litres": length * width * thickness * 1000.0,
                    "method": f"box cuboid: face L x W (in its own plane) x thickness from {source}"})
     return result
+
+
+PER_PIXEL_METHOD = "per-pixel support-plane integral (visible surface above the local support)"
+# Thickness sources that OBSERVE the third edge. A partial side-face run, the rise at a slab's low edge and
+# the surface beside a low edge are inferences about a hidden edge (5.6 vs 10.4 cm for one lying carton).
+OBSERVED_THICKNESS = {"observed faces", "face height above the surrounding surface"}
+RIGID_HEIGHT_TOLERANCE = (0.015, 0.15)   # top of the cuboid vs observed top above the support: max(1.5 cm, 15 %)
+
+
+def _rigid_entry(length, width, thickness, method, source, reason, **extra) -> dict[str, Any]:
+    """One rigid estimator's raw result: edges sorted longest -> shortest (pose-independent)."""
+    entry: dict[str, Any] = {"method": method, "thickness_source": source, **extra}
+    if thickness is None or length is None or width is None:
+        return {**entry, "status": "rejected", "reason": reason or "third edge not observable"}
+    edges = sorted((float(length), float(width), float(thickness)), reverse=True)
+    entry.update({"edges_m": [round(v, 4) for v in edges], "litres": round(edges[0] * edges[1] * edges[2] * 1000.0, 3),
+                  "length_m": float(length), "width_m": float(width), "thickness_m": float(thickness)})
+    if source not in OBSERVED_THICKNESS:
+        return {**entry, "status": "rejected",
+                "reason": f"third edge inferred ({source}), not observed: no hidden edge is invented"}
+    return {**entry, "status": "candidate"}
+
+
+def _select_rigid(estimators: dict[str, Any], observed_top_m: float) -> dict[str, Any] | None:
+    """The secondary rigid-box estimate: box-from-faces first (every edge spanned by a seen face), else a
+    flat-lying face with its height above the support. Rejected when its top disagrees with the observed
+    top above the support. Never replaces the per-pixel primary."""
+    for key in ("box_from_faces", "box_face"):
+        entry = estimators.get(key)
+        if not entry or entry.get("status") != "candidate":
+            continue
+        if key == "box_face":
+            # only a flat-lying face gets an observed thickness (its rise): it must match the observed top
+            tilt = math.radians(float(entry.get("tilt_deg") or 0.0))
+            predicted = entry["thickness_m"] * math.cos(tilt) + min(entry["length_m"], entry["width_m"]) * math.sin(tilt)
+            tolerance = max(RIGID_HEIGHT_TOLERANCE[0], RIGID_HEIGHT_TOLERANCE[1] * observed_top_m)
+            if abs(predicted - observed_top_m) > tolerance:
+                entry.update(status="rejected", reason=f"cuboid top {predicted * 100:.1f} cm vs observed "
+                                                       f"{observed_top_m * 100:.1f} cm above the support")
+                continue
+        entry["status"] = "secondary"
+        return {"key": key, **entry}
+    return None
 
 
 def _local_support(surface: dict[str, Any], ring: np.ndarray, y1: int, y2: int) -> dict[str, Any] | None:
@@ -1308,18 +1373,40 @@ def _oriented_box(surface: dict[str, Any], cells: np.ndarray, support: float | N
             "method": f"box from {len(normals)} visible faces: extents along the faces' own axes (L x W x H)"}
 
 
-def _support_jacobian_area(surface: dict[str, Any]) -> np.ndarray | None:
+# Synthetic stress test (4-px mixed-depth band, carton at 30/45 deg): lying poses kept within 7 % at a 2-8 %
+# share, upright poses at 10-12 % read -42 ... +95 %. A reading above this share is flagged, never corrected.
+EDGE_ARTIFACT_CHECK_SHARE = 0.08
+FLYING_WINDOW = 9              # px: local object depth for the "behind the object" test
+
+
+def _behind_local_surface(z: np.ndarray, region: np.ndarray) -> np.ndarray:
+    """Pixels of `region` whose depth lies BEHIND the median depth of the region around them by > 2 cm + 2 %.
+    The mask says the pixel shows the object, so its depth must be the object's: a mixed (flying) pixel
+    between an edge and the floor behind is farther, and its 3-D point lies behind the object."""
+    from numpy.lib.stride_tricks import sliding_window_view
+    half = FLYING_WINDOW // 2
+    obj = np.pad(np.where(region & np.isfinite(z), z, np.nan).astype(np.float32), half, constant_values=np.nan)
+    with np.errstate(all="ignore"):
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            local = np.nanmedian(sliding_window_view(obj, (FLYING_WINDOW, FLYING_WINDOW)), axis=(-1, -2))
+    return region & np.isfinite(local) & (np.nan_to_num(z, nan=0.0) - local > 0.02 + 0.02 * local)
+JACOBIAN_AREA_LIMIT = 2.0      # diagnostic only: x the support-projected area of a horizontal patch
+
+
+def _support_jacobian_area(surface: dict[str, Any], with_bound: bool = False):
     """Per-pixel area (m^2) of the surface patch projected onto the support plane, from the map's own
     back-projected points: (P_u x P_v) . up with P = z q, q = (x/z, y/z, 1) (linear in pixel position for
     a pinhole camera). z derivatives are central, one-sided across a > 2 cm + 2 % depth edge; NaN where
     no difference exists. Same formula as volume_experiment._support_area."""
     if "x" not in surface or "up" not in surface:
-        return None
+        return (None, None) if with_bound else None
     z = np.where(np.isfinite(surface["z"]) & (surface["z"] > 0.05), surface["z"], np.nan).astype(np.float64)
     with np.errstate(divide="ignore", invalid="ignore"):
         q = np.dstack([surface["x"] / z, surface["y"] / z, np.ones(z.shape)])
     if z.shape[0] < 3 or z.shape[1] < 3:
-        return None
+        return (None, None) if with_bound else None
     qu = np.nanmedian(np.diff(q, axis=1).reshape(-1, 3), axis=0)
     qv = np.nanmedian(np.diff(q, axis=0).reshape(-1, 3), axis=0)
 
@@ -1336,7 +1423,12 @@ def _support_jacobian_area(surface: dict[str, Any]) -> np.ndarray | None:
     up = up / max(1e-9, float(np.linalg.norm(up)))
     t0 = float(np.cross(qu, qv) @ up)
     area = z * (z * t0 + derivative(1) * (np.cross(q, qv) @ up) + derivative(0) * (np.cross(qu, q) @ up))
-    return -area if t0 < 0 else area
+    area = -area if t0 < 0 else area
+    if not with_bound:
+        return area
+    # horizontal patch through P = z q: d = z (q . up), area = d^2 |t0| / |q . up|^3 = z^2 |t0| / |q . up|
+    bound = z * z * abs(t0) / np.maximum(np.abs(q @ up), 0.25)
+    return area, bound
 
 
 def _mask_from(base: np.ndarray, selected: np.ndarray) -> np.ndarray:

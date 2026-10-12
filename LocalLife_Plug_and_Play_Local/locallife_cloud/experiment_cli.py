@@ -88,7 +88,7 @@ def cmd_calibrate(args) -> int:
         (path.parent / f"{args.camera}_{old['calibration_id']}.json").write_text(json.dumps(old, indent=1), encoding="utf-8")
     path.write_text(json.dumps(calibration, indent=1, default=float), encoding="utf-8")
     print(json.dumps({k: calibration[k] for k in ("calibration_id", "mapping", "offset_identifiable", "note",
-                                                  "calibration_objects", "fit_quality")}, indent=1, default=str))
+                                                  "calibration_objects", "fit_quality", "validation")}, indent=1, default=str))
     return 0
 
 

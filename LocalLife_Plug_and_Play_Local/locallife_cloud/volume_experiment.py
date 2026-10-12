@@ -62,7 +62,11 @@ from typing import Any
 
 import numpy as np
 
-MEASUREMENT_VERSION = "V54.4"   # bump on ANY change that can alter a measurement; evaluate per version
+MEASUREMENT_VERSION = "V54.5"
+# Depth-mapping acceptance (proposed, documented with every calibration; not supervisor-approved limits)
+CALIBRATION_MIN_PLACEMENTS = 3
+CALIBRATION_MIN_DEPTH_SPAN = 0.15
+CALIBRATION_MAX_HELD_OUT_PCT = 5.0   # bump on ANY change that can alter a measurement; evaluate per version
 QUANTITY = "visible_surface_volume_above_empty_bin"
 CELL_M = 0.005
 TOP_BAND_M = 0.015
@@ -468,6 +472,19 @@ def measure_frame(depth: np.ndarray, intrinsics: Any, mask: np.ndarray, baseline
         elif info.get("growth", 1.0) > MASK_TRUNCATION_GROWTH:
             reasons.append(f"the mask covers only part of the raised object ({info['growth']:.2f}x larger), "
                            f"and it could not be completed: {info.get('reason')}")
+    # flying pixels (far side of a depth jump, or behind the object's local depth): not object geometry,
+    # and their depth must not enter the neighbours' derivatives (same rule as the live path, bin_fill)
+    from .bin_fill import EDGE_ARTIFACT_CHECK_SHARE, _behind_local_surface
+    from .volume import _depth_edge_pixels
+    flying = (_depth_edge_pixels(np.nan_to_num(depth, nan=0.0), valid_now) | _behind_local_surface(depth, sel)) & sel
+    if np.count_nonzero(sel & ~flying) >= 10 and flying.any():
+        sel = sel & ~flying
+        area = _support_area(np.where(flying, np.nan, depth), k, plane["normal"])
+        sel &= np.isfinite(area)
+    share = float(np.count_nonzero(flying)) / max(1, int(np.count_nonzero(sel | flying)))
+    out["edge_artifact_share"] = round(share, 4)
+    out["quality_flags"] = [f"depth smeared across the object's edge ({share:.0%} of its pixels behind it): "
+                            "check this frame"] if share > EDGE_ARTIFACT_CHECK_SHARE else []
     ox, oy, oh = _cells(P[sel], plane, cell)
     okeys = _key(ox, oy)
     base_o, has_base = base_at(okeys)
@@ -544,9 +561,30 @@ def measure_frame(depth: np.ndarray, intrinsics: Any, mask: np.ndarray, baseline
     elif abs(out["background_residual_median_m"]) > BACKGROUND_TOL_M:
         reasons.append(f"background differs from the baseline by {out['background_residual_median_m'] * 100:+.1f} cm "
                        "(camera moved, depth drift or wrong depth scale)")
+    out["secondary_rigid_cuboid"] = _secondary_cuboid(depth, k, obj, base)
     if not reasons:
         out.update(status="ok", volume_l=round(volume_l, 5))
     return out
+
+
+def _secondary_cuboid(depth: np.ndarray, k: dict[str, Any], obj: np.ndarray, base: np.ndarray) -> dict[str, Any] | None:
+    """The rigid-box estimate of the same object, computed beside the per-pixel value (never instead of it):
+    sorted edges and L x W x H (live RealSense box path: volume.estimate_box_volume_cuboid). None when the
+    geometry does not support a cuboid."""
+    try:
+        from .types import CameraIntrinsics
+        from .volume import estimate_box_volume_cuboid, fit_reference_plane
+        intr = CameraIntrinsics(fx=float(k["fx"]), fy=float(k["fy"]), ppx=float(k["cx"]), ppy=float(k["cy"]),
+                                width=int(depth.shape[1]), height=int(depth.shape[0]))
+        plane = fit_reference_plane(np.nan_to_num(base, nan=0.0).astype(np.float32), intr)
+        r = estimate_box_volume_cuboid(np.nan_to_num(depth, nan=0.0).astype(np.float32), intr, obj, plane)
+    except Exception as exc:  # noqa: BLE001 - a secondary estimate never breaks the primary
+        return {"status": "error", "reason": str(exc)[:120]}
+    if r is None:
+        return None
+    edges = sorted((float(r.length_mm), float(r.width_mm), float(r.height_mm)), reverse=True)
+    return {"litres": round(float(r.volume_liters), 4), "edges_mm": [round(v, 1) for v in edges],
+            "method": r.volume_method, "label": "secondary rigid-box estimate (not the per-pixel volume)"}
 
 
 def measure_objects(depth, intrinsics, masks: list[np.ndarray], baseline_depth, roi=None, boxes=None,
@@ -575,7 +613,11 @@ def measure_objects(depth, intrinsics, masks: list[np.ndarray], baseline_depth, 
         else:
             r = measure_frame(depth, intrinsics, m, baseline_depth, roi, exclude=others,
                               box=None if not boxes or i >= len(boxes) else tuple(boxes[i]), **kw)
-            individual.append({"index": i, "volume_l": r["volume_l"], "status": r["status"], "reasons": r["reasons"]})
+            individual.append({"index": i, "volume_l": r["volume_l"], "status": r["status"], "reasons": r["reasons"],
+                               "volume_l_partial": r.get("volume_l_partial"), "top_height_m": r.get("top_height_m"),
+                               "edge_artifact_share": r.get("edge_artifact_share"),
+                               "quality_flags": r.get("quality_flags"),
+                               "secondary_rigid_cuboid": r.get("secondary_rigid_cuboid")})
     aggregate["objects_in_mask"] = len(masks)
     aggregate["individual"] = individual
     return aggregate
@@ -715,36 +757,50 @@ def fit_depth_mapping(samples: list[dict[str, Any]], *, camera: str, output_kind
     # absolute distance -- the measured perpendicular floor distance -- identifies the offset.
     offset_free = bool(floor_distance_m)
 
-    def predict(mapping):
+    def predict(mapping, subset=None):
         out = []
-        for smp in usable:
+        for smp in usable if subset is None else subset:
             r = measure_frame(smp["depth"][::2, ::2], smp["intrinsics"], smp["mask"][::2, ::2],
                               smp["baseline"][::2, ::2], None if smp.get("roi") is None else smp["roi"][::2, ::2],
                               mapping=mapping, distortion=None, fallback_shape=smp.get("fallback_shape"))
             out.append((r.get("top_height_m"), r.get("plane_distance_m")))
         return out
 
-    def cost(x):
-        mapping = _mapping_from(kind, x, offset_free)
-        total = 0.0
-        for (h, d), smp in zip(predict(mapping), usable):
-            if h is None or not np.isfinite(h):
-                return 1e6
-            total += (h - smp["reference_top_height_m"]) ** 2
-            if floor_distance_m and d is not None:
-                total += (d - floor_distance_m) ** 2 / len(usable)
-        return total
+    def fit(subset):
+        def cost(x):
+            mapping = _mapping_from(kind, x, offset_free)
+            total = 0.0
+            for (h, d), smp in zip(predict(mapping, subset), subset):
+                if h is None or not np.isfinite(h):
+                    return 1e6
+                total += (h - smp["reference_top_height_m"]) ** 2
+                if floor_distance_m and d is not None:
+                    total += (d - floor_distance_m) ** 2 / len(subset)
+            return total
 
-    if kind == "metric_affine":
-        x0 = [0.0, 0.0]
-    else:
-        floor_raw = float(np.nanmedian(usable[0]["baseline"]))
-        x0 = [math.log(1.0 / (floor_raw * floor_distance_m)), 0.0]
-    if offset_free:
-        x, _ = _nelder_mead(cost, x0, [0.2, 0.05 if kind == "metric_affine" else 0.05 * abs(math.exp(x0[0]))])
-    else:
-        x, _ = _nelder_mead(lambda v: cost(np.array([v[0], 0.0])), [x0[0]], [0.2])
-        x = np.array([x[0], 0.0])
+        if kind == "metric_affine":
+            x0 = [0.0, 0.0]
+        else:
+            floor_raw = float(np.nanmedian(subset[0]["baseline"]))
+            x0 = [math.log(1.0 / (floor_raw * floor_distance_m)), 0.0]
+        if offset_free:
+            x, _ = _nelder_mead(cost, x0, [0.2, 0.05 if kind == "metric_affine" else 0.05 * abs(math.exp(x0[0]))])
+        else:
+            x, _ = _nelder_mead(lambda v: cost(np.array([v[0], 0.0])), [x0[0]], [0.2])
+            x = np.array([x[0], 0.0])
+        return x
+
+    x = fit(usable)
+    # Held-out check: refit without each placement, predict that placement (leave-one-out). In-sample
+    # residuals of a 2-parameter fit to 2-3 points say little about objects it was not fitted to.
+    held_out = []
+    if len(usable) >= 3:
+        for i, smp in enumerate(usable):
+            rest = usable[:i] + usable[i + 1:]
+            h = predict(_mapping_from(kind, fit(rest), offset_free), [smp])[0][0]
+            held_out.append({"object_id": smp.get("object_id"), "trial_id": smp.get("trial_id"),
+                             "residual_pct": None if h is None else round(
+                                 100 * (h - smp["reference_top_height_m"]) / smp["reference_top_height_m"], 3)})
     mapping = _mapping_from(kind, x, offset_free)
     preds = predict(mapping)
     residuals = [{"trial_id": smp.get("trial_id"), "object_id": smp.get("object_id"),
@@ -757,6 +813,25 @@ def fit_depth_mapping(samples: list[dict[str, Any]], *, camera: str, output_kind
     all_raw = np.concatenate([smp["depth"][smp["mask"] & np.isfinite(smp["depth"])] for smp in usable])
     lo, hi = np.percentile(all_raw, (5, 95))
     mapping["valid_raw_depth"] = [round(float(lo) * 0.9, 4), round(float(hi) * 1.1, 4)]
+    # Conditioning: a mapping fitted at one depth (a single anchor, or a nearly flat background) does not
+    # identify scale AND offset; the placements must span the operating depth range.
+    # anchor depth of each placement = its top surface (the fitted quantity), robustly the near 10th percentile
+    sample_depth = [float(np.percentile(smp["depth"][smp["mask"] & np.isfinite(smp["depth"])], 10)) for smp in usable]
+    span = (max(sample_depth) - min(sample_depth)) / max(1e-9, float(np.median(sample_depth)))
+    loo = [abs(r["residual_pct"]) for r in held_out if r["residual_pct"] is not None]
+    problems = []
+    if len(usable) < CALIBRATION_MIN_PLACEMENTS:
+        problems.append(f"{len(usable)} calibration placement(s); >= {CALIBRATION_MIN_PLACEMENTS} needed for a held-out check")
+    if span < CALIBRATION_MIN_DEPTH_SPAN:
+        problems.append(f"placements span {span:.0%} of the object depth; >= {CALIBRATION_MIN_DEPTH_SPAN:.0%} needed "
+                        "(ill-conditioned: scale and offset not separable)")
+    if loo and max(loo) > CALIBRATION_MAX_HELD_OUT_PCT:
+        problems.append(f"held-out top-height error up to {max(loo):.1f} % > {CALIBRATION_MAX_HELD_OUT_PCT:.0f} %")
+    validation = {"status": "validated" if not problems else "not validated", "problems": problems,
+                  "held_out_residuals": held_out, "held_out_max_abs_pct": None if not loo else round(max(loo), 3),
+                  "raw_top_depth_span": round(span, 4),
+                  "criteria": {"min_placements": CALIBRATION_MIN_PLACEMENTS, "min_depth_span": CALIBRATION_MIN_DEPTH_SPAN,
+                               "max_held_out_pct": CALIBRATION_MAX_HELD_OUT_PCT, "note": "proposed acceptance limits"}}
     floor_check = None
     if floor_distance_m:
         d_fit = [d for _, d in preds if d is not None]
@@ -776,7 +851,7 @@ def fit_depth_mapping(samples: list[dict[str, Any]], *, camera: str, output_kind
                                 [r["residual_m"] ** 2 for r in residuals if r["residual_m"] is not None]))), 5),
                             "reference_heights_m": [min(heights), max(heights)],
                             "raw_depth_range": [round(float(lo), 4), round(float(hi), 4)]},
-            "created_at": time.time(), "frozen": True, **(meta or {})}
+            "validation": validation, "created_at": time.time(), "frozen": True, **(meta or {})}
     body["calibration_id"] = f"{camera}-cal-{hashlib.sha1(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()[:10]}"
     return body
 
@@ -1046,6 +1121,9 @@ class ExperimentRecorder:
                      "calibration_id": "factory-depth-scale", "distortion": distortion}
         else:
             reasons += [f"calibration invalid: {r}" for r in compatibility(calibration, {**current, "plane": baseline.get("plane")})]
+            validation = calibration.get("validation") or {}
+            if validation.get("status") == "not validated":
+                reasons.append("calibration invalid: not validated (" + "; ".join(validation.get("problems") or []) + ")")
             setup = {"mapping": calibration["mapping"], "align_background": calibration.get("align_background", False),
                      "calibration_id": calibration["calibration_id"], "distortion": distortion}
         if payload.meta.get("output_kind") not in (None, "metric") and setup["mapping"].get("kind") != "inverse_affine":
@@ -1344,8 +1422,16 @@ def replay_trial(trial_dir: Path, setups: dict[str, dict[str, Any]] | None = Non
                 r = measure_objects(raw["depth"], f["intrinsics"], masks, base,
                                     raw["roi"] if raw["roi"].size else None, boxes=boxes, **_setup_kwargs(setup),
                                     fallback_shape=raw["rgb"].shape[:2])
+                # side by side: per-pixel primary, the secondary cuboid, per object, and the LIVE path's raw
+                # numbers recorded with the frame (before/after on identical inputs)
                 g.update(volume_l=r["volume_l"], status=r["status"], reasons=r["reasons"],
-                         volume_l_partial=r.get("volume_l_partial"), setup=setup)
+                         volume_l_partial=r.get("volume_l_partial"), setup=setup,
+                         edge_artifact_share=r.get("edge_artifact_share"), quality_flags=r.get("quality_flags"),
+                         secondary_rigid_cuboid=r.get("secondary_rigid_cuboid"), individual=r.get("individual"),
+                         recorded={"volume_l": f.get("volume_l"), "status": f.get("status"),
+                                   "measurement_version": ((f.get("meta") or {}).get("provenance") or {}).get(
+                                       "measurement_version"),
+                                   "live": (f.get("meta") or {}).get("live")})
             frames.append(g)
         agg = aggregate_trial(frames, record.get("motion_requested", "settled"), res.get("motion_state") != "timeout_moving")
         agg["frames"] = frames

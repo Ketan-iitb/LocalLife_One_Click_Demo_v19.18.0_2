@@ -49,15 +49,19 @@ class CuboidPoseTests(unittest.TestCase):
         result, obj = measure(dims, pitch, cam)
         self.assertIsNotNone(result, obj)
         litres, height = result
-        self.assertTrue(obj["method"].startswith("box "), obj["method"])
+        # V54.5: the returned/displayed volume is the per-pixel primary in every pose ...
+        self.assertTrue(obj["method"].startswith("per-pixel"), obj["method"])
         self.assertLess(abs(litres - truth) / truth, 0.05)
-        # The SAME estimate: displayed litres = L x W x H (metres -> litres), height = the vertical extent.
-        product = obj["length_m"] * obj["width_m"] * obj["height_m"] * 1000.0
-        self.assertAlmostEqual(litres, product, delta=0.01)
         self.assertAlmostEqual(height, obj["height_m"], places=6)
         self.assertAlmostEqual(obj["height_m"], dims[2], delta=0.012)      # height above the support
-        measured = sorted((obj["length_m"], obj["width_m"], obj["height_m"]))
-        for got, want in zip(measured, sorted(dims)):
+        # ... and the rigid box is a separately labelled secondary: L x W x H of OBSERVED edges, sorted
+        rigid = obj["rigid"]
+        self.assertIsNotNone(rigid, obj["estimators"])
+        self.assertEqual(rigid["status"], "secondary")
+        self.assertLess(abs(rigid["litres"] - truth) / truth, 0.05)
+        e = rigid["edges_m"]
+        self.assertAlmostEqual(rigid["litres"], e[0] * e[1] * e[2] * 1000.0, delta=0.01)
+        for got, want in zip(e, sorted(dims, reverse=True)):
             self.assertAlmostEqual(got, want, delta=0.012)                  # cm-level, all three axes
 
     def test_same_box_upright_and_on_two_sides_oblique_views(self) -> None:

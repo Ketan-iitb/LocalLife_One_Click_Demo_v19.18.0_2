@@ -9,6 +9,50 @@ configuration changes, validation performed, hardware status, and any known
 limitations. This should make it possible to identify the version that
 introduced a regression without guessing from file modification dates.
 
+## V54.5 — 2026-10-12 — One primary volume method; carton placement diagnostics
+
+### Status
+
+- Synthetic diagnostics and regression tests only. No physical session has been run with this version;
+  physical accuracy of either camera is not demonstrated.
+
+### Observed problem
+
+One milk carton, fixed mount: RealSense 1.06 / 1.01 / 1.87 L and Logitech 3.93 / 4.27 / 1.05 L over three
+placements; RealSense third edge 5.6 vs 10.4 cm; method text switched between "tilted rigid slab",
+"face x visible-side thickness" and "box from 2/3 faces".
+
+### Confirmed causes (synthetic, identical inputs before/after: `tests/test_v54_5_consistency.py`)
+
+- The live/dashboard value (`support_volume_l`) came from whichever of four estimators won for that pose:
+  face cuboid, box-from-faces, tilted slab (replaced the integral whenever it was SMALLER) or integral.
+  The slab and side-run thicknesses are inferred, not observed (5.6 cm vs 10.4 cm).
+- Partial detector masks: the uncovered part of the object inside the detector box counted as
+  "surroundings", made a flat floor look uneven and blocked mask completion (-0.01 ... 1.43 L).
+- Flying pixels at the object edge produced random-signed Jacobian areas and a smeared footprint.
+- Tracker predictions / held-through-dropout copies (old box + old mask) were not excluded from the
+  geometry of neighbouring objects or from experiment recordings.
+
+### Changes
+
+- `bin_fill._object_volume`: the per-pixel support-plane integral is the ONE primary result for every
+  object and both cameras. Rigid estimators are computed beside it (`estimators`), a secondary rigid box
+  (`rigid`) only from observed edges (box from faces, or a flat face's own height); slab, side-run and
+  resting-edge thicknesses are rejected with the reason. Pile surroundings label the secondary unverified.
+- Surroundings levelness is judged outside the detector box; flying pixels (far side of a depth jump, or
+  behind the object's local depth) are dropped from the integral and footprint and counted; a share
+  above 8 % flags the frame "check" (threshold from the synthetic stress test only).
+- `pipeline`: stale track copies create no geometry; the per-track history restarts on a move/turn,
+  geometry change or calibration/baseline/intrinsics change; `support_rigid` exported separately.
+- `volume_experiment`: the same flying-pixel rule; secondary cuboid and live raw results side by side in
+  frames and replay; calibration reports leave-one-out residuals and depth-span conditioning, and an
+  unvalidated calibration blocks trial volumes (replayable later). MEASUREMENT_VERSION V54.5.
+
+### Known limitations (kept visible in tests)
+
+- Per-pixel volume is the space under the VISIBLE surface: a box leaning on a pile over-reads
+  (8-12 L for 4.7 L), a box sunk among bags under-reads; tall objects with heavy edge smear are flagged.
+
 ## v5 — 2026-09-16 — Reversible household-object geometry validation
 
 ### Status

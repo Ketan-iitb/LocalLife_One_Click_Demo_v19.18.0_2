@@ -539,11 +539,18 @@ class V49SlabTests(unittest.TestCase):
         for deg in (15, 25, 40):
             with self.subTest(tilt=deg):
                 litres, tall, obj = self._measure(deg)
-                self.assertLess(abs(litres - 4.73) / 4.73, 0.25, litres)
-                self.assertLess(abs(tall - 0.07), 0.025, tall)               # thickness, not the raised end
-                self.assertLess(abs(obj["length_m"] - 0.45), 0.04, obj)
-                self.assertLess(abs(obj["width_m"] - 0.15), 0.03, obj)
-                self.assertTrue("slab" in obj["method"] or obj["method"].startswith("box cuboid"), obj["method"])
+                # V54.5 characterisation: the per-pixel primary is the volume under the VISIBLE surface; for a
+                # box leaning on the pile that includes the space under its raised end (8-12 L for 4.73 L), and
+                # its height is the raised top. The slab/resting-edge cuboid that used to replace it inferred
+                # the third edge (5.6 vs 10.4 cm on one real carton): rejected with that reason, not shown.
+                self.assertTrue(obj["method"].startswith("per-pixel"), obj["method"])
+                self.assertGreater(litres, 4.73)
+                self.assertGreater(tall, 0.07)
+                self.assertIsNone(obj["rigid"])
+                slab = obj["estimators"]["tilted_slab"]
+                self.assertEqual(slab["status"], "rejected")
+                self.assertIn("inferred", slab["reason"])
+                self.assertLess(abs(slab["edges_m"][0] - 0.45), 0.04)    # still exported, raw, for comparison
 
     def test_flat_box_is_unchanged(self):
         litres, tall, obj = self._measure(0)

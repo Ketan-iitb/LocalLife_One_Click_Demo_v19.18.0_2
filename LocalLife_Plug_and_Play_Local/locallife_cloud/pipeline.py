@@ -100,7 +100,7 @@ from .logitech_metric import (CALIBRATION_SET, EVALUATION_SET, RECOMMENDED_SAMPL
                               integrate_volume_l, robust_height_cm, stable_statistics,
                               zone_signature)
 from .measurement_zone import MeasurementZone, MeasurementZoneStore
-from .bin_fill import FillEstimator, default_profile, deformable_label, height_map
+from .bin_fill import PER_PIXEL_METHOD, FillEstimator, default_profile, deformable_label, height_map
 from .recognition import object_name, visible_material
 from .mask_leak import trim_mask_leak
 from .session_deposits import FrameEvidence, TrackInfo
@@ -177,6 +177,14 @@ def _box_iou(a, b) -> float:
 
 def _is_phantom_detection(detection: Detection) -> bool:
     return is_phantom_source(detection.source)
+
+
+NON_MEASURABLE_SOURCES = frozenset({"tracked-prediction", "held-through-dropout"})
+
+
+def _measurable_detection(detection: Detection) -> bool:
+    """Seen in THIS frame by a detector: phantoms and copies of an earlier frame's box/mask create no geometry."""
+    return not _is_phantom_detection(detection) and detection.source not in NON_MEASURABLE_SOURCES
 
 
 def is_bag_detection(label: str) -> bool:
@@ -3311,42 +3319,50 @@ class VisionPipeline:
         # V49: object size/volume above the local support, class-consistent material and the
         # sorting verdict -- all from this track's RESOLVED class (object_class.py), one coherent set.
         resolver = self.__dict__.setdefault("_class_resolver", ClassResolver())
+        context = self._support_context_key(intrinsics, measure_intrinsics)
         for item in detections:
             own = item.monocular_volume_l if self.camera_id == "logitech" else item.realsense_volume_l
             if _is_phantom_detection(item):
                 continue
             resolved = item.resolved_label
-            try:
-                rigid = resolved in FLAT_FACED
-                others = None
-                if item.mask is not None:
-                    others = np.zeros(item.mask.shape, bool)
-                    for other in detections:
-                        if other is not item and other.mask is not None and other.mask.shape == others.shape \
-                                and not _is_phantom_detection(other):
-                            others |= other.mask.astype(bool)
-                estimate = self.fill.object_volume(
-                    item.box, item.mask, time.time(), rigid_hint=rigid,
-                    deformable_hint=not rigid and deformable_label(resolved or item.label), exclude_mask=others)
-                dims = dict(self.fill.last_object) if estimate is not None else None
-            except Exception:  # noqa: BLE001 - display-only estimate
-                estimate, dims = None, None
-            if estimate is None and (self.fill.__dict__.get("last_object") or {}).get("reason"):
-                # e.g. a box face was measured but its thickness is not observable: say so, no number
-                item.support_method = f"{self.fill.last_object['method']} ({self.fill.last_object['reason']})"
+            estimate, dims = None, None
+            if _measurable_detection(item):
+                # A tracker prediction / held-through-dropout copy repeats an OLD box and mask: it creates no
+                # geometry, and its stale mask is not "another object" around a real one.
+                try:
+                    rigid = resolved in FLAT_FACED
+                    others = None
+                    if item.mask is not None:
+                        others = np.zeros(item.mask.shape, bool)
+                        for other in detections:
+                            if other is not item and other.mask is not None and other.mask.shape == others.shape \
+                                    and _measurable_detection(other):
+                                others |= other.mask.astype(bool)
+                    estimate = self.fill.object_volume(
+                        item.box, item.mask, time.time(), rigid_hint=rigid,
+                        deformable_hint=not rigid and deformable_label(resolved or item.label), exclude_mask=others)
+                    dims = dict(self.fill.last_object) if estimate is not None else None
+                except Exception:  # noqa: BLE001 - display-only estimate
+                    estimate, dims = None, None
+                if estimate is None and (self.fill.__dict__.get("last_object") or {}).get("reason"):
+                    item.support_method = f"{self.fill.last_object['method']} ({self.fill.last_object['reason']})"
             if dims is not None and item.track_id is not None and dims.get("planar"):
                 resolver.set_rigid(item.track_id, True)      # depth evidence: a flat rigid top
             if estimate is not None and dims is not None:
                 sample = (time.time(), estimate[0], estimate[1], dims.get("length_m"), dims.get("width_m"),
-                          dims.get("method") or "volume above the local surface")
+                          dims.get("method") or PER_PIXEL_METHOD, tuple(item.box), context)
+                reset = None
                 if item.track_id is not None:
-                    # Repeatability over this SAME track's recent frames, as ONE coherent sample (the
-                    # median-volume frame): separate medians of L, W, H and V do not belong together.
+                    # Repeatability over this SAME track's recent frames AND the same placement, calibration and
+                    # intrinsics, as ONE coherent sample (the median-volume frame).
                     history = self.__dict__.setdefault("_provisional_history", {})
                     samples = [v for v in history.get(item.track_id, []) if sample[0] - v[0] <= 15.0][-7:]
-                    if samples and not _same_geometry(samples[-1], sample):
-                        # The object was turned or replaced (an upright box laid on its side): the
-                        # earlier geometry no longer describes it, so it must not win the median.
+                    if samples:
+                        last = samples[-1]
+                        reset = ("calibration/baseline/intrinsics changed" if len(last) < 8 or last[7] != context else
+                                 "object moved or turned" if _placement_changed(last[6], sample[6]) else
+                                 "geometry changed" if not _same_geometry(last, sample) else None)
+                    if reset:
                         samples = []
                         self.stage_counters["support_history_reset_on_geometry_change"] += 1
                     samples.append(sample)
@@ -3355,18 +3371,27 @@ class VisionPipeline:
                         for key in list(history)[:150]:
                             history.pop(key, None)
                     sample = sorted(samples, key=lambda v: v[1])[len(samples) // 2]
-                _, litres, height_m, length_m, width_m, method = sample
+                    frames_used = len(samples)
+                else:
+                    frames_used = 1
+                _, litres, height_m, length_m, width_m, method = sample[:6]
                 k = intrinsics if self.camera_id != "logitech" else (
                     measure_intrinsics or self._field_of_view_intrinsics(frame.shape))
+                rigid_est = dims.get("rigid")
+                item.support_rigid = None if not rigid_est else {
+                    "edges_cm": [round(v * 100, 1) for v in rigid_est["edges_m"]], "litres": rigid_est["litres"],
+                    "method": rigid_est["method"], "thickness_source": rigid_est.get("thickness_source"),
+                    "warning": rigid_est.get("warning"),
+                    "label": "secondary rigid-box estimate (this frame; not the displayed volume)"}
                 item.support_diagnostics = {
                     **(dims.get("diagnostics") or {}), "camera": self.camera_id,
                     "this_frame_litres": round(float(estimate[0]), 3), "aggregated_litres": round(float(litres), 3),
-                    "aggregation": "median-volume sample of this track's last 15 s (same geometry only)",
+                    "aggregation": f"median-volume sample of {frames_used} frame(s): same track, placement, "
+                                   "geometry and calibration, last 15 s",
+                    "history_reset": reset, "measurement_context": context,
                     "method": dims.get("method"), "shape_model": dims.get("shape_model"),
-                    # pose-independent edge lengths of a cuboid (L x W x H changes order when it is laid down)
-                    "edges_sorted_cm": None if not str(dims.get("method") or "").startswith("box ") or None in (
-                        dims.get("length_m"), dims.get("width_m"), dims.get("height_m")) else
-                    sorted((round(float(dims[k]) * 100, 1) for k in ("length_m", "width_m", "height_m")), reverse=True),
+                    "estimators": dims.get("estimators"),
+                    "edges_sorted_cm": None if not rigid_est else [round(v * 100, 1) for v in rigid_est["edges_m"]],
                     "intrinsics": None if k is None else {"fx": round(float(k.fx), 2), "fy": round(float(k.fy), 2),
                                                           "ppx": round(float(k.ppx), 2), "ppy": round(float(k.ppy), 2)},
                     "intrinsics_source": ("realsense-factory" if self.camera_id != "logitech"
@@ -3374,28 +3399,32 @@ class VisionPipeline:
                     "depth_source": "aligned hardware depth" if self.camera_id != "logitech"
                     else f"{self.config.depth_model} ({self.calibration_mode}); floor rescale "
                          f"{(self.logitech_floor_scale or {}).get('state')}",
-                    "quantity": "visible volume above the local surface (live diagnostic; the camera comparison "
-                                "uses the experiment's empty-baseline per-pixel path)"}
+                    "quantity": "visible volume above the local surface (per-pixel primary; the controlled "
+                                "comparison uses the experiment's empty-baseline per-pixel path)"}
                 item.support_volume_l = round(float(litres), 2)
-                item.support_height_cm = round(float(height_m) * 100, 1)
+                item.support_height_cm = round(float(height_m) * 100, 1)       # height ABOVE the support
                 if length_m:
-                    item.support_length_cm = round(float(length_m) * 100, 1)
+                    item.support_length_cm = round(float(length_m) * 100, 1)   # footprint on the support plane
                     item.support_width_cm = round(float(width_m) * 100, 1)
                 if item.track_id is not None:
                     resolver.set_size(item.track_id, item.support_length_cm, item.support_height_cm)
-                item.support_method = method if method.startswith(("box ", "deformable")) or "slab" in method else \
-                    "volume integrated above the local surface (not L x W x H; L x W x H is its enclosing box)"
-                cuboid = method.startswith("box ")
-                if self.camera_id == "logitech" and cuboid and self.logitech_depth_gain()[0] is None and (
+                item.support_method = method
+                quality = ((dims.get("estimators") or {}).get("per_pixel") or {}).get("quality", "ok")
+                if quality != "ok":
+                    item.support_method += f" | {quality}"
+                if item.support_rigid:
+                    e = item.support_rigid["edges_cm"]
+                    item.support_method += (f" | secondary rigid box {e[0]}x{e[1]}x{e[2]} cm = "
+                                            f"{item.support_rigid['litres']:.2f} L ({item.support_rigid['method']})"
+                                            + (f" [{item.support_rigid['warning']}]" if item.support_rigid["warning"] else ""))
+                elif not dims.get("shape_model") == "deformable":
+                    item.support_method += " | no rigid-box estimate (third edge not observed)"
+                if self.camera_id == "logitech" and self.logitech_depth_gain()[0] is None and (
                         self.support_volume_factors is None or self.support_volume_factors.frozen_at is None):
-                    # Monocular depth: every face extent and the thickness come from the model's depth at
-                    # one floor scale; nothing measured has validated that scale for object sizes.
+                    # Monocular depth: every extent and height come from the model's depth at one floor scale;
+                    # nothing measured has validated that scale for object sizes.
                     item.support_method += "; LOW CONFIDENCE: monocular depth, scale not validated with known objects"
-                if self.camera_id == "logitech" and self.support_volume_factors is not None and cuboid:
-                    if self.support_volume_factors.frozen_at is not None:
-                        item.support_method += "; Logitech known-object factor not applied (cuboid: V = L x W x H)"
-                    # A volume-only factor would leave the displayed L x W x H describing another volume.
-                elif self.camera_id == "logitech" and self.support_volume_factors is not None:
+                if self.camera_id == "logitech" and self.support_volume_factors is not None:
                     # Monocular depth flattens relief. A factor frozen from >= 3 KNOWN objects (never
                     # RealSense values) rescales the volume; the raw value is kept beside it.
                     item.support_raw_volume_l = item.support_volume_l
@@ -3836,7 +3865,7 @@ class VisionPipeline:
             k = measure_intrinsics if logitech else intrinsics
             if logitech and k is None:
                 k = self._field_of_view_intrinsics(frame.shape)
-            kept = [d for d in detections if d.mask is not None and not _is_phantom_detection(d)
+            kept = [d for d in detections if d.mask is not None and _measurable_detection(d)
                     and (bin_region is None or (d.mask & bin_region).any())]
             listener(FramePayload(
                 camera=self.camera_id, timestamp=float(timestamp), rgb=frame,
@@ -3850,7 +3879,17 @@ class VisionPipeline:
                       if logitech else "realsense-factory",
                       "depth_units": "model output (metric checkpoint: metres)" if logitech
                       else "metres (device depth scale applied at capture)",
-                      "distortion": "not modelled"}))
+                      "distortion": "not modelled",
+                      # what produced the live numbers, and those numbers raw (per object, unaggregated)
+                      "provenance": self.measurement_provenance(),
+                      "live": [{"track_id": d.track_id, "label": d.label, "box": [float(v) for v in d.box],
+                                "support_volume_l": d.support_volume_l, "support_height_cm": d.support_height_cm,
+                                "support_footprint_cm": [d.support_length_cm, d.support_width_cm],
+                                "support_method": d.support_method, "support_rigid": d.support_rigid,
+                                "this_frame_litres": (d.support_diagnostics or {}).get("this_frame_litres"),
+                                "estimators": (d.support_diagnostics or {}).get("estimators"),
+                                "history_reset": (d.support_diagnostics or {}).get("history_reset")}
+                               for d in kept]}))
         except Exception:  # noqa: BLE001 - the experiment recorder must never stop the pipeline
             LOGGER.exception("%s experiment frame failed", self.camera_id)
 
@@ -6476,6 +6515,16 @@ class VisionPipeline:
             "processing_fps": None if not latency else round(1000.0 / latency, 2),
             "volume_trace": self.last_logitech_volume_diagnostics,
         }
+
+    def _support_context_key(self, intrinsics, measure_intrinsics) -> tuple:
+        """What a support measurement depends on besides the object: calibration, empty reference (by
+        identity), depth model and intrinsics. A change starts a new measurement history."""
+        k = intrinsics if self.camera_id != "logitech" else measure_intrinsics
+        reference = self.reference_realsense if self.camera_id != "logitech" else self.reference_monocular
+        return (None if self.calibration is None else getattr(self.calibration, "calibration_id", id(self.calibration)),
+                None if reference is None else id(reference), getattr(self, "calibration_mode", None),
+                self.config.depth_model if self.camera_id == "logitech" else "realsense",
+                None if k is None else (round(float(k.fx), 1), round(float(k.fy), 1), int(k.width), int(k.height)))
 
     def measurement_provenance(self) -> dict[str, Any]:
         """What produced this camera's numbers: build, geometry, depth model, calibration, baseline, intrinsics."""

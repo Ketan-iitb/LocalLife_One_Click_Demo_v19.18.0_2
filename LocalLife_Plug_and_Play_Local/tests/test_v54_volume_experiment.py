@@ -28,10 +28,13 @@ FLAT = staticmethod(lambda x, y: 0 * x)
 
 
 @lru_cache(maxsize=None)
-def render(dims=None, pitch=45.0, cam=0.8, yaw=25.0, tilt=0.0, dome=False):
+def render(dims=None, pitch=45.0, cam=0.8, yaw=25.0, tilt=0.0, dome=False, at=(0.0, 0.0)):
     heights = (lambda x, y: np.maximum(0.0, 0.12 * (1 - (x / 0.15) ** 2 - (y / 0.11) ** 2))) if dome \
         else (lambda x, y: 0 * x)
-    box = None if dims is None else _obb(*dims, tilt, yaw, 0.0)
+    box = None
+    if dims is not None:
+        centre, axes, half = _obb(*dims, tilt, yaw, 0.0)
+        box = (centre + np.array([at[0], at[1], 0.0]), axes, half)
     depth, on_box = _scene(heights, box, pitch, cam=cam, far=cam * 3)
     empty, _ = _scene(lambda x, y: 0 * x, None, pitch, cam=cam, far=cam * 3)
     mask = on_box if not dome else depth < empty - 0.005
@@ -223,11 +226,11 @@ class RecorderReplayEvaluationTests(unittest.TestCase):
             rec.observe(_payload("logitech", 10 + i, noisy(empty, seed=i) * logitech_scale, None))
         return rec
 
-    def _run_trial(self, rec, dims, t0, designation, scale=0.7, frames=8, still=True, **kw):
+    def _run_trial(self, rec, dims, t0, designation, scale=0.7, frames=8, still=True, at=(0.0, 0.0), **kw):
         rec.start_trial(object_id="box1L" if dims[2] * dims[0] * dims[1] < 0.0015 else "box2L",
                         designation=designation, placement="centre", top_height_m=dims[2], **kw)
         rec.trial["started_at"] = t0 - 0.01
-        depth, mask, _ = render(dims)
+        depth, mask, _ = render(dims, at=at)
         rec.observe(_payload("realsense", t0 - 5.0, noisy(depth, seed=99), mask))     # captured before the start
         for i in range(frames):
             rgb = np.zeros((*depth.shape, 3), np.uint8) if still else \
@@ -260,7 +263,20 @@ class RecorderReplayEvaluationTests(unittest.TestCase):
             meta = {k: rec.baselines["logitech"].get(k) for k in ("shape", "intrinsics", "plane", "depth_model",
                                                                   "intrinsics_source", "depth_units")}
             calibration = ve.fit_depth_mapping(samples, camera="logitech", output_kind="metric", meta=meta)
+            # V54.5: two placements at one depth cannot be held-out checked and do not condition the fit
+            self.assertEqual(calibration["validation"]["status"], "not validated")
             rec.calibration_path("logitech").parent.mkdir(parents=True, exist_ok=True)
+            rec.calibration_path("logitech").write_text(json.dumps(calibration, default=float))
+            blocked = self._run_trial(rec, (0.20, 0.10, 0.10), 250.0, "test")
+            self.assertIsNone(blocked["cameras"]["logitech"]["volume_l"])
+            self.assertTrue(any("not validated" in r for f in blocked["cameras"]["logitech"]["frames"]
+                                for r in (f.get("reasons") or [])))
+            # a third calibration placement farther away (another depth): conditioned, held-out checked
+            trial3 = self._run_trial(rec, (0.10, 0.10, 0.10), 270.0, "calibration", at=(0.0, 0.25))
+            samples += ve.calibration_samples(rec.session_dir / "trials" / trial3["trial_id"], "logitech")
+            calibration = ve.fit_depth_mapping(samples, camera="logitech", output_kind="metric", meta=meta)
+            self.assertEqual(calibration["validation"]["status"], "validated", calibration["validation"])
+            self.assertEqual(len(calibration["validation"]["held_out_residuals"]), 3)
             rec.calibration_path("logitech").write_text(json.dumps(calibration, default=float))
             with self.assertRaises(ValueError):                    # calibration object as held-out test
                 rec.start_trial(object_id="box1L", designation="test")

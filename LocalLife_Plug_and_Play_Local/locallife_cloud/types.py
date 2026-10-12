@@ -78,6 +78,8 @@ class Detection:
     volume_selected_method: str | None = None        # which of the above the camera volume field shows ...
     volume_selection_reason: str | None = None       # ... and why
     support_raw_volume_l: float | None = None        # Logitech: before the known-object factor
+    support_rigid: dict | None = None                # V54.5: secondary rigid-box estimate (sorted edges, litres,
+                                                     #        method) or None; never the displayed volume
     material: str = "unknown"
     material_confidence: float = 0.0
     track_id: int | None = None
@@ -238,6 +240,7 @@ class Detection:
             "cuboid_volume_l": self.cuboid_volume_l, "volume_selected_method": self.volume_selected_method,
             "volume_selection_reason": self.volume_selection_reason,
             "support_raw_volume_l": self.support_raw_volume_l,
+            "support_rigid": self.support_rigid,
             "raw_label": self.label,
             "resolved_label": self.resolved_label,
             "resolved_share": self.resolved_share,

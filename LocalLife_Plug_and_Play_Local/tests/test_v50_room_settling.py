@@ -158,4 +158,5 @@ class SoftObjectGeometryTests(unittest.TestCase):
                     self.assertLess(abs(litres - truth) / truth, 0.12)
         _, obj = self._measure(15.0, deformable_hint=True)
         self.assertLess(obj["length_m"], 0.40)              # body (36 cm), not body + straps (47 cm)
-        self.assertTrue(obj["method"].startswith("deformable object"))
+        self.assertTrue(obj["method"].startswith("per-pixel") and "deformable" in obj["method"])
+        self.assertIsNone(obj["rigid"])
