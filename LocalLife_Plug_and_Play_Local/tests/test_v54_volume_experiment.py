@@ -575,3 +575,44 @@ class PartialMaskTests(unittest.TestCase):
         r = ve.measure_frame(depth, KW, left, empty, exclude=right, box=(cols.min(), rows.min(), mid, rows.max() + 1))
         half = 0.10 * 0.09 * 0.09 * 1000.0                                  # this object: half the 1.62 L box
         self.assertLess(abs(r["volume_l_partial"] - half) / half, 0.15)
+
+
+class ThesisPanelTests(unittest.TestCase):
+    """Dashboard 'Thesis test' panel: register, session, trial, then download THIS session's log and raw data."""
+
+    def test_panel_endpoints_and_session_only_downloads(self):
+        import io
+        import zipfile
+
+        from locallife_cloud.comparison import DualCameraCoordinator
+        from locallife_cloud.config import AppConfig
+        from locallife_cloud.server import create_app
+        with TemporaryDirectory() as d:
+            config = AppConfig(detector_model="local-opencv-background", enable_monocular_depth=False,
+                               enable_bucket_sync=False, results_dir=Path(d))
+            manager = DualCameraCoordinator(config)
+            client = create_app(config, manager).test_client()
+            page = client.get("/research").get_data(as_text=True)
+            self.assertIn("Download thesis CSV (this session)", page)
+            self.assertIn("/api/experiment/session.zip", page)
+            self.assertNotIn("Download paired thesis CSV", page)          # old export links removed from the UI
+            self.assertIn('style="display:none" href="/api/session-deposits.csv"', page)   # panel links hidden
+            self.assertEqual(client.get("/api/comparison.csv").status_code, 200)   # ... their endpoints remain
+            self.assertEqual(client.get("/api/experiment/trials.csv").status_code, 404)
+            r = client.post("/api/experiment/object-add", json={"object_id": "box2L", "reference_volume_l": "2.0",
+                                                                 "reference_method": "ruler 20x10x10 cm"})
+            self.assertEqual(r.status_code, 200, r.get_json())
+            sid = client.post("/api/experiment/session", json={"note": "panel"}).get_json()["session_id"]
+            self.assertEqual(client.post("/api/experiment/trial-start", json={
+                "object_id": "box2L", "designation": "test", "placement": "fixed"}).status_code, 200)
+            stop = client.post("/api/experiment/trial-stop", json={}).get_json()
+            self.assertTrue(stop["stopped"])
+            self.assertTrue(stop["last_trial"])                            # every camera reported, valid or not
+            csv_text = client.get("/api/experiment/trials.csv").get_data(as_text=True)
+            self.assertIn("box2L", csv_text)
+            self.assertIn("valid", csv_text.splitlines()[0])
+            archive = zipfile.ZipFile(io.BytesIO(client.get("/api/experiment/session.zip").get_data()))
+            names = archive.namelist()
+            self.assertIn(f"{sid}/trials.csv", names)
+            self.assertIn(f"{sid}/session.json", names)
+            self.assertIn(f"{sid}/_shared/objects.json", names)

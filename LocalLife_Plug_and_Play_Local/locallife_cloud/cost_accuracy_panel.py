@@ -30,9 +30,9 @@ COST_ACCURACY_PANEL = r"""{% raw %}
  <label>Local run <select id="ca-local"></select></label>
  <label>Cloud run <select id="ca-cloud"></select></label>
  <button type="button" id="ca-refresh">Refresh</button>
- <a class="ca-btn" id="ca-csv" href="/api/cost-accuracy.csv">Cost &amp; accuracy CSV</a>
- <a class="ca-btn" href="/api/cost-accuracy/trials.csv">Known-object trials CSV</a>
- <a class="ca-btn" href="/api/cost-accuracy/operation.csv">Continuous-operation cost CSV</a>
+ <a class="ca-btn" id="ca-csv" style="display:none" href="/api/cost-accuracy.csv">Cost &amp; accuracy CSV</a>
+ <a class="ca-btn" style="display:none" href="/api/cost-accuracy/trials.csv">Known-object trials CSV</a>
+ <a class="ca-btn" style="display:none" href="/api/cost-accuracy/operation.csv">Continuous-operation cost CSV</a>
 </div>
 <div class="ca-card" style="margin:8px 0"><b><span class="ca-step">1</span>Known-object accuracy test</b> <span class="ca-muted">— put ONE object of known volume in view (e.g. the 1.5 L milk carton), wait for its volume in the live table, then record. Do the same objects in local and in cloud mode.</span>
 <div style="margin:6px 0"><label>Object <input id="ca-trial-name" placeholder="milk carton 1.5 L" style="width:170px"></label> <label>True volume (L) <input id="ca-trial-litres" type="number" step="0.01" min="0" style="width:90px"></label> <button type="button" id="ca-trial-rec">Record measurement now (this camera)</button> <span id="ca-trial-msg" class="ca-muted"></span></div>

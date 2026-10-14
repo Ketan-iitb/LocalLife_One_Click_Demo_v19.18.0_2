@@ -36,9 +36,9 @@ COMPARISON_PANEL = r"""{% raw %}
  <div class="lc-chart"><strong>Failure % and superseded % over runs</strong><div id="lc-ch-fail"></div></div>
 </div>
 <div class="lc-row">
- <a class="lc-btn" id="lc-dl-raw" href="/api/local-cloud/raw.csv">Download raw CSV</a>
- <a class="lc-btn" id="lc-dl-sum" href="/api/local-cloud/summaries.csv">Download run summary CSV</a>
- <a class="lc-btn" id="lc-dl-cmp" href="/api/local-cloud/comparison.csv">Download comparison CSV</a>
+ <a class="lc-btn" id="lc-dl-raw" style="display:none" href="/api/local-cloud/raw.csv">Download raw CSV</a>
+ <a class="lc-btn" id="lc-dl-sum" style="display:none" href="/api/local-cloud/summaries.csv">Download run summary CSV</a>
+ <a class="lc-btn" id="lc-dl-cmp" style="display:none" href="/api/local-cloud/comparison.csv">Download comparison CSV</a>
  <label>Filter downloads: run <select id="lc-filter-run"><option value="">all runs (history)</option></select></label>
  <label>since <input id="lc-filter-since" type="date"></label>
  <label class="lc-btn" style="font-weight:600">Import other mode's run summary CSV <input id="lc-import" type="file" accept=".csv" style="display:none"></label>

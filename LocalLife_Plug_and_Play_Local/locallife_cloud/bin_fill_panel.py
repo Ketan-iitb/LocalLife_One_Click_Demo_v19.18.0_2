@@ -21,7 +21,7 @@ BIN_FILL_PANEL = r"""{% raw %}
 @media(max-width:900px){#bf-panel .bf-grid{grid-template-columns:1fr}}
 </style>
 <h2>Bin fill &amp; new deposits — each camera independently</h2>
-<div style="margin:6px 0"><button type="button" id="bf-reset">Reset counts &amp; readings</button> <a class="bf-btn" href="/api/bag-ledger.csv">Download bag ledger (CSV)</a> <a class="bf-btn" href="/api/session-deposits.xlsx">Download Excel</a> <a class="bf-btn" href="/api/session-deposits.csv">Download CSV</a></div>
+<div style="margin:6px 0"><button type="button" id="bf-reset">Reset counts &amp; readings</button> <a class="bf-btn" style="display:none" href="/api/bag-ledger.csv">Download bag ledger (CSV)</a> <a class="bf-btn" style="display:none" href="/api/session-deposits.xlsx">Download Excel</a> <a class="bf-btn" style="display:none" href="/api/session-deposits.csv">Download CSV</a></div>
 <div id="bf-session" class="bf-muted">Loading…</div>
 <div class="bf-grid"><div class="bf-card" id="bf-cam-realsense"></div><div class="bf-card" id="bf-cam-logitech"></div></div>
 <div class="bf-muted" style="margin-top:6px">Fill = average waste height ÷ 100 cm bin height; litres = 660 L × fill (approximate).</div>

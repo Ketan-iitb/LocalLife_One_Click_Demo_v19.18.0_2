@@ -1053,11 +1053,79 @@ def create_app(
                     motion=str(body.get("motion", "settled")),
                     top_height_m=None if body.get("top_height_m") is None else float(body["top_height_m"])))
             if action == "trial-stop":
+                from .volume_experiment import trial_rows
                 record = recorder.stop_trial()
-                return jsonify({"stopped": record is not None})
+                return jsonify({"stopped": record is not None, "last_trial": None if record is None else
+                                [{k: r.get(k) for k in ("camera", "volume_l", "status", "reasons")}
+                                 for r in trial_rows(record)]})
+            if action == "object-add":
+                volume = body.get("reference_volume_l")
+                return jsonify(recorder.add_object(
+                    str(body["object_id"]).strip(), reference_volume_l=None if volume in (None, "") else float(volume),
+                    reference_method=str(body.get("reference_method", "")), reference_quantity=str(
+                        body.get("reference_quantity", "external_geometric")),
+                    reference_status=str(body.get("reference_status", "measured")),
+                    reference_uncertainty_l=None if body.get("reference_uncertainty_l") in (None, "") else float(
+                        body["reference_uncertainty_l"]), notes=str(body.get("notes", ""))))
+            if action == "calibrate":
+                # same procedure as `experiment_cli calibrate`, on this server's results folder
+                import argparse as _argparse
+                import contextlib
+                from . import experiment_cli
+                floor = body.get("perpendicular_floor_distance_m")
+                args = _argparse.Namespace(results=str(recorder.root.parent), camera=str(body.get("camera", "logitech")),
+                                           session=None, replace=True,
+                                           perpendicular_floor_distance_m=None if floor in (None, "") else float(floor))
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    code = experiment_cli.cmd_calibrate(args)
+                return jsonify(ok=code == 0, output=out.getvalue()[-4000:]), (200 if code == 0 else 400)
             return jsonify(error=f"unknown experiment action {action!r}"), 404
         except (KeyError, ValueError, RuntimeError) as exc:
             return jsonify(error=str(exc)), 400
+
+    def _experiment_session_dir() -> Path | None:
+        """The running session, else the newest one on disk (so a download after a restart still works)."""
+        recorder = _experiment()
+        if recorder.session is not None:
+            return recorder.session_dir
+        sessions = sorted((recorder.root / "sessions").glob("*"), key=lambda p: p.stat().st_mtime)
+        return sessions[-1] if sessions else None
+
+    @app.get("/api/experiment/trials.csv")
+    def experiment_trials_csv() -> Any:
+        """THIS session's thesis log only (one row per trial and camera); older tests are not mixed in."""
+        try:
+            directory = _experiment_session_dir()
+        except RuntimeError as exc:
+            return jsonify(error=str(exc)), 409
+        path = None if directory is None else directory / "trials.csv"
+        if path is None or not path.exists():
+            return jsonify(error="no trials recorded in this session yet"), 404
+        return Response(path.read_bytes(), mimetype="text/csv", headers={
+            "Content-Disposition": f"attachment; filename=thesis_trials_{directory.name}.csv"})
+
+    @app.get("/api/experiment/session.zip")
+    def experiment_session_zip() -> Any:
+        """The whole session folder: log, baselines, raw RGB/depth/masks per trial, objects and calibration."""
+        import zipfile
+        try:
+            directory = _experiment_session_dir()
+            recorder = _experiment()
+        except RuntimeError as exc:
+            return jsonify(error=str(exc)), 409
+        if directory is None:
+            return jsonify(error="no experiment session yet"), 404
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            for file in sorted(directory.rglob("*")):
+                if file.is_file():
+                    archive.write(file, f"{directory.name}/{file.relative_to(directory)}")
+            for extra in [recorder.objects_path(), *sorted((recorder.root / "calibration").glob("*.json"))]:
+                if extra.is_file():
+                    archive.write(extra, f"{directory.name}/_shared/{extra.relative_to(recorder.root)}")
+        return Response(buffer.getvalue(), mimetype="application/zip", headers={
+            "Content-Disposition": f"attachment; filename=thesis_session_{directory.name}.zip"})
 
     @app.get("/api/cameras/<camera_id>/stages")
     def camera_stages(camera_id: str) -> Any:
