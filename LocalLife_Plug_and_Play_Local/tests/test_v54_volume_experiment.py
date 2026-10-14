@@ -594,7 +594,8 @@ class ThesisPanelTests(unittest.TestCase):
             client = create_app(config, manager).test_client()
             page = client.get("/research").get_data(as_text=True)
             self.assertIn("Record reading", page)
-            self.assertIn(">Download CSV<", page)
+            self.assertIn(">Download simple Excel<", page)
+            self.assertIn(">Download detailed Excel<", page)
             self.assertIn("/api/experiment/session.zip", page)
             self.assertNotIn("Download paired thesis CSV", page)          # old export links removed from the UI
             self.assertIn('style="display:none" href="/api/session-deposits.csv"', page)   # panel links hidden
@@ -602,6 +603,7 @@ class ThesisPanelTests(unittest.TestCase):
             empty = client.get("/api/experiment/trials.csv")                 # never an error: header-only file
             self.assertEqual(empty.status_code, 200)
             self.assertTrue(empty.get_data(as_text=True).startswith("reading_no,time,object,pose"))
+            self.assertEqual(client.get("/api/experiment/readings.xlsx?mode=simple").status_code, 200)
             r = client.post("/api/experiment/object-add", json={"object_id": "box2L", "reference_volume_l": "2.0",
                                                                  "reference_method": "ruler 20x10x10 cm"})
             self.assertEqual(r.status_code, 200, r.get_json())
@@ -623,6 +625,7 @@ class ThesisPanelTests(unittest.TestCase):
 
 class OneClickReadingTests(unittest.TestCase):
     def test_record_reading_saves_both_cameras_and_reset_starts_empty(self):
+        import io
         from types import SimpleNamespace
 
         from locallife_cloud.comparison import DualCameraCoordinator
@@ -644,19 +647,33 @@ class OneClickReadingTests(unittest.TestCase):
             rs.latest_analysis = SimpleNamespace(detections=[ghost, box])
             rs.latest_frame = np.zeros((48, 64, 3), np.uint8)
             rs.latest_depth = np.ones((48, 64), np.float32)
+            box.support_length_cm, box.support_width_cm, box.support_height_cm = 20.1, 10.2, 9.9
+            box.bin_verdict = {"status": "mis_sort", "text": "MIS-SORT"}
             row = client.post("/api/experiment/record", json={"object_id": "box2L", "pose": "fixed"}).get_json()
             self.assertEqual(row["reading_no"], 1)                             # session started automatically
-            self.assertEqual(row["realsense_volume_L"], 1.98)
-            self.assertEqual(row["logitech_volume_L"], "")                     # nothing seen: invalid, not zero
-            self.assertIn("RS yes", row["valid"])
-            self.assertIn("LG no", row["valid"])
-            self.assertEqual((row["colour"], row["material"]), ("brown", "paper/cardboard"))
-            self.assertIn("readings/R001_realsense.npz", row["raw_files"])
+            self.assertEqual(row["RealSense volume (L)"], 1.98)
+            self.assertEqual(row["Logitech volume (L)"], "")                   # nothing seen: invalid, not zero
+            self.assertEqual((row["RealSense valid"], row["Logitech valid"]), ("yes", "no"))
+            self.assertEqual(row["Logitech reason if invalid"], "no object detected")
+            self.assertEqual((row["RealSense colour"], row["RealSense material"]), ("brown", "paper/cardboard"))
+            self.assertEqual((row["RealSense class"], row["RealSense sorting"]), ("cardboard box", "MIS-SORT"))
+            self.assertEqual((row["RealSense length (cm)"], row["RealSense height (cm)"]), (20.1, 9.9))
+            self.assertIn("readings/R001_realsense.npz", row["raw files"])
             second = client.post("/api/experiment/record", json={"object_id": "box2L", "pose": "fixed"}).get_json()
             self.assertEqual(second["reading_no"], 2)
             text = client.get("/api/experiment/trials.csv").get_data(as_text=True).splitlines()
-            self.assertEqual(text[0].split(","), list(ve.ExperimentRecorder.READING_COLUMNS))
             self.assertEqual(len(text), 3)
             self.assertEqual(len(client.get("/api/experiment/status").get_json()["readings"]), 2)
+            from openpyxl import load_workbook
+            for mode, columns in (("simple", ve.ExperimentRecorder.SIMPLE_COLUMNS),
+                                  ("detailed", ve.ExperimentRecorder.READING_COLUMNS)):
+                sheet = load_workbook(io.BytesIO(client.get(f"/api/experiment/readings.xlsx?mode={mode}").get_data())).active
+                values = list(sheet.values)
+                self.assertEqual(list(values[0]), list(columns))
+                self.assertEqual(len(values), 3)
+            simple = dict(zip(ve.ExperimentRecorder.SIMPLE_COLUMNS, list(load_workbook(io.BytesIO(client.get(
+                "/api/experiment/readings.xlsx?mode=simple").get_data())).active.values)[1]))
+            self.assertEqual(simple["RealSense L x W x H (cm)"], "20.1 x 10.2 x 9.9")
+            self.assertEqual(simple["RealSense volume (L)"], 1.98)
             client.post("/api/experiment/session", json={"note": "reset"})       # Reset -> new, empty session
             self.assertEqual(len(client.get("/api/experiment/trials.csv").get_data(as_text=True).splitlines()), 1)

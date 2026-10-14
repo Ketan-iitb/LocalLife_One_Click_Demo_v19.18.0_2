@@ -1113,6 +1113,7 @@ def create_app(
         return {"volume_l": volume, "reason": None if volume is not None else (
                     d.volume_rejection_reason or d.measurement_quality or "no volume"),
                 "colour": d.color, "material": d.material, "label": d.resolved_label or d.label,
+                "sorting": (d.bin_verdict or {}).get("text") or "",
                 "track_id": d.track_id, "method": d.support_method, "height_cm": d.support_height_cm,
                 "footprint_cm": [d.support_length_cm, d.support_width_cm], "support_rigid": d.support_rigid,
                 "objects_in_view": len(items), "rgb": rgb, "depth": depth, "mask": d.mask}
@@ -1135,7 +1136,7 @@ def create_app(
         # the one-click readings of THIS session; protocol trials if that is what was recorded; never an error
         from .volume_experiment import ExperimentRecorder
         name = "session" if directory is None else directory.name
-        for candidate in ("thesis_readings.csv", "trials.csv"):
+        for candidate in ("readings_detailed.csv", "trials.csv"):
             path = None if directory is None else directory / candidate
             if path is not None and path.exists():
                 return Response(path.read_bytes(), mimetype="text/csv", headers={
@@ -1143,6 +1144,56 @@ def create_app(
         header = ",".join(ExperimentRecorder.READING_COLUMNS) + "\n"
         return Response(header, mimetype="text/csv", headers={
             "Content-Disposition": f"attachment; filename=thesis_readings_{name}.csv"})
+
+    @app.get("/api/experiment/readings.xlsx")
+    def experiment_readings_xlsx() -> Any:
+        """This session's readings as Excel: ?mode=simple (volume, dimensions, colour, material, time) or
+        ?mode=detailed (every recorded field). An empty session gives a sheet with the headings only."""
+        from .volume_experiment import ExperimentRecorder
+        try:
+            recorder = _experiment()
+        except RuntimeError as exc:
+            return jsonify(error=str(exc)), 409
+        detailed = request.args.get("mode", "simple") == "detailed"
+        rows = recorder.readings()
+        columns = ExperimentRecorder.READING_COLUMNS if detailed else ExperimentRecorder.SIMPLE_COLUMNS
+        rows = rows if detailed else [ExperimentRecorder.simple_row(r) for r in rows]
+        name = (recorder.session or {}).get("session_id", "session")
+        kind = "detailed" if detailed else "simple"
+        try:
+            from openpyxl import Workbook
+            from openpyxl.styles import Font
+            from openpyxl.utils import get_column_letter
+        except ImportError:
+            text = io.StringIO()
+            writer = csv.DictWriter(text, fieldnames=list(columns), extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+            return Response(text.getvalue(), mimetype="text/csv", headers={
+                "Content-Disposition": f"attachment; filename=thesis_{kind}_{name}.csv"})
+        book = Workbook()
+        sheet = book.active
+        sheet.title = "Readings"
+        sheet.append(list(columns))
+        for cell in sheet[1]:
+            cell.font = Font(bold=True)
+        for r in rows:
+            values = []
+            for column in columns:
+                value = r.get(column, "")
+                try:
+                    value = float(value) if column.endswith(("(L)", "(cm)")) and value not in ("", None) else value
+                except (TypeError, ValueError):
+                    pass
+                values.append(value)
+            sheet.append(values)
+        for index, column in enumerate(columns, start=1):
+            sheet.column_dimensions[get_column_letter(index)].width = max(10, min(40, len(column) + 2))
+        sheet.freeze_panes = "A2"
+        buffer = io.BytesIO()
+        book.save(buffer)
+        return Response(buffer.getvalue(), mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        headers={"Content-Disposition": f"attachment; filename=thesis_{kind}_{name}.xlsx"})
 
     @app.get("/api/experiment/session.zip")
     def experiment_session_zip() -> Any:

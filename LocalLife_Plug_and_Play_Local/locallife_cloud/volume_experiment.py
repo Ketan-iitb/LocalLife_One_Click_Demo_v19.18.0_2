@@ -1266,14 +1266,32 @@ class ExperimentRecorder:
         return record
 
     # one-click readings (dashboard "Record reading"): the live value of both cameras, raw data saved with it
-    READING_COLUMNS = ("reading_no", "time", "object", "pose", "realsense_volume_L", "logitech_volume_L",
-                       "colour", "material", "detected_as", "valid", "commit", "raw_files")
+    _CAM = (("realsense", "RealSense"), ("logitech", "Logitech"))
+    # DETAILED (saved): everything known about each camera's reading
+    READING_COLUMNS = ("reading_no", "time", "object", "pose") + tuple(
+        f"{name} {field}" for _, name in _CAM for field in (
+            "volume (L)", "length (cm)", "width (cm)", "height (cm)", "class", "colour", "material", "sorting",
+            "valid", "reason if invalid", "method", "objects in view")) + ("code version", "raw files")
+    # SIMPLE (download): volume, dimensions, colour, material and time only
+    SIMPLE_COLUMNS = ("reading_no", "time", "object", "pose") + tuple(
+        f"{name} {field}" for _, name in _CAM for field in ("volume (L)", "L x W x H (cm)", "colour", "material"))
+
+    @classmethod
+    def simple_row(cls, row: dict[str, Any]) -> dict[str, Any]:
+        out = {k: row.get(k, "") for k in ("reading_no", "time", "object", "pose")}
+        for _, name in cls._CAM:
+            dims = [row.get(f"{name} {d} (cm)", "") for d in ("length", "width", "height")]
+            out[f"{name} volume (L)"] = row.get(f"{name} volume (L)", "")
+            out[f"{name} L x W x H (cm)"] = " x ".join(str(v) for v in dims) if all(v not in ("", None) for v in dims) else ""
+            out[f"{name} colour"] = row.get(f"{name} colour", "")
+            out[f"{name} material"] = row.get(f"{name} material", "")
+        return out
 
     def readings_path(self) -> Path | None:
-        return None if self.session is None else self.session_dir / "thesis_readings.csv"
+        return None if self.session is None else self.session_dir / "readings_detailed.csv"
 
     def record_reading(self, object_id: str, pose: str, cameras: dict[str, dict[str, Any]]) -> dict[str, Any]:
-        """Append ONE row (both cameras) to this session's thesis_readings.csv, plus one row per camera to
+        """Append ONE row (both cameras) to this session's readings_detailed.csv, plus one row per camera to
         readings_long.csv (analysis format), and save each camera's raw RGB / depth / mask next to it.
         An invalid or missing camera value stays blank and is marked invalid -- never zero, never dropped."""
         if self.session is None:
@@ -1286,14 +1304,12 @@ class ExperimentRecorder:
                     number = sum(1 for _ in handle)              # header + n rows -> next number
             raw_dir = self.session_dir / "readings"
             raw_dir.mkdir(parents=True, exist_ok=True)
-            files, vols, valid = [], {}, []
+            files, vols = [], {}
             for camera in CAMERAS:
                 c = cameras.get(camera) or {}
                 volume = c.get("volume_l")
                 ok = volume is not None and float(volume) > 0
                 vols[camera] = round(float(volume), 4) if ok else ""
-                valid.append(f"{'RS' if camera == 'realsense' else 'LG'} {'yes' if ok else 'no'}"
-                             + ("" if ok else f" ({c.get('reason') or 'no reading'})"))
                 if c.get("rgb") is not None:
                     name = f"R{number:03d}_{camera}.npz"
                     empty = np.zeros(0)
@@ -1304,17 +1320,24 @@ class ExperimentRecorder:
                         {k: v for k, v in c.items() if k not in ("rgb", "depth", "mask")}, indent=1,
                         default=_json_default), encoding="utf-8")
                     files.append(f"readings/{name}")
-            rs, lg = cameras.get("realsense") or {}, cameras.get("logitech") or {}
-
-            def pair(key):
-                a, b = rs.get(key) or "", lg.get(key) or ""
-                return a if a == b or not b else (b if not a else f"{a} / {b}")
-
             commit = (self.session.get("software") or {}).get("commit") or ""
-            row = {"reading_no": number, "time": time.strftime("%Y-%m-%d %H:%M:%S"), "object": object_id,
-                   "pose": pose, "realsense_volume_L": vols["realsense"], "logitech_volume_L": vols["logitech"],
-                   "colour": pair("colour"), "material": pair("material"), "detected_as": pair("label"),
-                   "valid": "; ".join(valid), "commit": commit, "raw_files": " ".join(files)}
+
+            def num(value, digits=1):
+                return "" if value in (None, "") else round(float(value), digits)
+
+            row: dict[str, Any] = {"reading_no": number, "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                   "object": object_id, "pose": pose}
+            for camera, name in self._CAM:
+                c = cameras.get(camera) or {}
+                foot = c.get("footprint_cm") or [None, None]
+                row.update({f"{name} volume (L)": vols[camera], f"{name} length (cm)": num(foot[0]),
+                            f"{name} width (cm)": num(foot[1]), f"{name} height (cm)": num(c.get("height_cm")),
+                            f"{name} class": c.get("label") or "", f"{name} colour": c.get("colour") or "",
+                            f"{name} material": c.get("material") or "", f"{name} sorting": c.get("sorting") or "",
+                            f"{name} valid": "yes" if vols[camera] != "" else "no",
+                            f"{name} reason if invalid": "" if vols[camera] != "" else (c.get("reason") or "no reading"),
+                            f"{name} method": c.get("method") or "", f"{name} objects in view": c.get("objects_in_view", 0)})
+            row.update({"code version": commit, "raw files": " ".join(files)})
             _append_csv(path, [row])
             reference = (self.objects().get(object_id) or {}).get("reference_volume_l")
             _append_csv(self.session_dir / "readings_long.csv", [
