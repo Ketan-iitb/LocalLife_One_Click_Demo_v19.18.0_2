@@ -1116,7 +1116,9 @@ def create_app(
                 "sorting": (d.bin_verdict or {}).get("text") or "",
                 "track_id": d.track_id, "method": d.support_method, "height_cm": d.support_height_cm,
                 "footprint_cm": [d.support_length_cm, d.support_width_cm], "support_rigid": d.support_rigid,
-                "objects_in_view": len(items), "rgb": rgb, "depth": depth, "mask": d.mask}
+                "objects_in_view": len(items), "rgb": rgb, "depth": depth, "mask": d.mask,
+                # floor plane, support height, depth percentiles, estimators: what a wrong reading needs to be traced
+                "support_diagnostics": d.support_diagnostics}
 
     def _experiment_session_dir() -> Path | None:
         """The running session, else the newest one on disk (so a download after a restart still works)."""
