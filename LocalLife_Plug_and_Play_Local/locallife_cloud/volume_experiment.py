@@ -1325,7 +1325,7 @@ class ExperimentRecorder:
             def num(value, digits=1):
                 return "" if value in (None, "") else round(float(value), digits)
 
-            row: dict[str, Any] = {"reading_no": number, "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            row: dict[str, Any] = {"reading_no": number, "time": time.strftime("%H:%M:%S"),
                                    "object": object_id, "pose": pose}
             for camera, name in self._CAM:
                 c = cameras.get(camera) or {}
