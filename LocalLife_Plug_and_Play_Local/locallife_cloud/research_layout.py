@@ -61,10 +61,12 @@ function organise(){
  for(const id of ['bf-panel','lc-panel','ca-panel']){const el=main.querySelector('#'+id);if(el)el.classList.add('rl-anchor');}
  // 1. section menu
  const nav=document.createElement('nav');nav.id='rl-nav';
- const links=[[cams&&cams.id,'Cameras'],['bf-panel','Bin fill & deposits'],['lc-panel','Local vs Cloud'],['ca-panel','Cost & accuracy'],[compFold&&compFold.id,'Camera comparison'],[setupFold&&setupFold.id,'Setup & results']];
+ const links=[['thesis-test','Thesis test'],[cams&&cams.id,'Cameras'],['bf-panel','Bin fill & deposits'],['lc-panel','Local vs Cloud'],['ca-panel','Cost & accuracy'],[compFold&&compFold.id,'Camera comparison'],[setupFold&&setupFold.id,'Setup & results']];
  nav.innerHTML=links.filter(([id])=>id&&document.getElementById(id)).map(([id,t])=>'<a href="#'+id+'">'+t+'</a>').join('');
  nav.addEventListener('click',e=>{const a=e.target.closest('a');if(!a)return;const t=document.getElementById(a.getAttribute('href').slice(1));if(t&&t.tagName==='DETAILS')t.open=true;});
  (cams||main.firstElementChild).before(nav);
+ // the thesis test panel (sessions, trials, downloads) sits directly under the menu, always visible
+ const thesis=main.querySelector('#thesis-test')||document.getElementById('thesis-test');if(thesis)nav.after(thesis);
 }
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',organise);else organise();
 })();
