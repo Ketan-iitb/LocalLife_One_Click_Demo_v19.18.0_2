@@ -1265,6 +1265,72 @@ class ExperimentRecorder:
         self.last_trial = record
         return record
 
+    # one-click readings (dashboard "Record reading"): the live value of both cameras, raw data saved with it
+    READING_COLUMNS = ("reading_no", "time", "object", "pose", "realsense_volume_L", "logitech_volume_L",
+                       "colour", "material", "detected_as", "valid", "commit", "raw_files")
+
+    def readings_path(self) -> Path | None:
+        return None if self.session is None else self.session_dir / "thesis_readings.csv"
+
+    def record_reading(self, object_id: str, pose: str, cameras: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        """Append ONE row (both cameras) to this session's thesis_readings.csv, plus one row per camera to
+        readings_long.csv (analysis format), and save each camera's raw RGB / depth / mask next to it.
+        An invalid or missing camera value stays blank and is marked invalid -- never zero, never dropped."""
+        if self.session is None:
+            self.start_session("auto: first reading")
+        with self.lock:
+            path = self.readings_path()
+            number = 1
+            if path.exists():
+                with path.open(encoding="utf-8") as handle:
+                    number = sum(1 for _ in handle)              # header + n rows -> next number
+            raw_dir = self.session_dir / "readings"
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            files, vols, valid = [], {}, []
+            for camera in CAMERAS:
+                c = cameras.get(camera) or {}
+                volume = c.get("volume_l")
+                ok = volume is not None and float(volume) > 0
+                vols[camera] = round(float(volume), 4) if ok else ""
+                valid.append(f"{'RS' if camera == 'realsense' else 'LG'} {'yes' if ok else 'no'}"
+                             + ("" if ok else f" ({c.get('reason') or 'no reading'})"))
+                if c.get("rgb") is not None:
+                    name = f"R{number:03d}_{camera}.npz"
+                    empty = np.zeros(0)
+                    np.savez_compressed(raw_dir / name, rgb=c["rgb"],
+                                        depth=empty if c.get("depth") is None else np.asarray(c["depth"], np.float32),
+                                        mask=empty if c.get("mask") is None else np.asarray(c["mask"], bool))
+                    (raw_dir / name.replace(".npz", ".json")).write_text(json.dumps(
+                        {k: v for k, v in c.items() if k not in ("rgb", "depth", "mask")}, indent=1,
+                        default=_json_default), encoding="utf-8")
+                    files.append(f"readings/{name}")
+            rs, lg = cameras.get("realsense") or {}, cameras.get("logitech") or {}
+
+            def pair(key):
+                a, b = rs.get(key) or "", lg.get(key) or ""
+                return a if a == b or not b else (b if not a else f"{a} / {b}")
+
+            commit = (self.session.get("software") or {}).get("commit") or ""
+            row = {"reading_no": number, "time": time.strftime("%Y-%m-%d %H:%M:%S"), "object": object_id,
+                   "pose": pose, "realsense_volume_L": vols["realsense"], "logitech_volume_L": vols["logitech"],
+                   "colour": pair("colour"), "material": pair("material"), "detected_as": pair("label"),
+                   "valid": "; ".join(valid), "commit": commit, "raw_files": " ".join(files)}
+            _append_csv(path, [row])
+            reference = (self.objects().get(object_id) or {}).get("reference_volume_l")
+            _append_csv(self.session_dir / "readings_long.csv", [
+                {"object": object_id, "pose": pose, "trial": number, "camera": camera,
+                 "volume_l": vols[camera], "valid": "yes" if vols[camera] != "" else "no",
+                 "reference_volume_l": "" if reference is None else reference, "designation": "test",
+                 "commit": commit, "files": f"readings/R{number:03d}_{camera}.npz"} for camera in CAMERAS])
+            return row
+
+    def readings(self) -> list[dict[str, str]]:
+        path = self.readings_path()
+        if path is None or not path.exists():
+            return []
+        with path.open(newline="", encoding="utf-8") as handle:
+            return list(csv.DictReader(handle))
+
     def status(self) -> dict[str, Any]:
         with self.lock:
             trial = None if self.trial is None else {
@@ -1274,7 +1340,8 @@ class ExperimentRecorder:
             return {"session": self.session, "baselines": self.baselines,
                     "baseline_capture": None if self._capture is None else {c: len(f) for c, f in self._capture.items()},
                     "trial": trial, "calibration": {c: (self.calibration(c) or {}).get("calibration_id") for c in CAMERAS},
-                    "last_trial": None if self.last_trial is None else trial_rows(self.last_trial)}
+                    "last_trial": None if self.last_trial is None else trial_rows(self.last_trial),
+                    "readings": self.readings()}
 
 
 def _setup_kwargs(setup: dict[str, Any]) -> dict[str, Any]:

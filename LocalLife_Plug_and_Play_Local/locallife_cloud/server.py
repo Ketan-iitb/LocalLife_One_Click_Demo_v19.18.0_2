@@ -1058,6 +1058,10 @@ def create_app(
                 return jsonify({"stopped": record is not None, "last_trial": None if record is None else
                                 [{k: r.get(k) for k in ("camera", "volume_l", "status", "reasons")}
                                  for r in trial_rows(record)]})
+            if action == "record":
+                return jsonify(recorder.record_reading(
+                    str(body.get("object_id") or "object").strip() or "object", str(body.get("pose") or "fixed"),
+                    {camera: _live_reading(camera) for camera in ("realsense", "logitech")}))
             if action == "object-add":
                 volume = body.get("reference_volume_l")
                 return jsonify(recorder.add_object(
@@ -1084,6 +1088,35 @@ def create_app(
         except (KeyError, ValueError, RuntimeError) as exc:
             return jsonify(error=str(exc)), 400
 
+    def _live_reading(camera: str) -> dict[str, Any]:
+        """What the dashboard shows for this camera's object right now, with the frame, depth and mask."""
+        from .pipeline import _measurable_detection
+        try:
+            pipe = manager.pipelines[camera]
+        except (AttributeError, KeyError):
+            return {"reason": "camera not available"}
+        with pipe.lock:
+            analysis = pipe.latest_analysis
+            items = [d for d in (analysis.detections if analysis is not None else []) if _measurable_detection(d)]
+            rgb = None if pipe.latest_frame is None else pipe.latest_frame.copy()
+            depth = pipe.latest_depth if camera == "realsense" else getattr(pipe, "latest_monocular_depth", None)
+            depth = None if depth is None else depth.copy()
+
+        def shown(d):
+            own = d.realsense_volume_l if camera == "realsense" else d.monocular_volume_l
+            return d.support_volume_l if d.support_volume_l is not None else own
+        if not items:
+            return {"reason": "no object detected", "rgb": rgb, "depth": depth}
+        with_volume = [d for d in items if shown(d) is not None]
+        d = max(with_volume or items, key=lambda item: item.area_pixels)
+        volume = shown(d)
+        return {"volume_l": volume, "reason": None if volume is not None else (
+                    d.volume_rejection_reason or d.measurement_quality or "no volume"),
+                "colour": d.color, "material": d.material, "label": d.resolved_label or d.label,
+                "track_id": d.track_id, "method": d.support_method, "height_cm": d.support_height_cm,
+                "footprint_cm": [d.support_length_cm, d.support_width_cm], "support_rigid": d.support_rigid,
+                "objects_in_view": len(items), "rgb": rgb, "depth": depth, "mask": d.mask}
+
     def _experiment_session_dir() -> Path | None:
         """The running session, else the newest one on disk (so a download after a restart still works)."""
         recorder = _experiment()
@@ -1099,11 +1132,17 @@ def create_app(
             directory = _experiment_session_dir()
         except RuntimeError as exc:
             return jsonify(error=str(exc)), 409
-        path = None if directory is None else directory / "trials.csv"
-        if path is None or not path.exists():
-            return jsonify(error="no trials recorded in this session yet"), 404
-        return Response(path.read_bytes(), mimetype="text/csv", headers={
-            "Content-Disposition": f"attachment; filename=thesis_trials_{directory.name}.csv"})
+        # the one-click readings of THIS session; protocol trials if that is what was recorded; never an error
+        from .volume_experiment import ExperimentRecorder
+        name = "session" if directory is None else directory.name
+        for candidate in ("thesis_readings.csv", "trials.csv"):
+            path = None if directory is None else directory / candidate
+            if path is not None and path.exists():
+                return Response(path.read_bytes(), mimetype="text/csv", headers={
+                    "Content-Disposition": f"attachment; filename=thesis_readings_{name}.csv"})
+        header = ",".join(ExperimentRecorder.READING_COLUMNS) + "\n"
+        return Response(header, mimetype="text/csv", headers={
+            "Content-Disposition": f"attachment; filename=thesis_readings_{name}.csv"})
 
     @app.get("/api/experiment/session.zip")
     def experiment_session_zip() -> Any:

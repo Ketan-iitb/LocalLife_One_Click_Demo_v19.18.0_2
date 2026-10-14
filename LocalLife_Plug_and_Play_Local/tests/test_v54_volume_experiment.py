@@ -593,12 +593,15 @@ class ThesisPanelTests(unittest.TestCase):
             manager = DualCameraCoordinator(config)
             client = create_app(config, manager).test_client()
             page = client.get("/research").get_data(as_text=True)
-            self.assertIn("Download thesis CSV (this session)", page)
+            self.assertIn("Record reading", page)
+            self.assertIn(">Download CSV<", page)
             self.assertIn("/api/experiment/session.zip", page)
             self.assertNotIn("Download paired thesis CSV", page)          # old export links removed from the UI
             self.assertIn('style="display:none" href="/api/session-deposits.csv"', page)   # panel links hidden
             self.assertEqual(client.get("/api/comparison.csv").status_code, 200)   # ... their endpoints remain
-            self.assertEqual(client.get("/api/experiment/trials.csv").status_code, 404)
+            empty = client.get("/api/experiment/trials.csv")                 # never an error: header-only file
+            self.assertEqual(empty.status_code, 200)
+            self.assertTrue(empty.get_data(as_text=True).startswith("reading_no,time,object,pose"))
             r = client.post("/api/experiment/object-add", json={"object_id": "box2L", "reference_volume_l": "2.0",
                                                                  "reference_method": "ruler 20x10x10 cm"})
             self.assertEqual(r.status_code, 200, r.get_json())
@@ -616,3 +619,44 @@ class ThesisPanelTests(unittest.TestCase):
             self.assertIn(f"{sid}/trials.csv", names)
             self.assertIn(f"{sid}/session.json", names)
             self.assertIn(f"{sid}/_shared/objects.json", names)
+
+
+class OneClickReadingTests(unittest.TestCase):
+    def test_record_reading_saves_both_cameras_and_reset_starts_empty(self):
+        from types import SimpleNamespace
+
+        from locallife_cloud.comparison import DualCameraCoordinator
+        from locallife_cloud.config import AppConfig
+        from locallife_cloud.server import create_app
+        from locallife_cloud.types import Detection
+        with TemporaryDirectory() as d:
+            config = AppConfig(detector_model="local-opencv-background", enable_monocular_depth=False,
+                               enable_bucket_sync=False, results_dir=Path(d))
+            manager = DualCameraCoordinator(config)
+            client = create_app(config, manager).test_client()
+            mask = np.zeros((48, 64), bool)
+            mask[10:30, 20:40] = True
+            box = Detection("cardboard box", 0.9, (20, 10, 40, 30), mask, color="brown")
+            box.material, box.support_volume_l = "paper/cardboard", 1.98
+            ghost = Detection("cardboard box", 0.5, (0, 0, 60, 45), np.ones((48, 64), bool), source="tracked-prediction")
+            ghost.support_volume_l = 9.9                                        # stale copy: never recorded
+            rs = manager.pipelines["realsense"]
+            rs.latest_analysis = SimpleNamespace(detections=[ghost, box])
+            rs.latest_frame = np.zeros((48, 64, 3), np.uint8)
+            rs.latest_depth = np.ones((48, 64), np.float32)
+            row = client.post("/api/experiment/record", json={"object_id": "box2L", "pose": "fixed"}).get_json()
+            self.assertEqual(row["reading_no"], 1)                             # session started automatically
+            self.assertEqual(row["realsense_volume_L"], 1.98)
+            self.assertEqual(row["logitech_volume_L"], "")                     # nothing seen: invalid, not zero
+            self.assertIn("RS yes", row["valid"])
+            self.assertIn("LG no", row["valid"])
+            self.assertEqual((row["colour"], row["material"]), ("brown", "paper/cardboard"))
+            self.assertIn("readings/R001_realsense.npz", row["raw_files"])
+            second = client.post("/api/experiment/record", json={"object_id": "box2L", "pose": "fixed"}).get_json()
+            self.assertEqual(second["reading_no"], 2)
+            text = client.get("/api/experiment/trials.csv").get_data(as_text=True).splitlines()
+            self.assertEqual(text[0].split(","), list(ve.ExperimentRecorder.READING_COLUMNS))
+            self.assertEqual(len(text), 3)
+            self.assertEqual(len(client.get("/api/experiment/status").get_json()["readings"]), 2)
+            client.post("/api/experiment/session", json={"note": "reset"})       # Reset -> new, empty session
+            self.assertEqual(len(client.get("/api/experiment/trials.csv").get_data(as_text=True).splitlines()), 1)

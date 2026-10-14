@@ -29,7 +29,8 @@ FIXED_POSE = "fixed"            # the tape-marked repeatability pose; other pose
 def load(paths: list[Path]) -> list[dict]:
     rows = []
     for p in paths:
-        f = p / "trials.csv" if p.is_dir() else p
+        # a session folder: the one-click readings (readings_long.csv) if any, else the protocol trials
+        f = (p / "readings_long.csv" if (p / "readings_long.csv").exists() else p / "trials.csv") if p.is_dir() else p
         with f.open(newline="", encoding="utf-8") as h:
             for r in csv.DictReader(h):
                 vol = r.get("volume_l") or ""
