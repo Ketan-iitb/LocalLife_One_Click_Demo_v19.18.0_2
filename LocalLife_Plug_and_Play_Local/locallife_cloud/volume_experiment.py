@@ -968,7 +968,7 @@ class ExperimentRecorder:
     """Sessions, baselines, trials and their raw data under `root` (results/experiment)."""
 
     def __init__(self, root: Path, *, frames_per_trial: int = 10, settle_s: float = 1.5, window_s: float = 4.0,
-                 timeout_s: float = 25.0, baseline_frames: int = 15) -> None:
+                 timeout_s: float = 25.0, baseline_frames: int = 30) -> None:
         self.root = Path(root)
         self.frames_per_trial, self.settle_s, self.window_s, self.timeout_s = frames_per_trial, settle_s, window_s, timeout_s
         self.baseline_frames = baseline_frames

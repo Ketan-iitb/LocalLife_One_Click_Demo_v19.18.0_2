@@ -202,9 +202,10 @@ class DualCameraCoordinator:
         self.attach_deposit_listeners()
         # V54 volume experiment: raw trial recording for both cameras (inactive until a session starts).
         self.experiment = ExperimentRecorder(config.results_dir / "experiment")
-        self.experiment.config_meta = {k: str(getattr(config, k, None)) for k in (
-            "depth_model", "volume_geometry", "logitech_horizontal_fov_deg", "logitech_reference_distance_m",
-            "enable_monocular_depth", "detector_model", "operating_mode")}
+        # The EXACT effective configuration of the run (supervisor C1.3), minus anything secret-like.
+        secret = ("token", "secret", "password", "passwd", "api_key", "apikey", "credential", "private")
+        self.experiment.config_meta = {k: str(v) for k, v in sorted((f.name, getattr(config, f.name, None)) for f in __import__("dataclasses").fields(config))
+                                       if not any(w in k.lower() for w in secret)}
         for pipeline in self.pipelines.values():
             pipeline.experiment_listener = self.experiment.observe
         # Each station knows the other's geometry only so it can refuse to
