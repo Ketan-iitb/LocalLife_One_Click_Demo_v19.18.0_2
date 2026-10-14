@@ -502,7 +502,10 @@ class FillEstimator:
                 # A waste layer is flat too: unattended, only a surface at the floor reference is the floor.
                 return {"ok": False, "reason": f"deepest flat surface at {distance * 100:.0f} cm, not the "
                                                f"{reference * 100:.0f} cm floor"}
-            if not 0.80 <= distance <= 1.40:
+            # Unattended: only the 80-140 cm installation range. On request (floor emptied by the operator)
+            # any plausible mounting height: a room-floor rig at ~75 cm was refused before.
+            low, high = (0.80, 1.40) if automatic else (0.30, 2.50)
+            if not low <= distance <= high:
                 return {"ok": False, "reason": f"deepest flat surface is {distance * 100:.0f} cm away, not near the "
                                                f"{reference * 100:.0f} cm floor -- floor hidden by waste?"}
             scale = 1.0

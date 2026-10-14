@@ -1032,9 +1032,17 @@ def create_app(
     @app.get("/api/experiment/status")
     def experiment_status() -> Any:
         try:
-            return jsonify(_experiment().status())
+            status = _experiment().status()
         except RuntimeError as exc:
             return jsonify(error=str(exc)), 409
+        # the floor each camera measures objects against (what "Re-find floor" sets)
+        floors = {}
+        for camera_id, station in getattr(manager, "pipelines", {}).items():
+            diag = dict(getattr(station.fill, "last_diag", {}) or {})
+            floors[camera_id] = {k: diag.get(k) for k in ("floor_source", "floor_distance_cm", "tilt_deg")}
+            floors[camera_id]["fitted_at"] = getattr(station.fill.profile, "floor_fitted_at", None)
+        status["floors"] = floors
+        return jsonify(status)
 
     @app.post("/api/experiment/<action>")
     @protected
