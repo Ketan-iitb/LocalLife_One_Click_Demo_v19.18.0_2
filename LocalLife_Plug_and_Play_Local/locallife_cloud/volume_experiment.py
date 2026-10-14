@@ -514,6 +514,8 @@ def measure_frame(depth: np.ndarray, intrinsics: Any, mask: np.ndarray, baseline
         out["coverage"] = None
         return out
     volume_l = float(np.sum(rise[up] * a[up])) * 1000.0
+    if volume_l <= 0.0:
+        reasons.append(f"non-positive volume ({volume_l:.3f} L): invalid reading")
     out["volume_l_partial"] = round(volume_l, 5)
     out["height_max_m"] = round(float(np.percentile(rise[up], 99)), 4)
     out["top_height_m"] = round(top_height(rise[up]), 5)
@@ -1351,7 +1353,9 @@ def trial_rows(record: dict[str, Any]) -> list[dict[str, Any]]:
                      "frame_iqr_rel": res.get("frame_iqr_rel"), "top_height_m": res.get("top_height_m"),
                      "reference_top_height_m": record.get("reference_top_height_m"),
                      "quantity": QUANTITY, "measurement_version": MEASUREMENT_VERSION,
-                     "commit": (record.get("software") or {}).get("commit")})
+                     "commit": (record.get("software") or {}).get("commit"),
+                     "valid": "yes" if res.get("volume_l") is not None else "no",
+                     "files": f"trials/{record['trial_id']}/{camera}/"})
     return rows
 
 

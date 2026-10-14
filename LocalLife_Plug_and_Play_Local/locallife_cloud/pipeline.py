@@ -2241,6 +2241,9 @@ class VisionPipeline:
                     warnings.append(
                         "Rejected a volume whose measured height occupied too little of the detection mask"
                     )
+                elif individual.liters <= 0.0:
+                    detection.measurement_quality = "rejected-non-positive-volume"
+                    detection.volume_rejection_reason = "non-positive volume: invalid reading"
                 elif individual.liters > self.config.realsense_max_item_volume_l:
                     detection.measurement_quality = "rejected-implausible-volume"
                     warnings.append(
@@ -2738,6 +2741,9 @@ class VisionPipeline:
                     if foreground_fraction < self.config.minimum_foreground_fraction:
                         detection.measurement_quality = "rejected-sparse-height-inside-mask"
                         detection.provisional_volume_l = round(individual_mono.liters, 6)
+                    elif individual_mono.liters <= 0.0:
+                        detection.measurement_quality = "rejected-non-positive-volume"
+                        detection.volume_rejection_reason = "non-positive volume: invalid reading"
                     elif logitech_publish is not None and not logitech_publish.publish:
                         # A volume that cannot be right is withheld: one
                         # integrated over two bags at once, or one that does

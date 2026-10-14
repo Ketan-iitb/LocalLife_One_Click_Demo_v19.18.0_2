@@ -793,6 +793,11 @@ class FillEstimator:
         if missing:
             litres *= 1.0 + missing / max(1, int(np.count_nonzero(risen)))
         tall = float(np.percentile(rise_map[risen], 90))
+        if litres <= 0.0:
+            # A volume is never negative: noise-dominated depth (monocular, smeared edges). Invalid, not a number.
+            self.last_object = {"method": "unavailable", "reason": f"non-positive volume ({litres:.3f} L): invalid reading",
+                                "estimators": estimators}
+            return None
         if litres > 250.0 or tall > self.profile.usable_height_m + RIM_TOLERANCE_M:
             self.last_object = {"method": "unavailable", "reason": "implausible size (never clamped)",
                                 "estimators": estimators}
