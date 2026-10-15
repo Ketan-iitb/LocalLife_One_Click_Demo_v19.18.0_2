@@ -9,6 +9,28 @@ configuration changes, validation performed, hardware status, and any known
 limitations. This should make it possible to identify the version that
 introduced a regression without guessing from file modification dates.
 
+## V54.5 shape recognition — 2026-10-15 — cuboid / cube / cylinder / sphere
+
+### Observed problem
+
+- An 18 cm round object was reported as a 15 x 17 cm rectangle: every object was treated as a cuboid.
+
+### Change
+
+- `bin_fill._classify_shape`: from the floor-plane footprint (hull vs. min-area rectangle vs. enclosing circle)
+  and the top's height profile (flat vs. circular fall-off) each live reading is labelled cuboid, cube,
+  cylinder (standing), cylinder (lying), sphere or irregular. A standing cylinder or sphere reports
+  L = W = its diameter. A pillow-shaped bag (falls off faster than a circle) stays irregular.
+- The per-pixel volume stays the primary value; the shape-model volume (pi r^2 h, pi D^3 / 6, L W H) is
+  recorded as a secondary estimator and appended to the method text.
+- Shape shown on the video tag, the live table and the thesis panel; new `shape` column in both Excel
+  layouts. A session started before this version keeps its rows (the CSV header is widened).
+
+### Validation
+
+- `tests/test_shape_recognition.py` (ray-traced, 45 deg, 3 mm noise): box, cube, 18 x 8 cm standing
+  cylinder (reads 18.6 cm), lying cylinder, sphere, pillow-shaped bag. Synthetic only.
+
 ## V54.5 — 2026-10-12 — One primary volume method; carton placement diagnostics
 
 ### Status

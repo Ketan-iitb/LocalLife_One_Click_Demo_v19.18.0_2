@@ -3356,7 +3356,7 @@ class VisionPipeline:
                 resolver.set_rigid(item.track_id, True)      # depth evidence: a flat rigid top
             if estimate is not None and dims is not None:
                 sample = (time.time(), estimate[0], estimate[1], dims.get("length_m"), dims.get("width_m"),
-                          dims.get("method") or PER_PIXEL_METHOD, tuple(item.box), context)
+                          dims.get("method") or PER_PIXEL_METHOD, tuple(item.box), context, dims.get("shape"))
                 reset = None
                 if item.track_id is not None:
                     # Repeatability over this SAME track's recent frames AND the same placement, calibration and
@@ -3381,6 +3381,10 @@ class VisionPipeline:
                 else:
                     frames_used = 1
                 _, litres, height_m, length_m, width_m, method = sample[:6]
+                shape = sample[8] if len(sample) > 8 else None
+                item.support_shape = None if not shape else {
+                    "name": shape["name"], "dims_cm": [round(d * 100, 1) for d in shape["dims_m"]],
+                    "litres": shape["litres"], "evidence": shape["evidence"]}
                 k = intrinsics if self.camera_id != "logitech" else (
                     measure_intrinsics or self._field_of_view_intrinsics(frame.shape))
                 rigid_est = dims.get("rigid")
@@ -3414,7 +3418,10 @@ class VisionPipeline:
                     item.support_width_cm = round(float(width_m) * 100, 1)
                 if item.track_id is not None:
                     resolver.set_size(item.track_id, item.support_length_cm, item.support_height_cm)
-                item.support_method = method
+                item.support_method = method + ((f" | shape: {shape['name']}" + (
+                    f" (diameter {shape['diameter_m'] * 100:.1f} cm)" if shape.get("diameter_m") else "")
+                    + (f", shape-model volume {shape['litres']:.2f} L (secondary)" if shape.get("litres") is not None
+                       else "")) if shape else "")
                 quality = ((dims.get("estimators") or {}).get("per_pixel") or {}).get("quality", "ok")
                 if quality != "ok":
                     item.support_method += f" | {quality}"

@@ -1270,11 +1270,11 @@ class ExperimentRecorder:
     # DETAILED (saved): everything known about each camera's reading
     READING_COLUMNS = ("reading_no", "time", "object", "pose") + tuple(
         f"{name} {field}" for _, name in _CAM for field in (
-            "volume (L)", "length (cm)", "width (cm)", "height (cm)", "class", "colour", "material", "sorting",
+            "volume (L)", "shape", "length (cm)", "width (cm)", "height (cm)", "class", "colour", "material", "sorting",
             "valid", "reason if invalid", "method", "objects in view")) + ("code version", "raw files")
     # SIMPLE (download): volume, dimensions, colour, material and time only
     SIMPLE_COLUMNS = ("reading_no", "time", "object", "pose") + tuple(
-        f"{name} {field}" for _, name in _CAM for field in ("volume (L)", "L x W x H (cm)", "colour", "material"))
+        f"{name} {field}" for _, name in _CAM for field in ("volume (L)", "shape", "L x W x H (cm)", "colour", "material"))
 
     @classmethod
     def simple_row(cls, row: dict[str, Any]) -> dict[str, Any]:
@@ -1282,6 +1282,7 @@ class ExperimentRecorder:
         for _, name in cls._CAM:
             dims = [row.get(f"{name} {d} (cm)", "") for d in ("length", "width", "height")]
             out[f"{name} volume (L)"] = row.get(f"{name} volume (L)", "")
+            out[f"{name} shape"] = row.get(f"{name} shape", "")
             out[f"{name} L x W x H (cm)"] = " x ".join(str(v) for v in dims) if all(v not in ("", None) for v in dims) else ""
             out[f"{name} colour"] = row.get(f"{name} colour", "")
             out[f"{name} material"] = row.get(f"{name} material", "")
@@ -1330,7 +1331,8 @@ class ExperimentRecorder:
             for camera, name in self._CAM:
                 c = cameras.get(camera) or {}
                 foot = c.get("footprint_cm") or [None, None]
-                row.update({f"{name} volume (L)": vols[camera], f"{name} length (cm)": num(foot[0]),
+                row.update({f"{name} volume (L)": vols[camera], f"{name} shape": (c.get("shape") or {}).get("name", ""),
+                        f"{name} length (cm)": num(foot[0]),
                             f"{name} width (cm)": num(foot[1]), f"{name} height (cm)": num(c.get("height_cm")),
                             f"{name} class": c.get("label") or "", f"{name} colour": c.get("colour") or "",
                             f"{name} material": c.get("material") or "", f"{name} sorting": c.get("sorting") or "",
@@ -1453,8 +1455,22 @@ def _append_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     if not rows:
         return
     new = not path.exists()
+    fields = list(rows[0])
+    if not new:
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            header, old = list(reader.fieldnames or []), list(reader)
+        if any(f not in header for f in fields):
+            # a column added by a newer version (e.g. "shape"): rewrite with the wider header, old rows blank there
+            wider = header + [f for f in fields if f not in header]
+            with path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=wider)
+                writer.writeheader()
+                writer.writerows(old)
+            header = wider
+        fields = header
     with path.open("a", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer = csv.DictWriter(handle, fieldnames=fields, restval="")
         if new:
             writer.writeheader()
         writer.writerows(rows)

@@ -830,6 +830,14 @@ class FillEstimator:
                 body_raster = _floor_raster(surface, body, rise_map)
                 if body_raster is not None:
                     length, width = body_raster["length"], body_raster["width"]
+        shape = None if raster is None else raster.get("shape")
+        if shape is not None and deformable_hint:
+            shape = {**shape, "name": "irregular (deformable)"}
+        if shape is not None and shape["name"] in ("cylinder (standing)", "sphere"):
+            length = width = shape["diameter_m"]                   # round: L = W = the diameter
+        if shape is not None:
+            estimators["shape_model"] = {"status": "secondary", "shape": shape["name"], "litres": shape["litres"],
+                                         "dims_m": shape["dims_m"], "evidence": shape["evidence"]}
         method = PER_PIXEL_METHOD + (" (deformable: L x W is the body's enclosing box)" if deformable_hint else "")
         edge_share = float(np.count_nonzero(flying)) / max(1, int(np.count_nonzero(risen | flying)))
         estimators["per_pixel"] = {"status": "primary", "litres": round(litres, 3),
@@ -850,6 +858,7 @@ class FillEstimator:
             rigid["warning"] = "uneven surroundings: a face may be partly hidden by neighbours (unverified)"
         self.last_object = {"length_m": length, "width_m": width, "height_m": tall, "litres": round(litres, 2),
                             "method": method, "planar": planar, "estimators": estimators, "rigid": rigid,
+                            "shape": shape,
                             "quantity": "visible-surface volume above the local support",
                             "shape_model": "deformable" if deformable_hint else ("rigid" if rigid_hint else "unresolved")}
         return round(litres, 2), tall
@@ -1490,7 +1499,96 @@ def _floor_raster(surface: dict[str, Any], risen: np.ndarray, rise_map: np.ndarr
     scale = min(1.0, hull / cells_area) if cells_area > 0 and hull > 0 else 1.0
     litres = float(np.sum(filled[closed])) * cell * cell * scale * 1000.0
     (_, _), (w1, w2), _ = cv2.minAreaRect(uv)
-    return {"litres": litres, "length": float(max(w1, w2)), "width": float(min(w1, w2)), "cell_m": cell}
+    return {"litres": litres, "length": float(max(w1, w2)), "width": float(min(w1, w2)), "cell_m": cell,
+            "shape": _classify_shape(u, v, heights)}
+
+
+# Shape recognition from the same footprint and heights (display + a secondary shape-model volume; the
+# per-pixel integral stays the primary volume). Footprint: hull area / min-area rectangle is ~1 for a
+# rectangle and pi/4 = 0.785 for a disc; hull area / enclosing circle is ~1 for a disc and 2/pi = 0.64 for
+# a square. Top: a body of revolution resting on the floor shows its top at R + R sqrt(1 - s^2), so the
+# band 0.6-0.85 of the way to the rim reads ~0.84 of the centre height; a flat top reads ~1.
+SHAPE_MIN_POINTS = 30
+# An oblique camera sees a ball's far side only down to the grazing ray: at 45 deg its footprint is ~0.85
+# (0.80 with noise) as deep as it is wide, so a round footprint is allowed that much ellipticity.
+SHAPE_ROUND_ASPECT = 0.75          # short / long footprint side for a round footprint
+SHAPE_ROUND_CIRCLE_FILL = 0.70     # hull / enclosing-circle area
+SHAPE_RECT_FILL = 0.88             # hull / min-area-rectangle area at or above this: rectangular footprint
+SHAPE_CURVED_TOP_RATIO = 0.90      # edge-band / centre-band height below this: curved (revolved) top
+SHAPE_REVOLVED_MIN_RATIO = 0.70    # ... and above this: a pillow-shaped bag falls off faster (~0.6) than a circle
+SHAPE_DIAMETER_HEIGHT = (0.7, 1.4) # a sphere / lying cylinder is about as tall as it is wide
+SHAPE_CUBE_SPREAD = 0.15           # L, W, H all within this of their mean: cube
+
+
+def _band_ratio(coord: np.ndarray, heights: np.ndarray) -> float | None:
+    """Median height 0.6-0.85 of the way to the rim / median height of the central 40 % (coord in -1..1)."""
+    a = np.abs(coord)
+    centre, edge = heights[a < 0.4], heights[(a > 0.6) & (a < 0.85)]
+    if len(centre) < 5 or len(edge) < 5:
+        return None
+    mid = float(np.median(centre))
+    return float(np.median(edge)) / mid if mid > 0 else None
+
+
+def _classify_shape(u: np.ndarray, v: np.ndarray, heights: np.ndarray) -> dict[str, Any] | None:
+    """cuboid / cube / cylinder (standing or lying) / sphere / irregular from the floor-plane footprint (u, v
+    in metres) and the rise of each point. Dimensions in metres: a cylinder or sphere gives a diameter."""
+    try:
+        import cv2
+    except ImportError:  # pragma: no cover
+        return None
+    if len(u) < SHAPE_MIN_POINTS:
+        return None
+    pts = np.c_[u, v].astype(np.float32)
+    hull = cv2.convexHull(pts)
+    area = float(cv2.contourArea(hull))
+    (rx, ry), (w1, w2), _ = cv2.minAreaRect(pts)
+    (_, _), radius = cv2.minEnclosingCircle(hull)
+    length, width = float(max(w1, w2)), float(min(w1, w2))
+    tall = float(np.percentile(heights, 90))
+    if area <= 0 or width <= 0 or radius <= 0 or tall <= 0:
+        return None
+    rect_fill, circle_fill = area / (length * width), area / (math.pi * radius * radius)
+    aspect = width / length
+    evidence = {"rect_fill": round(rect_fill, 3), "circle_fill": round(circle_fill, 3), "aspect": round(aspect, 3)}
+
+    def result(name: str, dims: tuple[float, float, float], litres: float | None, **extra) -> dict[str, Any]:
+        return {"name": name, "dims_m": [round(float(d), 4) for d in dims],
+                "litres": None if litres is None else round(float(litres) * 1000.0, 3),
+                **extra, "evidence": evidence}
+
+    lo, hi = SHAPE_DIAMETER_HEIGHT
+    if aspect >= SHAPE_ROUND_ASPECT and circle_fill >= SHAPE_ROUND_CIRCLE_FILL and rect_fill < SHAPE_RECT_FILL:
+        # round footprint: radial position from the footprint's centre
+        ex, ey = float(np.mean(u)), float(np.mean(v))
+        rho = np.hypot(u - ex, v - ey) / radius
+        ratio = _band_ratio(rho, heights)
+        evidence["top_ratio"] = None if ratio is None else round(ratio, 3)
+        diameter = 2.0 * radius
+        if ratio is not None and SHAPE_REVOLVED_MIN_RATIO <= ratio < SHAPE_CURVED_TOP_RATIO \
+                and lo <= tall / diameter <= hi:
+            return result("sphere", (diameter, diameter, tall), math.pi * diameter ** 3 / 6.0, diameter_m=round(diameter, 4))
+        if ratio is None or ratio >= SHAPE_CURVED_TOP_RATIO:
+            return result("cylinder (standing)", (diameter, diameter, tall), math.pi * radius ** 2 * tall,
+                          diameter_m=round(diameter, 4))
+        return result("irregular", (length, width, tall), None)
+    if rect_fill >= SHAPE_RECT_FILL:
+        # rectangular footprint: flat top = box; curved across the short side = cylinder lying on its side
+        centred = np.c_[u - rx, v - ry]
+        _, _, axes = np.linalg.svd(centred - centred.mean(axis=0), full_matrices=False)
+        across = (centred @ axes[1]) / (width / 2.0)
+        ratio = _band_ratio(across, heights)
+        evidence["top_ratio"] = None if ratio is None else round(ratio, 3)
+        if ratio is not None and SHAPE_REVOLVED_MIN_RATIO <= ratio < SHAPE_CURVED_TOP_RATIO \
+                and aspect < SHAPE_ROUND_ASPECT \
+                and lo <= tall / width <= hi:
+            return result("cylinder (lying)", (length, width, tall), math.pi * (width / 2.0) ** 2 * length,
+                          diameter_m=round(width, 4))
+        if ratio is None or ratio >= SHAPE_CURVED_TOP_RATIO:
+            sides = np.array([length, width, tall])
+            name = "cube" if np.all(np.abs(sides - sides.mean()) <= SHAPE_CUBE_SPREAD * sides.mean()) else "cuboid"
+            return result(name, (length, width, tall), length * width * tall)
+    return result("irregular", (length, width, tall), None)       # no shape model: the per-pixel value only
 
 
 def _ransac_plane(pts: np.ndarray, tol: float = 0.015, iterations: int = 120):

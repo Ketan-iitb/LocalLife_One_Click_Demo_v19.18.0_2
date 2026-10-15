@@ -133,7 +133,8 @@ def _annotate_frame(frame: np.ndarray, pipeline: VisionPipeline) -> np.ndarray:
         # dimensions and litres are in the camera's table and CSV (unchanged).
         del distance, height, volume, visible_color
         short = shown_label if detection.accepted_class == "measurement_object" else display_type
-        tag = f"#{detection.track_id or '?'} {short[:18]}{'*' if continuity else ''}"
+        shape = (getattr(detection, "support_shape", None) or {}).get("name", "").split(" (")[0]
+        tag = f"#{detection.track_id or '?'} {short[:18]}{'*' if continuity else ''}" + (f" | {shape}" if shape else "")
         (text_w, text_h), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
         tx, ty = x1, max(text_h + 4, y1 - 5)
         for _ in range(8):                      # step down past tags already placed
@@ -1124,6 +1125,7 @@ def create_app(
                 "sorting": (d.bin_verdict or {}).get("text") or "",
                 "track_id": d.track_id, "method": d.support_method, "height_cm": d.support_height_cm,
                 "footprint_cm": [d.support_length_cm, d.support_width_cm], "support_rigid": d.support_rigid,
+                "shape": d.support_shape,
                 "objects_in_view": len(items), "rgb": rgb, "depth": depth, "mask": d.mask,
                 # floor plane, support height, depth percentiles, estimators: what a wrong reading needs to be traced
                 "support_diagnostics": d.support_diagnostics}

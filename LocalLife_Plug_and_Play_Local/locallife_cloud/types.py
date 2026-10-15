@@ -122,6 +122,7 @@ class Detection:
     support_height_cm: float | None = None
     support_length_cm: float | None = None          # oriented footprint of the same risen region
     support_width_cm: float | None = None
+    support_shape: dict | None = None               # recognised shape (cuboid / cube / cylinder / sphere / irregular)
     # A small, strongly coloured part distinct from the dominant colour -- the
     # red cap on a grey bottle -- and how the colour was reached
     # (colour_evidence.py). The dominant colour stays in `color`.
@@ -234,6 +235,7 @@ class Detection:
             "support_height_cm": self.support_height_cm,
             "support_length_cm": self.support_length_cm,
             "support_width_cm": self.support_width_cm,
+            "support_shape": self.support_shape,
             "support_method": self.support_method,
             "support_diagnostics": self.support_diagnostics,
             "per_pixel_volume_l": self.per_pixel_volume_l, "per_pixel_raw_volume_l": self.per_pixel_raw_volume_l,
